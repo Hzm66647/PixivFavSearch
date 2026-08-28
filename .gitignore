@@ -1,0 +1,20 @@
+# 用户自己的收藏数据（不上传 GitHub）
+data/*.json
+!data/demo_data.json
+
+# 缩略图缓存
+data/thumbs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 便携 Python 运行时
+python/
+
+# 环境/系统文件
+Thumbs.db
+.DS_Store
+*.log
