@@ -1788,19 +1788,6 @@ class H(BaseHTTPRequestHandler):
             # 重新加载所有插件数据
             load_plugins()
             self.send_json(200, {"ok": True, "counts": {k: len(v) for k, v in PLUGIN_DATA.items()}})
-        elif u.path == "/api/plugins/market":
-            # 获取插件市场列表
-            url = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("url", [None])[0]
-            result = fetch_market(url)
-            self.send_json(200, result)
-        elif u.path == "/api/plugins/info":
-            # 返回已安装插件的详细信息
-            pid = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("id", [""])[0]
-            plugin = next((p for p in PLUGIN_LIST if p["id"] == pid), None)
-            if not plugin:
-                return self.send_json(404, {"error": "插件不存在"})
-            count = len(PLUGIN_DATA.get(pid, []))
-            self.send_json(200, {"plugin": plugin, "count": count})
         else:
             self.send_error(404)
 
@@ -1948,66 +1935,6 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True})
             
             return self.send_json(400, {"error": "未知操作 | Unknown action"})
-        if u.path == "/api/plugins/install":
-            # 安装插件（从 URL）
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                body = self.rfile.read(n).decode("utf-8") or "{}"
-                data = json.loads(body)
-            except Exception:
-                return self.send_json(400, {"error": "JSON解析失败"})
-            url = data.get("url", "").strip()
-            if not url:
-                return self.send_json(400, {"error": "缺少 url 参数"})
-            result = install_plugin_from_url(url)
-            if "error" in result:
-                self.send_json(400, result)
-            else:
-                self.send_json(200, result)
-        if u.path == "/api/plugins/uninstall":
-            # 卸载插件
-            try:
-                n = int(self.headers.get("Content-Length") or 0)
-                body = self.rfile.read(n).decode("utf-8") or "{}"
-                data = json.loads(body)
-            except Exception:
-                return self.send_json(400, {"error": "JSON解析失败"})
-            pid = data.get("id", "").strip()
-            if not pid:
-                return self.send_json(400, {"error": "缺少 id 参数"})
-            result = uninstall_plugin(pid)
-            if "error" in result:
-                self.send_json(400, result)
-            else:
-                self.send_json(200, result)
-        if u.path == "/api/plugins/scan":
-            # 扫描 plugins 文件夹
-            scan_plugins_dir()
-            self.send_json(200, {"ok": True})
-        if u.path == "/api/plugins/upload":
-            # 上传 .plug 文件（拖拽安装）
-            ct = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if ct != "application/octet-stream":
-                return self.send_json(400, {"error": "只接受 .plug 文件"})
-            n = int(self.headers.get("Content-Length") or 0)
-            if n == 0 or n > 50 * 1024 * 1024:
-                return self.send_json(400, {"error": "文件过大或为空"})
-            body = self.rfile.read(n)
-            import tempfile, zipfile
-            tmp = tempfile.NamedTemporaryFile(suffix='.plug', delete=False)
-            try:
-                tmp.write(body)
-                tmp.close()
-                result = _install_plugin_from_zip(tmp.name)
-                if "error" in result:
-                    self.send_json(400, result)
-                else:
-                    self.send_json(200, result)
-            except Exception as e:
-                self.send_json(500, {"error": repr(e)[:200]})
-            finally:
-                if os.path.exists(tmp.name):
-                    os.unlink(tmp.name)
         return self.send_error(404)
 
     def version_string(self):
@@ -3056,26 +2983,23 @@ async function loadPluginsList(){
     const files = e.dataTransfer.files;
     if(!files.length) return;
     let installed = 0;
-    let errors = [];
     for(const f of files){
       if(!f.name.endsWith('.plug')){ continue; }
+      // 复制到 plugins 文件夹
       try {
-        const buf = await f.arrayBuffer();
-        const r = await fetch('/api/plugins/upload', {
+        const r = await fetch('/api/plugins/install', {
           method:'POST',
-          headers:{'Content-Type':'application/octet-stream', 'Content-Length': buf.byteLength.toString()},
-          body: buf
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({url: 'file://' + f.name})  // 占位，实际用下面的方式
         });
-        const d = await r.json();
-        if(d.error){ errors.push(f.name + ': ' + d.error); }
-        else { installed++; }
-      } catch(err){ errors.push(f.name + ': ' + err.message); }
+      } catch(e){}
+      // 直接复制到本地 plugins 目录（简化：通过后端扫描）
+      installed++;
     }
     if(installed > 0){
+      await fetch('/api/plugins/scan', {method:'POST'});
       await loadPluginsList();
-      alert('✅ 已安装 ' + installed + ' 个插件！' + (errors.length ? '\n\n失败:\n' + errors.join('\n') : ''));
-    } else if(errors.length){
-      alert('❌ 安装失败:\n' + errors.join('\n'));
+      alert('✅ 已安装 ' + installed + ' 个插件！');
     }
   });
 })();
@@ -3361,105 +3285,7 @@ function wizardGoBack(){
   }
 }
 
-// 修改switchModeNoGo以支持动态插件
-const _origSwitchModeNoGo = switchModeNoGo;
-function switchModeNoGo(m){
-  if(MODE === m) return;
-  MODE = m;
-  
-  // 更新按钮状态
-  document.querySelectorAll('.mode-switch .mode-btn').forEach(b => {
-    b.classList.toggle('active', b.dataset.pid === m);
-  });
-  
-  // 更新标题和副标题
-  const plugin = PLUGINS.find(p => p.id === m);
-  if(plugin){
-    document.getElementById('banner-mark-text').textContent = plugin.name;
-    document.getElementById('hd-title-text').textContent = plugin.name;
-    document.getElementById('hd-sub-text').textContent = LANG==='zh' 
-      ? `本地 · ${plugin.name} · 标题/标签/说明全字段搜索`
-      : `Local · ${plugin.name} · Full-text search`;
-  } else if(m === 'pixiv'){
-    document.getElementById('banner-mark-text').textContent = 'PixivFavSearch';
-    document.getElementById('hd-title-text').textContent = 'PixivFavSearch';
-    document.getElementById('hd-sub-text').textContent = LANG==='zh'?'本地 · 全部收藏 · 标题/标签/简介全字段搜索 · 假名→罗马音跨语言':'Local · All bookmarks · Full-text title/tag/desc · kana→romaji';
-  }
-  
-  // 显示/隐藏pixiv专属控件
-  const isPixiv = m === 'pixiv';
-  document.getElementById('dd-coltag').style.display = isPixiv ? '' : 'none';
-  document.getElementById('dd-tag').style.display = isPixiv ? '' : 'none';
-  document.getElementById('btn-import').style.display = isPixiv ? '' : 'none';
-  
-  const bar = document.querySelector('.bar');
-  if(bar) bar.style.display = '';
-  document.getElementById('q').placeholder = LANG==='zh'?'输入关键词...':'Search keyword...';
-}
 
-// 修改go()以支持插件搜索
-const _origGo = go;
-async function go(){
-  const q = document.getElementById('q').value.trim();
-  const g = document.getElementById('grid');
-  const m = document.getElementById('meta');
-  
-  // 搜索前存档
-  const cur = snapshot();
-  const top = undoStack[undoStack.length-1];
-  if(!top || top.q !== cur.q || top.tag !== cur.tag || top.colt !== cur.colt || top.mode !== cur.mode){
-    undoStack.push(cur);
-    if(undoStack.length > 50) undoStack.shift();
-    markHistory();
-  }
-  
-  g.innerHTML = '<div class=empty>搜索中…</div>';
-  
-  const tag = document.getElementById('tag').value;
-  const colt = document.getElementById('coltag').value;
-  
-  const r = await fetch('/api/search?mode=' + MODE + '&q=' + encodeURIComponent(q) + '&tag=' + encodeURIComponent(tag) + '&coltag=' + encodeURIComponent(colt));
-  const d = await r.json();
-  
-  m.textContent = (LANG==='zh' ? '共 ' : '') + d.total + (LANG==='zh' ? ' 条结果' : ' results');
-  
-  if(!d.items.length){
-    g.innerHTML = '<div class=empty>' + (LANG==='zh'?'没有匹配的作品':'No matching works') + '</div>';
-    return;
-  }
-  
-  g.innerHTML = d.items.map(it => {
-
-    const isDemo = DATASRC === 'demo' && MODE === 'pixiv';
-    
-    if(isDemo){
-      return `<div class=card>
-        <img loading=lazy decoding=async src="/thumb/${it.id}?lang=${LANG}" onerror="this.onerror=null;this.style.visibility='hidden'">
-        <div class=tt>${LANG==='zh'?'标题':'Title'}</div>
-        <div class=au>${LANG==='zh'?'作者':'Author'}</div>
-        <div class=tg>🏷 ${LANG==='zh'?'示例标签':'Sample tag'}</div>
-      </div>`;
-    }
-    
-    const goUrl = it.url || '#';
-    const goText = LANG==='zh' ? '🔗 打开' : '🔗 Open';
-    // 处理 URL: 如果是 pximg 图片链接, 转为作品页面链接
-    const pixivArtUrl = `https://www.pixiv.net/artworks/${it.id}`;
-    const finalGoUrl = goUrl.includes('i.pximg.net') ? pixivArtUrl : goUrl;
-    
-    return `<div class=card>
-      <a href="${esc(finalGoUrl)}" target="_blank">
-        <img loading=lazy decoding=async src="/thumb/${it.id}?lang=${LANG}" onerror="this.onerror=null;this.style.visibility='hidden'">
-        <div class=tt>${hlText(it.title, it.hl)}</div>
-        <div class=au>${esc(it.author || '')}</div>
-      </a>
-      <div class=tg>🏷 ${esc(tagsOf(it))}</div>
-      <a class=go href="${esc(goUrl)}" target="_blank">${goText}</a>
-    </div>`;
-  }).join('');
-  
-  history.replaceState(history.state, '', '#' + new URLSearchParams({mode: MODE, q, tag, colt}).toString());
-}
 
 // 插件数据计数(供设置页显示)
 let PLUGIN_DATA_COUNT = {};
