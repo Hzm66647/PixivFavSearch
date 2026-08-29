@@ -14,6 +14,11 @@ __pycache__/
 # 便携 Python 运行时
 python/
 
+# PyInstaller 构建产物（exe 走 GitHub Release，不进仓库）
+build/
+dist/
+*.spec
+
 # 环境/系统文件
 Thumbs.db
 .DS_Store

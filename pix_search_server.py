@@ -27,14 +27,27 @@ try:
 except Exception:
     pass
 
-# 数据目录: 工具所在目录下的 data/(便携, 随项目走)
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+# 数据目录: %LOCALAPPDATA%\PixivFavSearch (桌面应用标准位置, 随用户走)
+APP_DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PixivFavSearch")
+OUT = os.path.join(APP_DATA, "data")
 DATA = os.path.join(OUT, "bookmarks.json")
 DEMO_DATA = os.path.join(OUT, "demo_data.json")
 THUMB = os.path.join(OUT, "thumbs")
 COLTAGS = os.path.join(OUT, "coltags.json")
 os.makedirs(THUMB, exist_ok=True)
-ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pix_assets")
+# onefile 打包: exe 内自带一份示例数据作为首次运行回退(在 _MEIPASS 临时解压目录)
+_MEIPASS = getattr(sys, "_MEIPASS", None)
+if _MEIPASS and not os.path.exists(DEMO_DATA):
+    _bundle_demo = os.path.join(_MEIPASS, "demo_data.json")
+    if os.path.exists(_bundle_demo):
+        try:
+            with open(_bundle_demo, encoding="utf-8") as _f:
+                _demo_src_text = _f.read()
+            with open(DEMO_DATA, "w", encoding="utf-8", newline="\n") as _f:
+                _f.write(_demo_src_text)
+        except Exception:
+            pass
+ASSETS = os.path.join(APP_DATA, "pix_assets")
 os.makedirs(ASSETS, exist_ok=True)
 POS_FILE = os.path.join(ASSETS, "pos.json")
 PORT = int(os.environ.get("PIX_PORT", "8897"))
@@ -479,6 +492,41 @@ def reload_pixiv_if_changed():
         except Exception as e:
             print("pixiv 热更新失败:", repr(e))
 
+# --- 收藏导入/更新(CDP 抓取最新收藏) ---
+_import_state = {"running": False, "code": None, "msg": "", "count": 0, "t": 0.0}
+
+def import_status():
+    """返回当前导入状态(供前端轮询)。t 为完成时间戳, 前端用于判断是否新一轮完成。"""
+    s = dict(_import_state)
+    return s
+
+def _import_worker():
+    """后台线程: 调用 pixiv_export.main() 抓取收藏, 写 bookmarks.json 后触发热重载。"""
+    global _import_state
+    try:
+        import pixiv_export as _ex
+        code = _ex.main()
+        count = len(BOOKMARKS)
+        # 触发热重载(每次搜索前也会自动检查, 这里主动重载一次)
+        reload_pixiv_if_changed()
+        count = len(BOOKMARKS)
+        if code == 0:
+            msg = f"导入完成, 当前共 {count} 幅收藏"
+        else:
+            msg = "导入失败。已尝试自动启动调试浏览器, 请在弹出的 Pixiv 页面确认已登录, 再点一次导入"
+        _import_state.update({"running": False, "code": code, "msg": msg, "count": count, "t": time.time()})
+    except Exception as e:
+        _import_state.update({"running": False, "code": -1, "msg": f"导入异常: {repr(e)}", "count": 0, "t": time.time()})
+
+def start_import():
+    """启动导入任务。已在跑则返回 False。"""
+    if _import_state["running"]:
+        return False
+    _import_state.update({"running": True, "code": None, "msg": "导入中…", "count": 0, "t": 0.0})
+    import threading as _thr
+    _thr.Thread(target=_import_worker, daemon=True).start()
+    return True
+
 # 中文/日文别名 → 英文标签/角色名(多语言关联, 中文搜索也能命中)
 NH_ALIAS = {
     "碧蓝档案": ["blue archive"], "蔚蓝档案": ["blue archive"], "ブルアカ": ["blue archive"], "ブルーアーカイブ": ["blue archive"],
@@ -568,33 +616,90 @@ if os.path.exists(COLTAGS):
         print("收藏标签加载失败:", repr(e))
 
 THUMB_LOCK = threading.Lock()
-def thumb_for(item):
-    """返回本地缩略图路径(不存在则下载)。"""
+THUMB_SEM = threading.Semaphore(3)
+
+# demo 模式的示例占位图配色(每组 2 色渐变, 由 id 哈希决定, 稳定不闪变)
+_DEMO_PALETTES = [
+    ("#ff9a9e", "#fad0c4"), ("#a18cd1", "#fbc2eb"), ("#fbc2eb", "#a6c1ee"),
+    ("#84fab0", "#8fd3f4"), ("#fccb90", "#d57eeb"), ("#f6d365", "#fda085"),
+    ("#f093fb", "#f5576c"), ("#4facfe", "#00f2fe"), ("#43e97b", "#38f9d7"),
+    ("#fa709a", "#fee140"), ("#30cfd0", "#330867"), ("#a8edea", "#fed6e3"),
+]
+def demo_thumb_svg(item, lang="zh"):
+    """demo 数据(未导入收藏时)的本地占位图: 渐变色背景 + 占位文字(标题/作者/PID 用示例文案, 不泄露真实收藏)。
+    lang='en' 时文字为英文占位(Title/Author/Sample), 否则中文(标题/作者/示例)。纯本地生成, 不依赖网络。"""
+    pid = str(item.get("id", ""))
+    en = lang == "en"
+    title = "Title" if en else "标题"
+    author = "Author" if en else "作者"
+    pid_lbl = "Sample" if en else "示例"
+    h = 0
+    for ch in pid:
+        h = (h * 31 + ord(ch)) & 0xffff
+    c1, c2 = _DEMO_PALETTES[h % len(_DEMO_PALETTES)]
+    return ('<svg xmlns="http://www.w3.org/2000/svg" width="400" height="400" viewBox="0 0 400 400">'
+            f'<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+            f'<stop offset="0" stop-color="{c1}"/><stop offset="1" stop-color="{c2}"/></linearGradient></defs>'
+            '<rect width="400" height="400" fill="url(#g)"/>'
+            '<rect x="8" y="8" width="384" height="384" rx="10" fill="rgba(255,255,255,0.08)"/>'
+            f'<text x="200" y="120" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="64" fill="rgba(255,255,255,0.35)">🖼</text>'
+            f'<text x="200" y="215" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="26" font-weight="600" fill="#fff">{title}</text>'
+            f'<text x="200" y="255" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="17" fill="rgba(255,255,255,0.92)">{author}</text>'
+            f'<text x="20" y="380" font-family="Consolas,monospace" font-size="13" fill="rgba(255,255,255,0.55)">{pid_lbl} {pid}</text>'
+            '<text x="380" y="380" text-anchor="end" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="rgba(255,255,255,0.55)">PixivFavSearch demo</text>'
+            '</svg>')
+
+def thumb_for(item, lang="zh"):
+    """返回本地缩略图路径(不存在则下载, 受并发信号量限制避免占满线程池)。
+    demo 数据(未导入收藏)直接返回本地 SVG 占位图。lang 参数只在 demo 模式生效(控制 SVG 占位文字语言)。"""
+    # demo 模式: 不尝试下载, 直接返回本地占位图
+    if _data_src == "demo":
+        pid = str(item["id"])
+        svg = demo_thumb_svg(item, lang)
+        _demo_dir = os.path.join(OUT, "demo_thumbs")
+        try:
+            os.makedirs(_demo_dir, exist_ok=True)
+        except Exception:
+            pass
+        # lang 写入文件名, 避免 zh/en 缓存互相污染
+        demo_local = os.path.join(_demo_dir, pid + ("_en.svg" if lang == "en" else "_zh.svg"))
+        try:
+            with open(demo_local, "w", encoding="utf-8") as f:
+                f.write(svg)
+            return demo_local
+        except Exception:
+            return None
     pid = str(item["id"])
     local = os.path.join(THUMB, pid + ".jpg")
     if os.path.exists(local) and os.path.getsize(local) > 500:
         return local
     url = item.get("url", "")
-    if not url:
+    if not url or "i.pximg.net" not in url:
+        # 不是图片 URL(旧数据可能是页面 URL), 直接跳过下载, 返回 None 让前端显示占位
         return None
-    try:
-        req = urllib.request.Request(url, headers={
-            "Referer": "https://www.pixiv.net/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
-        })
-        # 禁重定向: 防 SSRF 跳内网
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **k):
-                return None
-        op = urllib.request.build_opener(NoRedirect)
-        with op.open(req, timeout=25) as r, open(local, "wb") as f:
-            data = r.read(5 * 1024 * 1024 + 1)
-            if len(data) > 5 * 1024 * 1024:
-                return None
-            f.write(data)
-        return local if os.path.getsize(local) > 500 else None
-    except Exception:
-        return None
+    # 并发限制: 同时最多 3 个下载, 防止 200 张卡片请求占满服务线程
+    with THUMB_SEM:
+        # 二次检查(可能在排队期间已下载)
+        if os.path.exists(local) and os.path.getsize(local) > 500:
+            return local
+        try:
+            req = urllib.request.Request(url, headers={
+                "Referer": "https://www.pixiv.net/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
+            })
+            # 禁重定向: 防 SSRF 跳内网
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **k):
+                    return None
+            op = urllib.request.build_opener(NoRedirect)
+            with op.open(req, timeout=12) as r, open(local, "wb") as f:
+                data = r.read(5 * 1024 * 1024 + 1)
+                if len(data) > 5 * 1024 * 1024:
+                    return None
+                f.write(data)
+            return local if os.path.getsize(local) > 500 else None
+        except Exception:
+            return None
 
 # ========== 局域网访问安全(白名单 + Host校验 + 访问令牌 + 限速) ==========
 # 只放行本机 + 手动添加的设备 IP。其余局域网设备一律 403。
@@ -833,7 +938,7 @@ class H(BaseHTTPRequestHandler):
                 self._sec_headers()
                 self.end_headers()
                 return
-            self.send_html(INDEX)
+            self.send_html(INDEX.replace("__DATASRC__", _data_src))
         elif u.path == "/api/search":
             mode = urllib.parse.parse_qs(u.query).get("mode", ["pixiv"])[0].strip()
             q = urllib.parse.parse_qs(u.query).get("q", [""])[0].strip()
@@ -899,18 +1004,33 @@ class H(BaseHTTPRequestHandler):
                     c[tag] = c.get(tag, 0) + 1
             tags = [{"tag": k, "count": v} for k, v in sorted(c.items(), key=lambda x: -x[1])]
             self.send_json(200, {"total": len(tags), "tags": tags})
+        elif u.path == "/api/import":
+            # 从 Pixiv 抓取最新收藏(CDP, cookie 不落盘)。POST 启动, 完成后热重载
+            if self.command == "POST":
+                started = start_import()
+                self.send_json(200, {"ok": True, "started": started})
+            else:
+                st = import_status()
+                self.send_json(200, st)
+        elif u.path == "/api/import-status":
+            self.send_json(200, import_status())
         elif u.path.startswith("/thumb/"):
             pid = os.path.basename(u.path)
             it = next((x for x in BOOKMARKS if str(x["id"])==pid), None)
             if not it:
                 return self.send_error(404)
-            local = thumb_for(it)
+            # 解析 lang 参数(demo 模式时前端用 ?lang= 切换占位文字语言, user 模式忽略)
+            lang = urllib.parse.parse_qs(u.query).get("lang", ["zh"])[0]
+            if lang not in ("en", "zh"):
+                lang = "zh"
+            local = thumb_for(it, lang)
             if not local:
                 return self.send_error(404)
             with open(local, "rb") as f:
                 body = f.read()
+            ctype = "image/svg+xml" if local.endswith(".svg") else "image/jpeg"
             self.send_response(200)
-            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "max-age=86400")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -968,6 +1088,11 @@ class H(BaseHTTPRequestHandler):
             self._deny(429, "Too Many Requests (pix_search_server)")
             return
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/api/import":
+            # 从 Pixiv 抓取最新收藏(CDP)。启动导入线程, 返回是否已启动
+            started = start_import()
+            self.send_json(200, {"ok": True, "started": started})
+            return
         m = _re.match(r"^/api/asset/(banner|avatar)$", u.path)
         if m:
             kind = m.group(1)
@@ -1089,6 +1214,10 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
  .mode-btn:hover{color:#fff;transform:scale(1.05)}
  .mode-btn.active{background:linear-gradient(135deg,#ef9eff,#c77dff);color:#2b0030;box-shadow:0 2px 10px rgba(0,0,0,.35)}
  .mode-btn:active{transform:scale(.9)}
+ .import-btn{border:none;cursor:pointer;font-size:12px;font-weight:700;color:#2b0030;background:linear-gradient(135deg,#ef9eff,#c77dff);padding:6px 14px;border-radius:18px;box-shadow:0 2px 10px rgba(0,0,0,.35);transition:background .2s,transform .18s cubic-bezier(.34,1.56,.64,1),opacity .2s}
+ .import-btn:hover{transform:scale(1.06);box-shadow:0 4px 14px rgba(0,0,0,.4)}
+ .import-btn:active{transform:scale(.9)}
+ .import-btn.loading{opacity:.65;cursor:wait}
  .banner-btns{position:absolute;top:10px;right:10px;z-index:3;display:none;gap:6px}
  .banner:hover .banner-btns{display:flex}
  .swap-btn{display:inline-flex;align-items:center;gap:6px;border:none;cursor:pointer;font-size:12px;font-weight:600;color:#fff;background:rgba(0,0,0,.45);padding:6px 13px;border-radius:20px;backdrop-filter:blur(8px);transition:background .2s,transform .18s cubic-bezier(.34,1.56,.64,1)}
@@ -1194,62 +1323,65 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
   <div class=mode-switch>
    <button class="mode-btn active" id=btn-pixiv onclick="switchMode('pixiv')">📚 Pixiv</button>
    <button class="lang-btn" id=btn-lang onclick="toggleLang()">中 / EN</button>
+   <button class=import-btn id=btn-import onclick="doImport()" data-l data-zh="📥 导入/更新收藏" data-en="📥 Import / Update">📥 导入/更新收藏</button>
   </div>
   <div class=banner-btns>
-   <button class=swap-btn onclick=pick('banner')>🖼 更换横幅</button>
-   <button class=swap-btn onclick=enterAdj('banner')>✋ 调整位置</button>
+   <button class=swap-btn onclick=pick('banner') data-l data-zh="🖼 更换横幅" data-en="🖼 Change Banner">🖼 更换横幅</button>
+   <button class=swap-btn onclick=enterAdj('banner') data-l data-zh="✋ 调整位置" data-en="✋ Adjust Position">✋ 调整位置</button>
   </div>
-  <button class=adj-done id=done-banner onclick=doneAdj('banner')>✓ 完成</button>
+  <button class=adj-done id=done-banner onclick=doneAdj('banner') data-l data-zh="✓ 完成" data-en="✓ Done">✓ 完成</button>
  </div>
  <div class=hd-row>
   <div class=avatar id=avatar>
    <svg class=avatar-ph viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round'><circle cx='12' cy='8' r='4'/><path d='M4 21c0-4.2 3.6-6.4 8-6.4s8 2.2 8 6.4'/></svg>
    <img id=avatar-img src=/assets/avatar alt='' onerror="this.style.display='none'">
-   <button class=avatar-swap swap-photo onclick=pick('avatar') title=更换头像>📷</button>
-   <button class=avatar-swap swap-move onclick=enterAdj('avatar') title=调整位置>✋</button>
-   <button class=adj-done-av id=done-avatar onclick=doneAdj('avatar') title=完成>✓</button>
+   <button class=avatar-swap swap-photo onclick=pick('avatar') title=更换头像 data-l-t data-zh-t="更换头像" data-en-t="Change Avatar">📷</button>
+   <button class=avatar-swap swap-move onclick=enterAdj('avatar') title=调整位置 data-l-t data-zh-t="调整位置" data-en-t="Adjust Position">✋</button>
+   <button class=adj-done-av id=done-avatar onclick=doneAdj('avatar') title=完成 data-l-t data-zh-t="完成" data-en-t="Done">✓</button>
   </div>
   <div class=hd-titles>
    <div class=hd-title><span id=hd-title-text data-l data-zh="Pixiv 书签搜索" data-en="PixivFavSearch">Pixiv 书签搜索</span></div>
    <div class=hd-sub id=hd-sub-text data-l data-zh="本地 · 全部收藏 · 标题/标签/简介全字段搜索 · 假名→罗马音跨语言" data-en="Local · All bookmarks · Full-text title/tag/desc · kana→romaji">本地 · 全部收藏 · 标题/标签/简介全字段搜索 · 假名→罗马音跨语言</div>
   </div>
-  <div class=hd-badge>本地运行中</div>
+  <div class=hd-badge data-l data-zh="本地运行中" data-en="Running locally">本地运行中</div>
  </div>
  <div class=bar>
   <div class=dd-container id=dd-coltag>
-   <select id=coltag onchange="go()" hidden><option value="">全部收藏标签</option></select>
-   <div class=dd-trigger role=button tabindex=0><span class=dd-text id=coltag-text>全部收藏标签</span><span class=dd-arrow>▾</span></div>
+   <select id=coltag onchange="go()" hidden><option value="" data-l data-zh="全部收藏标签" data-en="All coltags">全部收藏标签</option></select>
+   <div class=dd-trigger role=button tabindex=0><span class=dd-text id=coltag-text data-l data-zh="全部收藏标签" data-en="All coltags">全部收藏标签</span><span class=dd-arrow>▾</span></div>
    <div class=dd-menu id=coltag-menu></div>
   </div>
   <div class=dd-container id=dd-tag>
-   <select id=tag onchange="go()" hidden><option value="">全部作品标签(不限)</option></select>
-   <div class=dd-trigger role=button tabindex=0><span class=dd-text id=tag-text>全部作品标签(不限)</span><span class=dd-arrow>▾</span></div>
+   <select id=tag onchange="go()" hidden><option value="" data-l data-zh="全部作品标签(不限)" data-en="All tags (any)">全部作品标签(不限)</option></select>
+   <div class=dd-trigger role=button tabindex=0><span class=dd-text id=tag-text data-l data-zh="全部作品标签(不限)" data-en="All tags (any)">全部作品标签(不限)</span><span class=dd-arrow>▾</span></div>
    <div class=dd-menu id=tag-menu></div>
   </div>
   <input id=q data-l-ph data-zh="输入关键词，如: ibuki / 水着 / ブルアカ / Plana ..." data-en="Search keyword, e.g. ibuki / swimsuit / Plana ..." placeholder="输入关键词，如: ibuki / 水着 / ブルアカ / Plana ..." onkeydown="if(event.key==='Enter')go()">
-  <button onclick="go()">搜索</button>
+  <button onclick="go()" data-l data-zh="搜索" data-en="Search">搜索</button>
   </div>
   <div id=hint></div>
 </header>
 <div id=crop-modal class=crop-modal>
  <div class=crop-box>
-  <div class=crop-title>✂ 裁剪图片 — 框内就是要显示的区域</div>
+  <div class=crop-title data-l data-zh="✂ 裁剪图片 — 框内就是要显示的区域" data-en="✂ Crop Image — area inside frame is what shows">✂ 裁剪图片 — 框内就是要显示的区域</div>
   <div class=crop-stage id=crop-stage>
    <img id=crop-img alt=''>
    <div class=crop-frame id=crop-frame></div>
-   <div class=crop-hint>拖动图片选位置 · 滚轮缩放 · 框内 = 最终显示</div>
+   <div class=crop-hint data-l data-zh="拖动图片选位置 · 滚轮缩放 · 框内 = 最终显示" data-en="Drag to position · Scroll to zoom · Inside frame = final view">拖动图片选位置 · 滚轮缩放 · 框内 = 最终显示</div>
   </div>
   <div class=crop-bar>
-   <button class="crop-btn cancel" onclick=cropCancel()>取消</button>
-   <button class="crop-btn ok" onclick=cropConfirm()>✓ 确认裁剪</button>
+   <button class="crop-btn cancel" onclick=cropCancel() data-l data-zh="取消" data-en="Cancel">取消</button>
+   <button class="crop-btn ok" onclick=cropConfirm() data-l data-zh="✓ 确认裁剪" data-en="✓ Confirm Crop">✓ 确认裁剪</button>
   </div>
  </div>
 </div>
 <div id=meta></div><div id=grid class=grid></div>
-<button id=home-btn title="回到本站主页" onclick="location.href='/'"><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 10.5L12 3l9 7.5'/><path d='M5 9.5V21h14V9.5'/></svg><span class=ttip>🏠 回到本站</span></button>
+<div id=demo-bar data-l data-zh="🎨 当前为效果预览，导入收藏后即可正常使用" data-en="🎨 Preview mode - import your bookmarks to use" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:60;background:rgba(18,18,32,.78);backdrop-filter:blur(8px);color:#fff;font-size:13px;font-weight:600;padding:10px 20px;border-radius:22px;box-shadow:0 6px 18px rgba(0,0,0,.4);pointer-events:none;white-space:nowrap;max-width:92vw;text-align:center">🎨 当前为效果预览，导入收藏后即可正常使用</div>
+<button id=home-btn title="回到本站主页" data-l-t data-zh-t="回到本站主页" data-en-t="Back to homepage" onclick="location.href='/'"><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 10.5L12 3l9 7.5'/><path d='M5 9.5V21h14V9.5'/></svg><span class=ttip data-l data-zh="🏠 回到本站" data-en="🏠 Home">🏠 回到本站</span></button>
 <script>
  // --- 顶部按钮栏 ---
  let MODE='pixiv';
+ let DATASRC='__DATASRC__'; // 'user'|'demo'|'no-data'(服务端注入)
  function switchMode(m){
   if(MODE===m)return;
   switchModeNoGo(m);
@@ -1260,7 +1392,7 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
  function pick(kind){_fi.dataset.kind=kind;_fi.click();}
  _fi.addEventListener('change',()=>{
   const f=_fi.files[0];if(!f)return;
-  if(f.size>15*1024*1024){alert('图片太大了,请选 15MB 以内的');return;}
+  if(f.size>15*1024*1024){alert(LANG==='zh'?'图片太大了,请选 15MB 以内的':'Image too large, pick under 15MB');return;}
   openCrop(_fi.dataset.kind,f); // 先框选,确认后才上传
   _fi.value='';
  });
@@ -1275,7 +1407,7 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
  function enterAdj(kind){
   if(adj)return;
   const img=document.getElementById(kind+'-img');
-  if(!img||img.style.display==='none'){alert('先上传图片,再调整显示位置');return;}
+  if(!img||img.style.display==='none'){alert(LANG==='zh'?'先上传图片,再调整显示位置':'Upload an image first');return;}
   adj={kind,img,px:POS[kind].x,py:POS[kind].y,ps:POS[kind].s,orig:{x:POS[kind].x,y:POS[kind].y,s:POS[kind].s}};
   img.classList.add('adj');
   document.getElementById('done-'+kind).style.display='flex';
@@ -1297,7 +1429,7 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
   POS[kind].x=Math.round(adj.px);POS[kind].y=Math.round(adj.py);POS[kind].s=Math.round(adj.ps*100)/100;
   exitAdj();
   fetch('/api/asset-pos',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({[kind]:POS[kind]})});
-  const h=document.getElementById('hint');h.textContent='位置已保存 ✓';setTimeout(()=>h.textContent='',1800);
+  const h=document.getElementById('hint');h.textContent=LANG==='zh'?'位置已保存 ✓':'Position saved ✓';setTimeout(()=>h.textContent='',1800);
  }
  function cancelAdj(){
   if(!adj)return;
@@ -1401,9 +1533,9 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
      const img=document.getElementById(kind+'-img');
      img.style.display='';
      img.src='/assets/'+kind+'?t='+Date.now();
-     const h=document.getElementById('hint');h.textContent='已裁剪并保存 ✓(可再点「调整位置」微调)';setTimeout(()=>h.textContent='',2500);
-    }else{alert('上传失败: '+j.error);}
-   }catch(e){alert('上传失败: '+e);}
+     const h=document.getElementById('hint');h.textContent=LANG==='zh'?'已裁剪并保存 ✓(可再点「调整位置」微调)':'Cropped & saved ✓';setTimeout(()=>h.textContent='',2500);
+    }else{alert((LANG==='zh'?'上传失败: ':'Upload failed: ')+j.error);}
+   }catch(e){alert((LANG==='zh'?'上传失败: ':'Upload failed: ')+e);}
   },'image/jpeg',0.92);
   cropCancel();
  }
@@ -1442,27 +1574,45 @@ function hlText(s, words){
   document.addEventListener('keydown',e=>{ if(e.key==='Escape') close(); });
  }
  // 加载收藏标签下拉
- (async function(){
-  const r=await fetch('/api/coltags');
-  const d=await r.json();
-  const sel=document.getElementById('coltag');
-  sel.innerHTML='<option value="">全部收藏标签</option>'+d.tags.map(t=>`<option value="${esc(t.tag)}">${esc(t.tag)} (${t.count})</option>`).join('');
-  setupDD('coltag','coltag-text','coltag-menu','dd-coltag');
- })();
+ function loadColtags(){
+  const r=document.getElementById('coltag');
+  return fetch('/api/coltags').then(r=>r.json()).then(d=>{
+   const lbl=LANG==='zh'?'全部收藏标签':'All coltags';
+   r.innerHTML=`<option value="">${lbl}</option>`+d.tags.map(t=>`<option value="${esc(t.tag)}">${esc(t.tag)} (${t.count})</option>`).join('');
+   syncDD();
+  });
+ }
+ (async function(){ await loadColtags(); setupDD('coltag','coltag-text','coltag-menu','dd-coltag'); })();
  // 加载作品标签下拉
- (async function(){
-  const r=await fetch('/api/tags');
-  const d=await r.json();
-  const sel=document.getElementById('tag');
-  sel.innerHTML='<option value="">全部作品标签(不限)</option>'+d.tags.map(t=>`<option value="${esc(t.tag)}">${esc(t.tag)} (${t.count})</option>`).join('');
-  setupDD('tag','tag-text','tag-menu','dd-tag');
- })();
+ function loadTags(){
+  const r=document.getElementById('tag');
+  return fetch('/api/tags').then(r=>r.json()).then(d=>{
+   const lbl=LANG==='zh'?'全部作品标签(不限)':'All tags (any)';
+   r.innerHTML=`<option value="">${lbl}</option>`+d.tags.map(t=>`<option value="${esc(t.tag)}">${esc(t.tag)} (${t.count})</option>`).join('');
+   syncDD();
+  });
+ }
+ (async function(){ await loadTags(); setupDD('tag','tag-text','tag-menu','dd-tag'); })();
+// --- demo 模式(未导入收藏): 页面打开自动展示全部示例图 ---
+(async function(){
+ await Promise.all([
+  (async()=>{await loadColtags();})(),
+  (async()=>{await loadTags();})()
+ ]);
+ const _db=document.getElementById('demo-bar');
+ if(DATASRC==='demo'){
+  if(_db)_db.style.display='block'; // 底部固定提示条: 仅 demo 模式显示
+  if(!location.hash){ go(); } // 自动搜一次, 展示全部示例
+ }else if(_db){
+  _db.style.display='none'; // user/no-data 模式隐藏
+ }
+})();
  // 同步两个下拉的显示文本(undo/重放设置 select.value 后调用)
  function syncDD(){
   const c=document.getElementById('coltag');
-  document.getElementById('coltag-text').textContent=c.options[c.selectedIndex]?c.options[c.selectedIndex].text:'全部收藏标签';
+  document.getElementById('coltag-text').textContent=c.options[c.selectedIndex]?c.options[c.selectedIndex].text:(LANG==='zh'?'全部收藏标签':'All coltags');
   const t=document.getElementById('tag');
-  document.getElementById('tag-text').textContent=t.options[t.selectedIndex]?t.options[t.selectedIndex].text:'全部作品标签(不限)';
+  document.getElementById('tag-text').textContent=t.options[t.selectedIndex]?t.options[t.selectedIndex].text:(LANG==='zh'?'全部作品标签(不限)':'All tags (any)');
  }
  let undoStack=[]; // 每次搜索前保存一次状态,按 Ctrl+Z / Alt+← 可撤回
  function snapshot(){
@@ -1492,12 +1642,12 @@ function switchModeNoGo(m){
  document.getElementById('btn-pixiv').classList.toggle('active',m==='pixiv');
  document.getElementById('banner-mark-text').textContent='PixivFavSearch';
  document.getElementById('hd-title-text').textContent='PixivFavSearch';
- document.getElementById('hd-sub-text').textContent='本地 · 全部收藏 · 标题/标签/简介全字段搜索 · 假名→罗马音跨语言';
+ document.getElementById('hd-sub-text').textContent=LANG==='zh'?'本地 · 全部收藏 · 标题/标签/简介全字段搜索 · 假名→罗马音跨语言':'Local · All bookmarks · Full-text title/tag/desc · kana→romaji';
  document.getElementById('dd-coltag').style.display='';
  document.getElementById('dd-tag').style.display='';
  const bar=document.querySelector('.bar');
  if(bar) bar.style.display='';
- document.getElementById('q').placeholder='输入关键词，如: ibuki / 水着 / ブルアカ / Plana ...';
+ document.getElementById('q').placeholder=LANG==='zh'?'输入关键词，如: ibuki / 水着 / ブルアカ / Plana ...':'Search keyword, e.g. ibuki / swimsuit / Plana ...';
  }
  
 // --- 从 pixiv 页面按「后退」键/鼠标侧键回来时:页面重载,按 URL 里的 #参数 自动恢复刚才的搜索结果 ---
@@ -1533,6 +1683,25 @@ function langApply(){
  const q=document.getElementById('q');
  const ph=q.getAttribute(zh?'data-zh':'data-en');
  if(ph!=null) q.placeholder=ph;
+ document.querySelectorAll('[data-l-t]').forEach(el=>{
+  const t=el.getAttribute(zh?'data-zh-t':'data-en-t');
+  if(t!=null) el.title=t;
+ });
+ // 刷新两个下拉的语言文案
+ loadColtags(); loadTags();
+ // demo 模式: 已渲染的占位卡片文字与缩略图 ?lang= 跟随语言切换
+ if(DATASRC==='demo'){
+  const zh=LANG==='zh';
+  document.querySelectorAll('#grid .card').forEach(c=>{
+   const tt=c.querySelector('.tt'); if(tt) tt.textContent=zh?'标题':'Title';
+   const au=c.querySelector('.au'); if(au) au.textContent=zh?'作者':'Author';
+   const tg=c.querySelector('.tg'); if(tg) tg.textContent='🏷 '+(zh?'示例标签':'Sample tag');
+   const im=c.querySelector('img'); if(im&&im.src.indexOf('/thumb/')>=0){
+    const base=im.src.split('/thumb/')[1].split('?')[0];
+    im.src='/thumb/'+base+'?lang='+LANG; // 不同 lang 不同 URL, 浏览器缓存天然不串
+   }
+  });
+ }
 }
 function toggleLang(){ LANG=LANG==='zh'?'en':'zh'; langApply(); }
 // --- 更新检查提示 ---
@@ -1543,16 +1712,118 @@ function toggleLang(){ LANG=LANG==='zh'?'en':'zh'; langApply(); }
   if(d.update){
    const el=document.createElement('div');
    el.style.cssText='position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:99;background:linear-gradient(135deg,#ef9eff,#c77dff);color:#2b0030;font-size:13px;font-weight:700;padding:10px 18px;border-radius:24px;box-shadow:0 6px 20px rgba(0,0,0,.4);cursor:pointer';
-   el.textContent='✨ 新版本 v'+d.latest+' 可用, 点击前往下载';
+   el.textContent=LANG==='zh'?'✨ 新版本 v'+d.latest+' 可用, 点击前往下载':'✨ v'+d.latest+' available, click to download';
    el.onclick=()=>location.href=d.url||'https://github.com/Hzm66647/PixivFavSearch/releases/latest';
    document.body.appendChild(el);
   }
  }catch(e){}
 })();
+
+// === 核心搜索(开源版修复: 补回丢失的 go/undo) ===
+let _hs=0;
+function markHistory(){ history.pushState({hs:++_hs},'',location.pathname); }
+function undoSearch(){
+ if(!undoStack.length)return;
+ const s=undoStack.pop();
+ restoreState(s);
+ markHistory();
+}
+async function go(){
+ const q=document.getElementById('q').value.trim();
+ const tag=document.getElementById('tag').value;
+ const colt=document.getElementById('coltag').value;
+ const g=document.getElementById('grid');const m=document.getElementById('meta');
+ // 搜索前先存档(仅当和栈顶不同才存,避免重复搜索塞满栈)
+ const cur=snapshot();
+ const top=undoStack[undoStack.length-1];
+ if(!top||top.q!==cur.q||top.tag!==cur.tag||top.colt!==cur.colt||top.mode!==cur.mode){
+  undoStack.push(cur);if(undoStack.length>50)undoStack.shift();
+  markHistory(); // 多压一个历史项,让 Alt+←/鼠标后退 能先触发 popstate 事件
+ }
+ g.innerHTML='<div class=empty>搜索中…</div>';
+ const r=await fetch('/api/search?mode='+MODE+'&q='+encodeURIComponent(q)+'&tag='+encodeURIComponent(tag)+'&coltag='+encodeURIComponent(colt));
+ const d=await r.json();
+ m.textContent=(LANG==='zh'
+ ?(colt?'收藏标签「'+esc(colt)+'」内 · ':'')+(tag?'作品标签「'+esc(tag)+'」内 · ':'')+'共 '+d.total+' 幅作品命中(标题+标签+说明文字)'+(d.total>200?'，显示前200':'')
+ :(colt?'In coltag "'+esc(colt)+'" · ':'')+(tag?'In tag "'+esc(tag)+'" · ':'')+d.total+' works'+(d.total>200?' · showing first 200':''));
+ if(!d.items.length){g.innerHTML='<div class=empty>'+(LANG==='zh'?'没有匹配的作品':'No matching works')+'</div>';return;}
+ g.innerHTML=d.items.map(it=>{
+  if(DATASRC==='demo'){
+   // demo 模式: 纯展示占位卡片 — 无链接、无打开按钮、标题/作者/标签用占位文案
+   return `<div class=card>
+   <img loading=lazy decoding=async src="/thumb/${it.id}?lang=${LANG}" onerror="this.onerror=null;this.style.visibility='hidden'">
+   <div class=tt>${LANG==='zh'?'标题':'Title'}</div>
+   <div class=au>${LANG==='zh'?'作者':'Author'}</div>
+   <div class=tg>🏷 ${LANG==='zh'?'示例标签':'Sample tag'}</div>
+  </div>`;
+  }
+  return `<div class=card>
+   <a href="https://www.pixiv.net/artworks/${it.id}">
+     <img loading=lazy decoding=async src="/thumb/${it.id}" onerror="this.onerror=null;this.style.visibility='hidden'">
+     <div class=tt>${hlText(it.title, it.hl)}</div>
+     <div class=au>${esc(it.userName)}</div>
+   </a>
+   <div class=tg>🏷 ${esc(tagsOf(it))}</div>
+   <a class=go href="https://www.pixiv.net/artworks/${it.id}">🔗 ${LANG==='zh'?'打开 Pixiv':'Open Pixiv'}</a>
+ </div>`;
+ }).join('');
+ // 把搜索条件写进 URL(#参数),从外部页面按后退键回来时能自动恢复结果
+ history.replaceState(history.state,'','#'+new URLSearchParams({mode:MODE,q:q,tag:tag,colt:colt}).toString());
+}
+// Ctrl+Z 撤销(捕获阶段,拦截输入框原生撤销)
+document.addEventListener('keydown',function(e){
+ if((e.ctrlKey||e.metaKey)&&(e.key==='z'||e.key==='Z')){e.preventDefault();e.stopPropagation();undoSearch();}
+},true);
+// 导入/更新收藏(CDP 抓取最新收藏)
+async function doImport(){
+ const btn=document.getElementById('btn-import');
+ const hint=document.getElementById('hint');
+ if(btn.classList.contains('loading'))return; // 已在导入中
+ btn.classList.add('loading');btn.textContent=LANG==='zh'?'⏳ 导入中…':'⏳ Importing…';
+ hint.textContent=LANG==='zh'?'正在连接浏览器抓取最新收藏, 请稍候…':'Connecting to browser to fetch latest bookmarks…';
+ try{
+  const r=await fetch('/api/import',{method:'POST'});
+  const j=await r.json();
+  if(!j.started){ hint.textContent=LANG==='zh'?'已有导入任务在运行, 请稍候…':'Import already running…'; btn.classList.remove('loading');btn.textContent=(LANG==='zh'?'📥 导入/更新收藏':'📥 Import / Update'); return; }
+  // 轮询状态直到完成(最多 180s)
+  for(let i=0;i<90;i++){
+   await new Promise(res=>setTimeout(res,2000));
+   const sr=await fetch('/api/import-status');
+   const s=await sr.json();
+   if(!s.running){
+    hint.style.color=s.code===0?'#34C759':'#FF453A';
+    hint.textContent=s.msg||(LANG==='zh'?'导入完成':'Done');
+    btn.classList.remove('loading');btn.textContent=(LANG==='zh'?'📥 导入/更新收藏':'📥 Import / Update');
+    if(s.code===0){ await go(); } // 刷新搜索结果(数据已热重载)
+    setTimeout(()=>{hint.style.color='';},6000);
+    return;
+   }
+  }
+  hint.textContent=LANG==='zh'?'导入超时, 请检查浏览器调试端口是否开启':'Import timeout, check browser debug port';
+ }catch(e){
+  hint.style.color='#FF453A';hint.textContent=(LANG==='zh'?'导入请求失败: ':'Import request failed: ')+e.message;
+  setTimeout(()=>{hint.style.color='';},6000);
+ }
+ btn.classList.remove('loading');btn.textContent=(LANG==='zh'?'📥 导入/更新收藏':'📥 Import / Update');
+}
+// Alt+← / 鼠标后退 → popstate 恢复上一步搜索
+window.addEventListener('popstate',function(){
+ if(undoStack.length){
+  const s=undoStack.pop();
+  restoreState(s);
+  markHistory();
+ }
+});
 </script>
 """
 
-if __name__ == "__main__":
+# --- 可复用的启动/停止函数(供 desktop_app 导入调用) ---
+_server = None
+def start_server(host="127.0.0.1", port=None, daemon=True):
+    global _server
+    if _server is not None and _server._serving_thread and _server._serving_thread.is_alive():
+        return _server
+    port = port or PORT
     # 提高连接排队容量: 默认 request_queue_size=5, 浏览器并发拉图/多设备访问时会拒连
     ThreadingHTTPServer.request_queue_size = 128
     # 线程上限: 防瞬时并发/慢速 DoS 耗尽线程
@@ -1567,7 +1838,6 @@ if __name__ == "__main__":
             return
         return _orig_process(self, request, client_address)
     ThreadingHTTPServer.process_request = _limited_process
-    # 在 process_request_thread 中释放信号量
     _orig_thread = ThreadingHTTPServer.process_request_thread
     def _release_thread(self, request, client_address):
         try:
@@ -1576,6 +1846,28 @@ if __name__ == "__main__":
             _THREAD_SEM.release()
     ThreadingHTTPServer.process_request_thread = _release_thread
 
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
-    print(f"✅ 已启动: 浏览器打开 http://127.0.0.1:{PORT}/  (线程上限 {_MAX_THREADS}, 局域网白名单模式, 仅放行 {sorted(ALLOWED_IPS)})")
-    srv.serve_forever()
+    srv = ThreadingHTTPServer((host, port), H)
+    _server = srv
+    t = threading.Thread(target=srv.serve_forever, daemon=daemon)
+    srv._serving_thread = t
+    t.start()
+    return srv
+
+def stop_server():
+    global _server
+    if _server is not None:
+        try: _server.shutdown()
+        except Exception: pass
+        try: _server.server_close()
+        except Exception: pass
+        _server = None
+
+if __name__ == "__main__":
+    # 命令行直接运行: 前台绑定 0.0.0.0 供局域网访问, 阻塞等待
+    srv = start_server(host="0.0.0.0", daemon=False)
+    print(f"✅ 已启动: 浏览器打开 http://127.0.0.1:{PORT}/  (局域网白名单模式, 仅放行 {sorted(ALLOWED_IPS)})")
+    try:
+        while srv._serving_thread.is_alive():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        stop_server()
