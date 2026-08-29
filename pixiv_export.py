@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""PixivFavSearch 收藏导出器 (多方案回退, cookie 不落盘)
+"""PixivFavSearch 收藏导出器 (CDP Network.loadNetworkResource, 最优方案)
 
-抓取路径 (按优先级尝试):
-  A. CDP 读已有调试浏览器 + Python urllib 直发  (主路径)
-  B. CDP 浏览器内 fetch (绕过代理)
-  C. 启动新调试 Edge 实例 + 自动登录流程
+方案优先级:
+  A. CDP loadNetworkResource (浏览器网络栈, 支持公开+私密, 零代理问题)
+  B. CDP 浏览器内fetch (备选)
+  C. CDP读cookie + Python urllib (兜底)
 """
 import os, sys, json, re, time, socket, subprocess, urllib.request, urllib.parse, platform
 
-# 可选依赖
 try:
     import psutil
     _HAS_PSUTIL = True
@@ -55,31 +54,30 @@ except ImportError:
 
 def cdp_targets():
     try:
-        _t0 = time.time()
         with _LOCAL_OPENER.open(f"http://127.0.0.1:{PORT}/json", timeout=3) as r:
-            data = json.loads(r.read())
-        return data
-    except Exception as e:
+            return json.loads(r.read())
+    except:
         return None
 
 _EDGE_PATHS = [
     r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
     r"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
 ]
-_EDGE_PROFILE = os.path.join(APP_DATA, "edge_profile")
 
-def _launch_edge(headless=True):
+def _launch_edge(profile_dir=None, headless=False):
+    """启动调试 Edge, 可指定 profile 目录复用登录态"""
     edge = next((p for p in _EDGE_PATHS if os.path.exists(p)), None)
     if not edge:
         return False
-    os.makedirs(_EDGE_PROFILE, exist_ok=True)
     args = [edge, f"--remote-debugging-port={PORT}", "--remote-allow-origins=*",
-            f"--user-data-dir={_EDGE_PROFILE}", "--no-first-run", "--no-default-browser-check"]
-    if headless:
-        args[3:3] = ["--headless=new", "--disable-gpu"]
+            "--no-first-run", "--no-default-browser-check"]
+    if profile_dir:
+        args.append(f"--profile-directory={profile_dir}")
+    else:
+        args.append(f"--user-data-dir={os.path.join(APP_DATA, 'edge_profile')}")
     args.append(PIXIV)
     p = subprocess.Popen(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    for i in range(20):
+    for i in range(30):
         time.sleep(1)
         if cdp_targets():
             return True
@@ -101,52 +99,148 @@ def _save_settings(settings):
     except:
         pass
 
-def _detect_uid_from_edge(profile_path=None):
-    """尝试从 Edge profile 的 Preferences 文件读取 uid"""
-    if profile_path is None:
-        profile_path = _EDGE_PROFILE
-    prefs = os.path.join(profile_path, "Default", "Preferences")
-    if os.path.exists(prefs):
-        try:
-            with open(prefs, "r", encoding="utf-8") as f:
-                prefs_data = json.load(f)
-            cookies = prefs_data.get("cookies", [])
-            for c in cookies:
-                if c.get("name") == "yuid_b":
-                    m = re.search(r"\d{4,}", c.get("value", ""))
-                    if m:
-                        return m.group(0)
-        except:
-            pass
-    return None
-
 def _get_user_default_edge_profile():
-    """获取用户默认 Edge 配置目录"""
+    """获取用户默认 Edge profile 目录"""
     local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-    default_profile = os.path.join(local_appdata, "Microsoft", "Edge", "User Data")
-    if os.path.exists(os.path.join(default_profile, "Default")):
-        return default_profile
+    user_data = os.path.join(local_appdata, "Microsoft", "Edge", "User Data")
+    if os.path.exists(os.path.join(user_data, "Default")):
+        return "Default"
     return None
 
-def _is_user_edge_running():
-    """检查用户日常 Edge 是否在运行"""
-    if not _HAS_PSUTIL:
-        return False
+# ══════════════════════════════════════════════════════════════
+# 方案 A: CDP Network.loadNetworkResource (最优)
+# ══════════════════════════════════════════════════════════════
+def _fetch_via_load_resource(pages, uid):
+    """用 CDP Network.loadNetworkResource 走浏览器网络栈, 支持公开+私密"""
+    _log("main", "[方案A] 尝试 CDP Network.loadNetworkResource...")
+    
+    # 找 pixiv tab 或任意可用 tab
+    target = None
+    for p in pages:
+        if p.get("type") in ("page", "other") and "pixiv" in p.get("url", ""):
+            target = p
+            break
+    if not target:
+        for p in pages:
+            if p.get("type") in ("page", "other"):
+                target = p
+                break
+    
+    if not target:
+        _log("main", "[方案A] 无可用 tab")
+        return None, "NO_TAB"
+    
+    ws_url = target["webSocketDebuggerUrl"]
+    ws = create_connection(ws_url, timeout=60)
+    _id = 0
+    def cdp(method, params=None, timeout=60):
+        nonlocal _id
+        _id += 1
+        ws.send(json.dumps({"id": _id, "method": method, "params": params or {}}))
+        ws.settimeout(timeout)
+        while True:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == _id:
+                return msg.get("result", {})
+    
+    # 导航到 rest=show 页面 (提供 frame 上下文, 不要导航到 rest=hide)
+    cdp("Page.enable")
+    current_url = target.get("url", "")
+    if "rest=show" not in current_url and "rest=hide" not in current_url:
+        _log("main", f"[方案A] 导航到 rest=show 页面...")
+        cdp("Page.navigate", {"url": f"https://www.pixiv.net/users/{uid}/bookmarks/artworks?rest=show"})
+        time.sleep(6)  # SPA 加载
+    
+    # 获取 frameId
+    frame_tree = cdp("Page.getFrameTree")
+    frame_id = frame_tree.get("frameTree", {}).get("frame", {}).get("id")
+    if not frame_id:
+        ws.close()
+        return None, "NO_FRAME", False
+    
+    def ajax(url):
+        """用 loadNetworkResource 读 AJAX 响应"""
+        res = cdp("Network.loadNetworkResource", {
+            "frameId": frame_id,
+            "url": url,
+            "options": {"disableCache": False, "includeCredentials": True}
+        })["resource"]
+        stream = res.get("stream")
+        if not stream:
+            return None, res.get("httpStatusCode")
+        body = ""
+        while True:
+            d = cdp("IO.read", {"handle": stream})
+            body += d.get("data", "")
+            if d.get("eof"):
+                break
+        return json.loads(body), 200
+    
+    # 先尝试私密收藏 (rest=hide)
+    all_items = []
+    has_private = False
+    
+    for rest, label in (("hide", "PRIVATE"), ("show", "PUBLIC")):
+        offset = 0
+        page_num = 0
+        while True:
+            page_num += 1
+            url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
+                   f"?tag=&offset={offset}&limit=48&rest={rest}&order=desc&mode=all&lang=zh")
+            try:
+                d, status = ajax(url)
+                if not d or d.get("error"):
+                    break
+                works = d.get("body", {}).get("works") or []
+                if not works:
+                    break
+                for w in works:
+                    all_items.append({
+                        "id": str(w.get("id")),
+                        "title": w.get("title", ""),
+                        "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
+                                 for t in (w.get("tags") or [])],
+                        "description": w.get("description", ""),
+                        "url": w.get("url", ""),
+                        "userId": str(w.get("userId", "")),
+                        "userName": w.get("userName", ""),
+                        "width": w.get("width"),
+                        "height": w.get("height"),
+                        "pageCount": w.get("pageCount"),
+                        "createDate": w.get("createDate", ""),
+                        "aiType": w.get("aiType"),
+                    })
+                _log("fetch", f"[方案A/{label}] 第{page_num}页: {len(works)} works (累计 {len(all_items)})")
+                if rest == "hide" and works:
+                    has_private = True
+                if len(works) < 48:
+                    break
+                offset += len(works)
+                time.sleep(0.3)
+            except Exception as e:
+                _log("fetch", f"[方案A/{label}] 异常: {_err_type(e)} {e}")
+                break
+    
     try:
-        for proc in psutil.process_iter(['name']):
-            if proc.info['name'] and 'msedge' in proc.info['name'].lower():
-                return True
+        ws.close()
     except:
         pass
-    return False
+    
+    if all_items:
+        return all_items, "OK", has_private
+    return None, "EMPTY", False
 
 # ══════════════════════════════════════════════════════════════
-# 方案 B: CDP 浏览器内 fetch (绕过代理, 需要 CDP)
+# 方案 B: CDP 浏览器内 fetch (备选)
 # ══════════════════════════════════════════════════════════════
-def _fetch_browser_internal(ws_url, uid):
-    """通过 CDP 在浏览器内部发 fetch, 绕过系统代理"""
-    _log("main", "[方案B] 尝试 CDP 浏览器内 fetch")
-    ws = create_connection(ws_url, timeout=30)
+def _fetch_via_browser_fetch(pages, uid):
+    """备选: Runtime.evaluate + fetch (可能冻结)"""
+    _log("main", "[方案B] 尝试 CDP 浏览器内 fetch...")
+    target = next((p for p in pages if p.get("type") in ("page", "other")), None)
+    if not target:
+        return None, "NO_TAB"
+    
+    ws = create_connection(target["webSocketDebuggerUrl"], timeout=60)
     _id = 0
     def cdp(method, params=None, timeout=30):
         nonlocal _id
@@ -157,80 +251,75 @@ def _fetch_browser_internal(ws_url, uid):
             msg = json.loads(ws.recv())
             if msg.get("id") == _id:
                 return msg.get("result", {})
+    
     all_items = []
-    offset = 0
-    while True:
-        url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
-               f"?tag=&offset={offset}&limit=48&rest=show&order=desc&mode=all&lang=zh")
-        js = f"""
-        (async () => {{
-            const t0 = performance.now();
-            try {{
-                const r = await fetch("{url}", {{credentials: "include"}});
-                const d = await r.json();
-                const ms = (performance.now() - t0).toFixed(0);
-                return JSON.stringify({{ok: true, ms: ms, body: d.body}});
-            }} catch(e) {{
-                return JSON.stringify({{ok: false, err: e.message}});
-            }}
-        }})()
-        """
-        try:
-            res = cdp("Runtime.evaluate", {"expression": js, "awaitPromise": True, "returnByValue": True}, timeout=15)
-            val = json.loads((res.get("result") or {}).get("value", "{}"))
-            if not val.get("ok"):
-                _log("fetch", f"[方案B] fetch 失败: {val.get('err','')}")
+    for rest in ("show", "hide"):
+        offset = 0
+        while True:
+            url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
+                   f"?tag=&offset={offset}&limit=48&rest={rest}&order=desc&mode=all&lang=zh")
+            js = f"""
+            (async () => {{
+                try {{
+                    const r = await fetch("{url}", {{credentials: "include"}});
+                    const d = await r.json();
+                    return JSON.stringify(d);
+                }} catch(e) {{
+                    return JSON.stringify({{error: true, err: e.message}});
+                }}
+            }})()
+            """
+            try:
+                res = cdp("Runtime.evaluate", {"expression": js, "awaitPromise": True, "returnByValue": True}, timeout=15)
+                d = json.loads((res.get("result") or {}).get("value", "{}"))
+                if d.get("error"):
+                    break
+                works = (d.get("body") or {}).get("works") or []
+                if not works:
+                    break
+                for w in works:
+                    all_items.append({
+                        "id": str(w.get("id")),
+                        "title": w.get("title", ""),
+                        "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
+                                 for t in (w.get("tags") or [])],
+                        "description": w.get("description", ""),
+                        "url": w.get("url", ""),
+                        "userId": str(w.get("userId", "")),
+                        "userName": w.get("userName", ""),
+                        "width": w.get("width"),
+                        "height": w.get("height"),
+                        "pageCount": w.get("pageCount"),
+                        "createDate": w.get("createDate", ""),
+                        "aiType": w.get("aiType"),
+                    })
+                if len(works) < 48:
+                    break
+                offset += len(works)
+                time.sleep(0.3)
+            except:
                 break
-            works = (val.get("body") or {}).get("works") or []
-            if not works:
-                break
-            for w in works:
-                all_items.append({
-                    "id": str(w.get("id")),
-                    "title": w.get("title", ""),
-                    "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
-                             for t in (w.get("tags") or [])],
-                    "description": w.get("description", ""),
-                    "url": w.get("url", ""),
-                    "userId": str(w.get("userId", "")),
-                    "userName": w.get("userName", ""),
-                    "width": w.get("width"),
-                    "height": w.get("height"),
-                    "pageCount": w.get("pageCount"),
-                    "createDate": w.get("createDate", ""),
-                    "aiType": w.get("aiType"),
-                })
-            _log("fetch", f"[方案B] 第{len(all_items)//48+1}页: {len(works)} works (累计 {len(all_items)})")
-            if len(works) < 48:
-                break
-            offset += len(works)
-            time.sleep(0.3)
-        except Exception as e:
-            _log("fetch", f"[方案B] 异常: {_err_type(e)} {e}")
-            break
+    
     try:
         ws.close()
     except:
         pass
-    return all_items
+    
+    if all_items:
+        return all_items, "OK", False
+    return None, "EMPTY", False
 
 # ══════════════════════════════════════════════════════════════
-# 方案 A: CDP + Python urllib (主路径)
+# 方案 C: CDP 读 cookie + Python urllib (兜底)
 # ══════════════════════════════════════════════════════════════
-def _fetch_via_cdp(pages):
-    """主路径: CDP 读 cookie → Python urllib 直发"""
-    page = next((p for p in pages if p.get("type") == "page"), None)
-    if not page:
-        try:
-            with _LOCAL_OPENER.open(f"http://127.0.0.1:{PORT}/json/new", timeout=5) as r:
-                page = json.loads(r.read())
-        except:
-            return None, "", ""
+def _fetch_via_cdp_urllib(pages, uid):
+    """兜底: CDP 读 cookie + Python urllib"""
+    _log("main", "[方案C] 尝试 CDP + Python urllib...")
+    target = next((p for p in pages if p.get("type") in ("page", "other")), None)
+    if not target:
+        return None, "NO_TAB"
     
-    ws_url = page["webSocketDebuggerUrl"]
-    page_url = page.get("url", "")
-    
-    ws = create_connection(ws_url, timeout=30)
+    ws = create_connection(target["webSocketDebuggerUrl"], timeout=60)
     _id = 0
     def cdp(method, params=None, timeout=60):
         nonlocal _id
@@ -248,183 +337,162 @@ def _fetch_via_cdp(pages):
     phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
     
     if not phpsessid:
-        try: ws.close()
-        except: pass
-        return None, page_url, "NO_LOGIN"
+        ws.close()
+        return None, "NO_LOGIN"
     
     cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-    
-    m = re.search(r".*/users/(\d+)/.*", page_url)
-    uid = m.group(1) if m else None
-    if not uid:
-        yuid = next((c["value"] for c in cookies if c["name"] == "yuid_b"), None)
-        m2 = re.search(r"\d{4,}", yuid or "")
-        uid = m2.group(0) if m2 else None
-    
-    if not uid:
-        try: ws.close()
-        except: pass
-        return None, page_url, "NO_UID"
-    
-    try: ws.close()
-    except: pass
+    ws.close()
     
     all_items = []
-    offset = 0
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
         "Referer": "https://www.pixiv.net/",
         "Cookie": cookie_header,
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "application/json",
     }
-    while True:
-        url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
-               f"?tag=&offset={offset}&limit=48&rest=show&order=desc&mode=all&lang=zh")
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                raw = resp.read()
-                d = json.loads(raw)
-            works = (d.get("body") or {}).get("works") or []
-            if not works:
-                break
-            for w in works:
-                all_items.append({
-                    "id": str(w.get("id")),
-                    "title": w.get("title", ""),
-                    "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
-                             for t in (w.get("tags") or [])],
-                    "description": w.get("description", ""),
-                    "url": w.get("url", ""),
-                    "userId": str(w.get("userId", "")),
-                    "userName": w.get("userName", ""),
-                    "width": w.get("width"),
-                    "height": w.get("height"),
-                    "pageCount": w.get("pageCount"),
-                    "createDate": w.get("createDate", ""),
-                    "aiType": w.get("aiType"),
-                })
-            if len(works) < 48:
-                break
-            offset += len(works)
-            time.sleep(0.3)
-        except Exception as e:
-            _log("fetch", f"[方案A] 抓取失败: {_err_type(e)} {e}")
-            return all_items, page_url, f"FETCH_ERR:{_err_type(e)}"
     
-    return all_items, page_url, "OK"
+    for rest in ("show",):
+        offset = 0
+        while True:
+            url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
+                   f"?tag=&offset={offset}&limit=48&rest={rest}&order=desc&mode=all&lang=zh")
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    d = json.loads(resp.read())
+                works = (d.get("body") or {}).get("works") or []
+                if not works:
+                    break
+                for w in works:
+                    all_items.append({
+                        "id": str(w.get("id")),
+                        "title": w.get("title", ""),
+                        "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
+                                 for t in (w.get("tags") or [])],
+                        "description": w.get("description", ""),
+                        "url": w.get("url", ""),
+                        "userId": str(w.get("userId", "")),
+                        "userName": w.get("userName", ""),
+                        "width": w.get("width"),
+                        "height": w.get("height"),
+                        "pageCount": w.get("pageCount"),
+                        "createDate": w.get("createDate", ""),
+                        "aiType": w.get("aiType"),
+                    })
+                if len(works) < 48:
+                    break
+                offset += len(works)
+                time.sleep(0.3)
+            except Exception as e:
+                break
+    
+    if all_items:
+        return all_items, "OK", False
+    return None, "EMPTY", False
+
+# ══════════════════════════════════════════════════════════════
+# uid 检测
+# ══════════════════════════════════════════════════════════════
+def _detect_uid(pages):
+    """多来源 uid 检测"""
+    uid = os.environ.get("PIXIV_UID", "")
+    
+    settings = _load_settings()
+    if not uid:
+        uid = settings.get("pixiv_uid", "")
+    
+    if pages:
+        for p in pages:
+            url = p.get("url", "")
+            m = re.search(r".*/users/(\d+).*", url)
+            if m:
+                uid = m.group(1)
+                break
+    
+    if not uid:
+        profile = _get_user_default_edge_profile()
+        if profile:
+            prefs = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "User Data", profile, "Preferences")
+            if os.path.exists(prefs):
+                try:
+                    with open(prefs, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    for c in data.get("cookies", []):
+                        if c.get("name") == "yuid_b":
+                            m = re.search(r"\d{4,}", c.get("value", ""))
+                            if m:
+                                uid = m.group(0)
+                                break
+                except:
+                    pass
+    
+    return uid
 
 def main():
     _log("main", f"=== 开始导入 (PORT={PORT}) ===")
     
-    # ── 多来源 uid 检测 ──
-    uid = ""
-    settings = _load_settings()
-    
-    # 1. 环境变量
-    uid = os.environ.get("PIXIV_UID", "")
-    
-    # 2. 配置文件
-    if not uid:
-        uid = settings.get("pixiv_uid", "")
-        if uid:
-            _log("main", f"从配置文件读取 uid={uid}")
-    
-    # 3. CDP page URL
     pages = cdp_targets()
-    ws_url_for_b = None
-    if pages:
-        page = next((p for p in pages if p.get("type") == "page"), None)
-        if page:
-            page_url = page.get("url", "")
-            m = re.search(r".*/users/(\d+).*", page_url)
-            if m:
-                uid = m.group(1)
-                _log("main", f"从 CDP page URL 提取 uid={uid}")
-            ws_url_for_b = page["webSocketDebuggerUrl"]
-    
-    # 4. 工具自带 edge_profile
-    if not uid:
-        uid = _detect_uid_from_edge()
-        if uid:
-            _log("main", f"从工具 edge_profile 检测到 uid={uid}")
-    
-    # 5. 用户默认 Edge profile
-    if not uid:
-        user_profile = _get_user_default_edge_profile()
-        if user_profile:
-            uid = _detect_uid_from_edge(user_profile)
-            if uid:
-                _log("main", f"从用户默认 Edge profile 检测到 uid={uid}")
+    uid = _detect_uid(pages or [])
     
     if not uid:
-        _log("main", "无法自动检测 uid。请设置环境变量 PIXIV_UID=你的用户ID")
-        print("请在设置中填写你的 Pixiv 用户ID，或确保 Edge 已打开收藏页")
+        _log("main", "无法自动检测 uid")
+        print("请在设置中填写 Pixiv 用户ID，或确保 Edge 已打开收藏页")
         return 1
     
-    # 记住 uid
-    if not settings.get("pixiv_uid"):
-        settings["pixiv_uid"] = uid
-        _save_settings(settings)
+    if not os.path.exists(SETTINGS):
+        _save_settings({"pixiv_uid": uid})
     
     _log("main", f"目标 uid={uid}")
+    
+    # 如果无 CDP, 尝试启动用户 Edge (复用登录态)
+    if not pages:
+        _log("main", "无 CDP 实例, 尝试启动用户 Edge...")
+        profile = _get_user_default_edge_profile()
+        if profile:
+            _launch_edge(profile_dir=profile)
+        else:
+            _launch_edge()
+        pages = cdp_targets()
+    
     all_items = []
     method_used = ""
+    has_private = False
     
-    # ── 尝试方案 A: CDP + urllib ──
+    # ── 方案 A: loadNetworkResource ──
     if pages:
-        _log("main", "[方案A] 尝试 CDP + Python urllib...")
-        items, page_url, status = _fetch_via_cdp(pages)
+        items, status, priv = _fetch_via_load_resource(pages, uid)
         if items:
             all_items = items
-            method_used = "A:CDP+urllib"
-            _log("main", f"[方案A] 成功: {len(items)} works")
-        elif status == "NO_LOGIN":
-            _log("main", "[方案A] 无登录态, 尝试其他方案...")
+            has_private = priv
+            method_used = "A:loadNetworkResource"
         else:
-            _log("main", f"[方案A] 失败: {status}, 尝试其他方案...")
+            _log("main", f"[方案A] 失败: {status}")
     
-    # ── 尝试方案 B: 浏览器内 fetch (需要 CDP) ──
-    if not all_items and ws_url_for_b:
-        _log("main", "[方案B] 尝试 CDP 浏览器内 fetch...")
-        items = _fetch_browser_internal(ws_url_for_b, uid)
+    # ── 方案 B: 浏览器内 fetch ──
+    if not all_items and pages:
+        items, status, priv = _fetch_via_browser_fetch(pages, uid)
         if items:
             all_items = items
-            method_used = "B:browser-fetch"
-            _log("main", f"[方案B] 成功: {len(items)} works")
+            has_private = priv
+            method_used = "B:browserFetch"
         else:
-            _log("main", "[方案B] 失败, 尝试下一方案...")
+            _log("main", f"[方案B] 失败: {status}")
     
-    # ── 尝试方案 C: 启动新调试 Edge ──
-    if not all_items:
-        _log("main", "[方案C] 尝试启动新的调试 Edge 实例...")
-        if _launch_edge(headless=True):
-            pages = cdp_targets()
-            if pages:
-                items, page_url, status = _fetch_via_cdp(pages)
-                if items:
-                    all_items = items
-                    method_used = "C:new-edge+urllib"
-                    _log("main", f"[方案C] 成功: {len(items)} works")
-                elif status == "NO_LOGIN":
-                    _log("main", "[方案C] 新实例无登录态, 尝试有头模式...")
-                    # 杀掉无头，启动有头
-                    subprocess.run(
-                        ["powershell", "-NoProfile", "-Command",
-                         "Get-CimInstance Win32_Process -Filter \"CommandLine like '%edge_profile%'\" | Stop-Process -Force"],
-                        capture_output=True, timeout=10)
-                    time.sleep(2)
-                    if _launch_edge(headless=False):
-                        print("请在弹出的 Pixiv 页面登录后重试")
-                        return 1
+    # ── 方案 C: CDP + urllib ──
+    if not all_items and pages:
+        items, status, priv = _fetch_via_cdp_urllib(pages, uid)
+        if items:
+            all_items = items
+            has_private = priv
+            method_used = "C:cdp+urllib"
+        else:
+            _log("main", f"[方案C] 失败: {status}")
     
-    # ── 全部失败 ──
     if not all_items:
         _log("main", "所有方案均失败")
         print("导入失败。请检查:")
         print("  1. 网络连接是否正常")
         print("  2. 已在 Edge 中登录 Pixiv")
-        print("  3. 收藏是否设置为公开")
         return 1
     
     # 写入文件
@@ -432,8 +500,9 @@ def main():
     with open(DATA, "w", encoding="utf-8") as f:
         f.write(_json_data)
     
-    _log("main", f"=== 完成: 导出 {len(all_items)} 幅收藏 (方案: {method_used}) ===")
-    print(f"[OK] 已导出 {len(all_items)} 幅收藏到 data/bookmarks.json (方案: {method_used})")
+    privacy_note = " (含私密收藏)" if has_private else ""
+    _log("main", f"=== 完成: 导出 {len(all_items)} 幅收藏{privacy_note} (方案: {method_used}) ===")
+    print(f"[OK] 已导出 {len(all_items)} 幅收藏{privacy_note} (方案: {method_used})")
     return 0
 
 if __name__ == "__main__":
