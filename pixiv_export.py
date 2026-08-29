@@ -54,6 +54,8 @@ def _err_type(e):
         return "TIMEOUT"
     if "10065" in str(e):
         return "HOST_UNREACHABLE"
+    if "remote end closed" in str(e).lower() or "connection aborted" in str(e).lower():
+        return "PROXY_RESET"
     if "name resolution" in str(e).lower() or "getaddrinfo" in str(e).lower():
         return "DNS_FAIL"
     if "ssl" in str(e).lower() or "certificate" in str(e).lower():
@@ -448,8 +450,17 @@ def main():
 
     # P0-3: 代理实际连通性测试
     _proxy_status = _probe_proxy()
+    if _proxy_status == "FAIL":
+        _log("main", "代理测试失败, 跳过抓取。请检查代理设置或关闭代理后重试。")
+        print("代理无法访问 Pixiv。请检查代理设置或关闭代理后重试。")
+        return 1
 
     # 诊断: 用 CDP 在浏览器内发 fetch, 对比 Python urllib
+    # 注意: 阶段6结束时 ws.close() 了, 需要先 reconnect 才能用 CDP
+    try:
+        reconnect()
+    except Exception as e:
+        _log("diag", f"重连失败, 跳过浏览器内 fetch: {_err_type(e)} {e}")
     _diag_url = f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks?tag=&offset=0&limit=4&rest=show&order=desc&mode=all&lang=zh"
     _log("diag", f"浏览器内 fetch 测试: {_diag_url[:80]}...")
     try:
