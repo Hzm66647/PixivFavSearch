@@ -8,7 +8,14 @@
    完全绕过页面 Service Worker 对 fetch 的拦截(页面内 JS fetch 会被 SW
    拦截后挂起, 永不 resolve)。
 """
-import os, sys, json, re, time, socket, subprocess, urllib.request, urllib.parse, base64
+import os, sys, json, re, time, socket, subprocess, urllib.request, urllib.parse, base64, platform
+
+# 可选依赖: psutil (进程健康检测, 没有也能跑)
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 APP_DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PixivFavSearch")
 OUT = os.path.join(APP_DATA, "data")
@@ -21,9 +28,39 @@ PIXIV = "https://www.pixiv.net/bookmark.php?rest=show"
 # 调试日志开关: 环境变量 PIXIV_DEBUG=1 启用详细日志
 _DEBUG = os.environ.get("PIXIV_DEBUG", "0") == "1"
 
+# 全局统计
+_stat = {
+    "retry_count": 0,
+    "total_backoff": 0.0,
+    "pages_fetched": 0,
+    "pages_failed": 0,
+}
+
 def _log(tag, msg):
     """带标签的调试日志, 格式: [tag] msg"""
     print(f"[{tag}] {msg}", flush=True)
+
+def _err_type(e):
+    """分类 urllib 错误类型"""
+    if isinstance(e, socket.timeout) or "timed out" in str(e).lower():
+        return "TIMEOUT"
+    if isinstance(e, ConnectionRefusedError) or "10061" in str(e):
+        return "REFUSED"
+    if "10054" in str(e) or "reset" in str(e).lower():
+        return "RESET"
+    if "10051" in str(e) or "unreachable" in str(e).lower():
+        return "UNREACHABLE"
+    if "10060" in str(e):
+        return "TIMEOUT"
+    if "10065" in str(e):
+        return "HOST_UNREACHABLE"
+    if "name resolution" in str(e).lower() or "getaddrinfo" in str(e).lower():
+        return "DNS_FAIL"
+    if "ssl" in str(e).lower() or "certificate" in str(e).lower():
+        return "TLS_FAIL"
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTP_{e.code}"
+    return f"OTHER:{type(e).__name__}"
 
 # 本地 CDP 请求必须直连, 绝不能走系统/环境代理
 # (否则 urllib 会把 http://127.0.0.1:9222 通过 SOCKS5/HTTP 代理转发,
@@ -52,7 +89,7 @@ def cdp_targets():
         return data
     except Exception as e:
         _ms = (time.time() - _t0) * 1000 if '_t0' in dir() else 0
-        _log("cdp", f"连接失败({_ms:.0f}ms): {e}")
+        _log("cdp", f"连接失败({_ms:.0f}ms): {_err_type(e)} {e}")
         return None
 
 
@@ -72,7 +109,8 @@ def _launch_edge(headless=True):
         return False
     os.makedirs(_EDGE_PROFILE, exist_ok=True)
     mode = "无头" if headless else "有头(登录用)"
-    _log("edge", f"启动 [{mode}] profile={_EDGE_PROFILE}")
+    _log("edge", f"启动 [{mode}] path={edge}")
+    _log("edge", f"  profile={_EDGE_PROFILE}")
     args = [
         edge,
         f"--remote-debugging-port={PORT}",
@@ -108,17 +146,68 @@ def ensure_cdp_browser():
     return False
 
 
+def _probe_proxy():
+    """测试代理实际连通性 (不只是打印配置)"""
+    _proxies = urllib.request.getproxies()
+    if not _proxies:
+        _log("proxy_test", "无代理配置 (直连)")
+        return "DIRECT"
+    _log("proxy_test", f"配置: {_proxies}")
+    _t0 = time.time()
+    try:
+        _req = urllib.request.Request("https://www.pixiv.net/", headers={"User-Agent": "Mozilla/5.0"})
+        _resp = urllib.request.urlopen(_req, timeout=8)
+        _ms = (time.time() - _t0) * 1000
+        _log("proxy_test", f"OK: status={_resp.status}, {_ms:.0f}ms")
+        return "OK"
+    except Exception as e:
+        _ms = (time.time() - _t0) * 1000
+        _log("proxy_test", f"FAIL: {_err_type(e)} ({_ms:.0f}ms) {e}")
+        return "FAIL"
+
+
+def _check_edge_health(pid):
+    """检查 Edge 进程健康状态"""
+    if not _HAS_PSUTIL:
+        return
+    try:
+        _proc = psutil.Process(pid)
+        _rss = _proc.memory_info().rss / 1024**2
+        _cpu = _proc.cpu_percent(interval=0.1)
+        _threads = _proc.num_threads()
+        _log("edge_health", f"PID={pid} RSS={_rss:.0f}MB CPU={_cpu:.0f}% threads={_threads}")
+    except Exception as e:
+        _log("edge_health", f"PID={pid} 无法读取: {e}")
+
+
 def main():
     _log("main", f"=== 开始导入 (PORT={PORT}, DEBUG={'ON' if _DEBUG else 'OFF'}) ===")
     _t_start = time.time()
 
+    # P2-13: 启动环境快照
+    _log("env", f"Python {sys.version.split()[0]} | {platform.platform()} | {platform.machine()}")
+    _log("env", f"APP_DATA={APP_DATA}")
+    _edge_path = next((p for p in _EDGE_PATHS if os.path.exists(p)), "NOT_FOUND")
+    _log("env", f"Edge={_edge_path}")
+    if _HAS_PSUTIL:
+        _log("env", f"psutil=OK")
+    else:
+        _log("env", f"psutil=MISSING (pip install psutil 启用进程健康检测)")
+
     # 阶段1: 确保 CDP 可用
     _log("main", "[阶段1] 确保 CDP 浏览器就绪")
+    _t_stage1 = time.time()
     pages = ensure_cdp_browser() and cdp_targets()
     if not pages:
         _log("main", "CDP 不可用, 退出")
         return 1
-    _log("main", f"CDP 就绪, {len(pages)} targets")
+    _log("main", f"CDP 就绪, {len(pages)} targets ({(time.time()-_t_stage1):.1f}s)")
+
+    # P0-5: Edge CDP 版本
+    try:
+        _ver = cmd("Browser.getVersion") if False else None  # 延迟到 ws 连接后
+    except Exception:
+        pass
 
     # 阶段2: 选择 page target
     page = next((p for p in pages if p.get("type") == "page"), None)
@@ -137,7 +226,7 @@ def main():
             page_url = page.get("url") or ""
             _log("main", f"新建标签页: {page_url[:80]}")
         except Exception as e:
-            _log("main", f"新建标签页失败: {e}")
+            _log("main", f"新建标签页失败: {_err_type(e)} {e}")
             return 1
 
     # 阶段3: 连接 WebSocket
@@ -146,7 +235,7 @@ def main():
         ws = create_connection(ws_url, timeout=30)
         _log("main", "WebSocket 连接成功")
     except Exception as e:
-        _log("main", f"WebSocket 连接失败: {e}")
+        _log("main", f"WebSocket 连接失败: {_err_type(e)} {e}")
         return 1
 
     _id = 0
@@ -168,12 +257,16 @@ def main():
                 if msg.get("id") == _cid:
                     _ms = (time.time() - _t0) * 1000
                     _res = msg.get("result", {})
+                    _err = msg.get("error")
+                    # P1-16: CDP 错误响应
+                    if _err and _DEBUG:
+                        _log("cmd_err", f"#{_cid} CDP错误: {_err.get('code')} {_err.get('message','')[:100]}")
                     if _DEBUG:
                         _log("cmd", f"#{_cid} 响应({_ms:.0f}ms) keys={list(_res.keys())}")
                     return _res
         except Exception as e:
             _ms = (time.time() - _t0) * 1000
-            _log("cmd", f"#{_cid} 超时/断开({_ms:.0f}ms): {e}")
+            _log("cmd", f"#{_cid} 超时/断开({_ms:.0f}ms): {_err_type(e)} {e}")
             return {}
 
     def reconnect():
@@ -195,7 +288,40 @@ def main():
         r = cmd("Network.getCookies", {"urls": ["https://www.pixiv.net"]})
         cookies = r.get("cookies", [])
         _log("cookie", f"获取 {len(cookies)} 个 cookie")
+        # P1-8: Cookie 过期时间
+        if cookies and _DEBUG:
+            _sess = next((c for c in cookies if c.get("name") == "PHPSESSID"), None)
+            if _sess:
+                _exp = _sess.get("expires", -1)
+                if _exp == -1:
+                    _log("cookie", f"PHPSESSID session cookie (无过期时间)")
+                else:
+                    _remain = _exp - time.time()
+                    _log("cookie", f"PHPSESSID expires_in={_remain:.0f}s")
+        # P2-18: Cookie scope
+        _domains = set(c.get("domain","") for c in cookies)
+        if _DEBUG:
+            _log("cookie", f"domains: {','.join(sorted(_domains))}")
         return cookies
+
+    # P0-5: Edge CDP 版本 (ws 已连接)
+    try:
+        _ver = cmd("Browser.getVersion", timeout=5)
+        if _ver:
+            _log("cdp_ver", f"product={_ver.get('product','?')} protocol={_ver.get('protocolVersion','?')} userAgent={_ver.get('userAgent','?')[:60]}")
+    except Exception as e:
+        _log("cdp_ver", f"获取失败: {e}")
+
+    # P2-14: Service Worker 检测
+    try:
+        _sw_r = cmd("Runtime.evaluate", {"expression": "navigator.serviceWorker?.controller?.scriptURL || null", "returnByValue": True}, timeout=5)
+        _sw_url = (_sw_r.get("result") or {}).get("value")
+        if _sw_url:
+            _log("sw", f"ServiceWorker active: {_sw_url}")
+        else:
+            _log("sw", "ServiceWorker: none")
+    except Exception as e:
+        _log("sw", f"检测失败: {e}")
 
     # 阶段4: 健康检查
     _log("main", "[阶段4] CDP 健康检查 (5s)")
@@ -205,7 +331,7 @@ def main():
         _test_ck = _test_r.get("cookies", [])
         _log("main", f"健康检查通过: {len(_test_ck)} cookie ({(time.time()-_test_start)*1000:.0f}ms)")
     except Exception as e:
-        _log("main", f"健康检查失败({(time.time()-_test_start)*1000:.0f}ms): {e}, 尝试重连")
+        _log("main", f"健康检查失败({(time.time()-_test_start)*1000:.0f}ms): {_err_type(e)} {e}, 尝试重连")
         reconnect()
         cmd("Network.enable")
 
@@ -246,7 +372,7 @@ def main():
                     page = json.loads(r.read())
                 ws_url = page["webSocketDebuggerUrl"]
             except Exception as e:
-                _log("main", f"新建标签页失败: {e}")
+                _log("main", f"新建标签页失败: {_err_type(e)} {e}")
                 return 1
         reconnect()
         cookies = get_cookies()
@@ -313,14 +439,17 @@ def main():
 
     # 阶段7: 抓取收藏
     _log("main", "[阶段7] 抓取收藏")
+    _t_stage7 = time.time()
     all_items = []
     offset = 0
     _proxies = urllib.request.getproxies()
     if _proxies:
         _log("proxy", f"环境代理: {_proxies}")
 
+    # P0-3: 代理实际连通性测试
+    _proxy_status = _probe_proxy()
+
     # 诊断: 用 CDP 在浏览器内发 fetch, 对比 Python urllib
-    # (浏览器能加载 pixiv 页面, 但 Python 走代理可能超时; 用来区分是代理问题还是 Python 特有问题)
     _diag_url = f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks?tag=&offset=0&limit=4&rest=show&order=desc&mode=all&lang=zh"
     _log("diag", f"浏览器内 fetch 测试: {_diag_url[:80]}...")
     try:
@@ -345,7 +474,7 @@ def main():
         else:
             _log("diag", f"浏览器内 fetch 失败: {_diag_res.get('ms')}ms, err={_diag_res.get('err','')}")
     except Exception as e:
-        _log("diag", f"浏览器内 fetch 测试异常: {e}")
+        _log("diag", f"浏览器内 fetch 测试异常: {_err_type(e)} {e}")
 
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -355,6 +484,7 @@ def main():
         "Accept": "application/json, text/plain, */*",
     }
     _page_num = 0
+    _consecutive_fail = 0
     while True:
         _page_num += 1
         url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
@@ -363,21 +493,57 @@ def main():
         for attempt in range(3):
             _t0 = time.time()
             try:
+                # P0-6: 每页耗时拆解 (DNS / 连接 / 首字节 / 传输)
+                _dns_t0 = time.time()
+                _host = urllib.parse.urlparse(url).hostname
+                try:
+                    socket.getaddrinfo(_host, 443)
+                    _dns_ms = (time.time() - _dns_t0) * 1000
+                except Exception:
+                    _dns_ms = -1
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    _ms = (time.time() - _t0) * 1000
+                    _ttfb_ms = (time.time() - _t0) * 1000
                     _raw = resp.read()
+                    _total_ms = (time.time() - _t0) * 1000
+                    _xfer_ms = _total_ms - _ttfb_ms
+                    # P0-1: HTTP 响应码
+                    _status = resp.status
+                    # P1-7: 服务端限速信号
+                    _retry_after = resp.headers.get("Retry-After", "")
+                    _rate_limit = resp.headers.get("X-RateLimit-Remaining", "")
+                    if _status == 429:
+                        _log("ratelimit", f"429! Retry-After={_retry_after}, X-RateLimit-Remaining={_rate_limit}")
+                    # P0-4: 响应体校验
+                    _content_type = resp.headers.get("Content-Type", "")
+                    if "json" not in _content_type and "text" not in _content_type:
+                        _log("body_warn", f"异常 Content-Type={_content_type}, len={len(_raw)}, preview={_raw[:80]}")
+                    if len(_raw) == 0:
+                        _log("body_warn", f"空响应体 (status={_status})")
                     d = json.loads(_raw)
                 works = (d.get("body") or {}).get("works") or []
-                _log("fetch", f"第{_page_num}页(尝试{attempt+1}) {_ms:.0f}ms, {len(works)} works, {len(_raw)} bytes")
+                _log("fetch", f"第{_page_num}页(尝试{attempt+1}) {_total_ms:.0f}ms (DNS={_dns_ms:.0f} TTFB={_ttfb_ms:.0f} xfer={_xfer_ms:.0f}), status={_status}, {len(works)} works, {len(_raw)} bytes")
+                if _retry_after:
+                    _log("ratelimit", f"Retry-After={_retry_after}s, 等待后重试")
+                    time.sleep(int(_retry_after) if _retry_after.isdigit() else 5)
+                _consecutive_fail = 0
+                _stat["pages_fetched"] += 1
                 break
             except Exception as e:
                 _ms = (time.time() - _t0) * 1000
+                _etype = _err_type(e)
+                _stat["retry_count"] += 1
+                _stat["total_backoff"] += 2
+                _consecutive_fail += 1
+                # P1-11: 响应体 hex dump (JSON 解析失败时)
+                if "json" in str(e).lower() and '_raw' in dir():
+                    _log("body_dump", f"JSON解析失败, raw[:200]={_raw[:200]}")
                 if attempt < 2:
-                    _log("fetch", f"第{_page_num}页(尝试{attempt+1}) 失败({_ms:.0f}ms): {e}, 2s后重试")
+                    _log("fetch", f"第{_page_num}页(尝试{attempt+1}) 失败({_ms:.0f}ms): {_etype} {e}, 2s后重试")
                     time.sleep(2)
                 else:
-                    _log("fetch", f"第{_page_num}页(尝试{attempt+1}) 最终失败({_ms:.0f}ms): {e}")
+                    _log("fetch", f"第{_page_num}页(尝试{attempt+1}) 最终失败({_ms:.0f}ms): {_etype} {e}")
+                    _stat["pages_failed"] += 1
         if not works:
             if _page_num == 1:
                 _log("main", "第1页即无数据, 退出")
@@ -410,9 +576,21 @@ def main():
         print("未抓取到收藏。请确认已登录后重试。")
         return 1
 
+    # P2-15: 文件 I/O 日志
+    _json_data = json.dumps(all_items, ensure_ascii=False, indent=1)
+    _log("io", f"写入 {len(_json_data)} bytes 到 {DATA}")
     with open(DATA, "w", encoding="utf-8") as f:
-        json.dump(all_items, f, ensure_ascii=False, indent=1)
-    _log("main", f"=== 完成: 导出 {len(all_items)} 幅收藏到 {DATA} (耗时 {time.time()-_t_start:.1f}s) ===")
+        f.write(_json_data)
+    _written = os.path.getsize(DATA)
+    _log("io", f"写入完成: {_written} bytes")
+
+    # P1-12: 各阶段耗时占比
+    _total = time.time() - _t_start
+    _log("profile", f"总耗时 {_total:.1f}s | 阶段7(抓取)={time.time()-_t_stage7:.1f}s")
+    # P1-10: 重试统计
+    _log("stat", f"pages_fetched={_stat['pages_fetched']} pages_failed={_stat['pages_failed']} retries={_stat['retry_count']} backoff={_stat['total_backoff']:.0f}s")
+
+    _log("main", f"=== 完成: 导出 {len(all_items)} 幅收藏到 {DATA} (耗时 {_total:.1f}s) ===")
     print(f"[OK] 已导出 {len(all_items)} 幅收藏到 data/bookmarks.json")
     print("  缩略图在下次搜索时会按需下载。")
     return 0
