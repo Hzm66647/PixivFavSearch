@@ -93,6 +93,8 @@ PLUGIN_CONFIG_FILE = os.path.join(APP_DATA, "plugins.json")
 # 插件数据存储: {plugin_id: [items]}
 PLUGIN_DATA = {}
 PLUGIN_LIST = []  # 有序列表,保持UI顺序
+PLUGINS_DIR = os.path.join(APP_DATA, "plugins")  # 插件文件夹（用户拖拽 .plug 文件到这里即可安装）
+MARKET_URL_DEFAULT = "https://raw.githubusercontent.com/Hzm66647/PixivFavSearch/refs/heads/plugin-market/market.json"
 
 # 标准字段定义
 PLUGIN_STD_FIELDS = ["id", "title", "author", "thumb", "tags", "url", "desc"]
@@ -303,6 +305,11 @@ def _load_plugin(plugin):
             if not os.path.exists(fpath):
                 return {"error": f"文件不存在: {os.path.basename(fpath)}"}
             
+            # 支持 plugins 目录下的相对路径
+            if not os.path.isabs(fpath) and not os.path.exists(fpath):
+                alt = os.path.join(PLUGINS_DIR, plugin.get("id", ""), "data.json")
+                if os.path.exists(alt):
+                    fpath = alt
             with open(fpath, encoding="utf-8") as f:
                 data = json.load(f)
         
@@ -326,6 +333,147 @@ def _load_plugin(plugin):
     
     except Exception as e:
         return {"error": repr(e)[:200]}
+
+
+def _get_plugin_dir(pid):
+    """获取插件数据目录"""
+    return os.path.join(PLUGINS_DIR, pid)
+
+def scan_plugins_dir():
+    """扫描 plugins 文件夹，自动安装新的 .plug 文件"""
+    if not os.path.isdir(PLUGINS_DIR):
+        return
+    os.makedirs(PLUGINS_DIR, exist_ok=True)
+    for fname in os.listdir(PLUGINS_DIR):
+        if not fname.endswith('.plug'):
+            continue
+        fpath = os.path.join(PLUGINS_DIR, fname)
+        try:
+            _install_plugin_from_zip(fpath)
+        except Exception as e:
+            print(f"[plugin] 扫描安装失败 {fname}: {repr(e)[:100]}")
+
+def _install_plugin_from_zip(filepath):
+    """从 .zip/.plug 文件安装插件"""
+    import zipfile, shutil
+    pid_base = os.path.splitext(os.path.basename(filepath))[0]
+    extract_dir = os.path.join(PLUGINS_DIR, f"_{pid_base}_tmp")
+    try:
+        # 解压
+        with zipfile.ZipFile(filepath, 'r') as z:
+            z.extractall(extract_dir)
+        # 读取 manifest
+        manifest_path = os.path.join(extract_dir, 'manifest.json')
+        if not os.path.exists(manifest_path):
+            # 没有 manifest，自动生成
+            manifest = {
+                "id": pid_base,
+                "name": pid_base,
+                "version": "1.0.0",
+                "icon": "📦",
+                "description": f"本地安装: {pid_base}",
+                "type": "custom"
+            }
+        else:
+            with open(manifest_path, encoding='utf-8') as f:
+                manifest = json.load(f)
+        pid = manifest.get('id', pid_base)
+        # 检查是否已存在
+        final_dir = _get_plugin_dir(pid)
+        if os.path.exists(final_dir):
+            shutil.rmtree(final_dir)
+        os.makedirs(final_dir, exist_ok=True)
+        # 复制文件
+        for item in os.listdir(extract_dir):
+            s = os.path.join(extract_dir, item)
+            d = os.path.join(final_dir, item)
+            if os.path.isdir(s):
+                shutil.copytree(s, d, dirs_exist_ok=True)
+            else:
+                shutil.copy2(s, d)
+        # 写入 manifest
+        with open(os.path.join(final_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        # 注册到 PLUGIN_LIST
+        if not any(p['id'] == pid for p in PLUGIN_LIST):
+            PLUGIN_LIST.append({
+                "id": pid,
+                "name": manifest.get('name', pid),
+                "type": manifest.get('type', 'custom'),
+                "enabled": True,
+                "icon": manifest.get('icon', '📦'),
+                "config": {"data_file": os.path.join(final_dir, 'data.json')},
+                "mapping": manifest.get('mapping', {})
+            })
+            save_plugin_config(PLUGIN_LIST)
+        return {"ok": True, "id": pid, "name": manifest.get('name', pid)}
+    finally:
+        if os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir)
+
+def install_plugin_from_url(url):
+    """从 URL 下载并安装插件"""
+    import tempfile
+    if not url.startswith(('http://', 'https://')):
+        return {"error": "链接必须以 http:// 或 https:// 开头"}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "PixivFavSearch/1.0"})
+        tmp = tempfile.NamedTemporaryFile(suffix='.plug', delete=False)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+                if len(data) > 50 * 1024 * 1024:
+                    return {"error": "文件太大了（最大 50MB）"}
+                tmp.write(data)
+            tmp.close()
+            result = _install_plugin_from_zip(tmp.name)
+            return result
+        except Exception as e:
+            return {"error": f"下载失败: {repr(e)[:100]}"}
+        finally:
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
+    except Exception as e:
+        return {"error": repr(e)[:200]}
+
+def uninstall_plugin(pid):
+    """卸载插件"""
+    import shutil
+    try:
+        # 不能卸载内置 pixiv
+        if pid == 'pixiv':
+            return {"error": "不能卸载 Pixiv 数据源"}
+        plugin = next((p for p in PLUGIN_LIST if p['id'] == pid), None)
+        if not plugin:
+            return {"error": "插件不存在"}
+        # 删除目录
+        pdir = _get_plugin_dir(pid)
+        if os.path.exists(pdir):
+            shutil.rmtree(pdir)
+        # 删除 .plug 文件
+        for fname in os.listdir(PLUGINS_DIR):
+            if fname.endswith('.plug') and os.path.splitext(fname)[0] == pid:
+                os.unlink(os.path.join(PLUGINS_DIR, fname))
+        # 从列表移除
+        PLUGIN_LIST[:] = [p for p in PLUGIN_LIST if p['id'] != pid]
+        save_plugin_config(PLUGIN_LIST)
+        # 清除缓存
+        PLUGIN_DATA.pop(pid, None)
+        return {"ok": True}
+    except Exception as e:
+        return {"error": repr(e)[:200]}
+
+def fetch_market(url=None):
+    """获取插件市场列表"""
+    if not url:
+        url = MARKET_URL_DEFAULT
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "PixivFavSearch/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode('utf-8', 'ignore'))
+        return {"ok": True, "plugins": data.get('plugins', []), "url": url}
+    except Exception as e:
+        return {"error": f"获取市场失败: {repr(e)[:100]}"}
 
 def load_plugins():
     """加载所有启用的插件数据"""
@@ -455,6 +603,7 @@ def load_plugin_config():
         }
     ]
     save_plugin_config(PLUGIN_LIST)
+    scan_plugins_dir()
 
 
 # --- 内置更新检查(启动时后台查一次 GitHub 最新 release, 非强制) ---
@@ -901,9 +1050,55 @@ def reload_pixiv_if_changed():
             BOOKMARKS_LOAD_TIME = mtime
             print(f"pixiv 数据热更新: {len(BOOKMARKS)} 幅书签")
             log_info(f"收藏数据热更新 {len(BOOKMARKS)} 条 | Bookmark data hot-reloaded: {len(BOOKMARKS)} items")
+            # 后台预下载缩略图 (服务端进程, 不会被杀)
+            import threading as _thr
+            _thr.Thread(target=_prefetch_thumbnails_bg, daemon=True).start()
         except Exception as e:
             print("pixiv 热更新失败:", repr(e))
             log_error(f"收藏数据热更新失败: {repr(e)} | Bookmark hot-reload failed: {repr(e)}")
+
+_PREFETCH_SEM = threading.Semaphore(3)  # 预下载并发限制
+
+def _prefetch_thumbnails_bg():
+    """后台预下载缺失缩略图 (在服务端运行, 进程存活则持续下载)"""
+    time.sleep(0.5)
+    missing = []
+    for item in BOOKMARKS:
+        pid = str(item.get("id", ""))
+        local = os.path.join(THUMB, pid + ".jpg")
+        if not (os.path.exists(local) and os.path.getsize(local) > 500):
+            missing.append(item)
+    if not missing:
+        return
+    log_info(f"开始预下载 {len(missing)} 个缺失缩略图 | Prefetching {len(missing)} missing thumbnails")
+    count = 0
+    for item in missing:
+        pid = str(item.get("id", ""))
+        local = os.path.join(THUMB, pid + ".jpg")
+        url = item.get("url", "")
+        if not url or "i.pximg.net" not in url:
+            url = _fetch_thumb_url_from_api(pid)
+            if not url:
+                continue
+        with _PREFETCH_SEM:
+            try:
+                req = urllib.request.Request(url, headers={
+                    "Referer": "https://www.pixiv.net/",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
+                })
+                proxies = urllib.request.getproxies()
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies)) if proxies else urllib.request.build_opener()
+                with opener.open(req, timeout=12) as r:
+                    data = r.read(5 * 1024 * 1024 + 1)
+                if len(data) > 5 * 1024 * 1024:
+                    continue
+                with open(local, "wb") as f:
+                    f.write(data)
+                if os.path.getsize(local) > 500:
+                    count += 1
+            except:
+                pass
+    log_info(f"缩略图预下载完成: {count}/{len(missing)} | Thumbnail prefetch done: {count}/{len(missing)}")
 
 # --- 收藏导入/更新(CDP 抓取最新收藏) ---
 _import_state = {"running": False, "code": None, "msg": "", "count": 0, "t": 0.0}
@@ -1107,8 +1302,10 @@ def thumb_for(item, lang="zh"):
         return local
     url = item.get("url", "")
     if not url or "i.pximg.net" not in url:
-        # 不是图片 URL(旧数据可能是页面 URL), 直接跳过下载, 返回 None 让前端显示占位
-        return None
+        # url 缺失或不是图片 URL, 尝试从 pixiv API 获取
+        url = _fetch_thumb_url_from_api(pid)
+        if not url:
+            return None
     # 并发限制: 同时最多 3 个下载, 防止 200 张卡片请求占满服务线程
     with THUMB_SEM:
         # 二次检查(可能在排队期间已下载)
@@ -1123,15 +1320,56 @@ def thumb_for(item, lang="zh"):
             class NoRedirect(urllib.request.HTTPRedirectHandler):
                 def redirect_request(self, *a, **k):
                     return None
-            op = urllib.request.build_opener(NoRedirect)
-            with op.open(req, timeout=12) as r, open(local, "wb") as f:
+            # 走系统代理 (v2rayN 等)
+            proxies = urllib.request.getproxies()
+            if proxies:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), NoRedirect)
+            else:
+                opener = urllib.request.build_opener(NoRedirect)
+            with opener.open(req, timeout=12) as r, open(local, "wb") as f:
                 data = r.read(5 * 1024 * 1024 + 1)
                 if len(data) > 5 * 1024 * 1024:
                     return None
                 f.write(data)
             return local if os.path.getsize(local) > 500 else None
-        except Exception:
+        except Exception as e:
+            # 日志: 缩略图下载失败原因 (首次失败时打印)
+            if not hasattr(thumb_for, '_err_logged'):
+                thumb_for._err_logged = set()
+            err_key = type(e).__name__
+            if err_key not in thumb_for._err_logged:
+                thumb_for._err_logged.add(err_key)
+                log_warn(f"缩略图下载失败: {e} | Thumb download failed: {e}")
             return None
+
+# pixiv API 获取缩略图 URL (缓存)
+_thumb_url_cache = {}
+def _fetch_thumb_url_from_api(pid):
+    """从 pixiv API 获取作品缩略图 URL"""
+    if pid in _thumb_url_cache:
+        return _thumb_url_cache[pid]
+    try:
+        api_url = f"https://www.pixiv.net/ajax/illust/{pid}?lang=zh"
+        req = urllib.request.Request(api_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
+            "Referer": "https://www.pixiv.net/",
+        })
+        proxies = urllib.request.getproxies()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies)) if proxies else urllib.request.build_opener()
+        with opener.open(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        body = data.get("body", {})
+        # 优先用 custom-thumb, 其次 img-master
+        url = (body.get("urls", {}).get("thumb") or 
+               body.get("urls", {}).get("small") or 
+               body.get("urls", {}).get("mini") or "")
+        if url and "i.pximg.net" in url:
+            _thumb_url_cache[pid] = url
+            return url
+    except:
+        pass
+    _thumb_url_cache[pid] = None
+    return None
 
 # ========== 局域网访问安全(白名单 + Host校验 + 访问令牌 + 限速) ==========
 # 只放行本机 + 手动添加的设备 IP。其余局域网设备一律 403。
@@ -1458,7 +1696,7 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/import-status":
             self.send_json(200, import_status())
         elif u.path.startswith("/thumb/"):
-            pid = os.path.basename(u.path)
+            pid = os.path.basename(u.path).split("?")[0]
             it = next((x for x in BOOKMARKS if str(x["id"])==pid), None)
             if not it:
                 return self.send_error(404)
@@ -1550,6 +1788,19 @@ class H(BaseHTTPRequestHandler):
             # 重新加载所有插件数据
             load_plugins()
             self.send_json(200, {"ok": True, "counts": {k: len(v) for k, v in PLUGIN_DATA.items()}})
+        elif u.path == "/api/plugins/market":
+            # 获取插件市场列表
+            url = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("url", [None])[0]
+            result = fetch_market(url)
+            self.send_json(200, result)
+        elif u.path == "/api/plugins/info":
+            # 返回已安装插件的详细信息
+            pid = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("id", [""])[0]
+            plugin = next((p for p in PLUGIN_LIST if p["id"] == pid), None)
+            if not plugin:
+                return self.send_json(404, {"error": "插件不存在"})
+            count = len(PLUGIN_DATA.get(pid, []))
+            self.send_json(200, {"plugin": plugin, "count": count})
         else:
             self.send_error(404)
 
@@ -1697,6 +1948,66 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True})
             
             return self.send_json(400, {"error": "未知操作 | Unknown action"})
+        if u.path == "/api/plugins/install":
+            # 安装插件（从 URL）
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n).decode("utf-8") or "{}"
+                data = json.loads(body)
+            except Exception:
+                return self.send_json(400, {"error": "JSON解析失败"})
+            url = data.get("url", "").strip()
+            if not url:
+                return self.send_json(400, {"error": "缺少 url 参数"})
+            result = install_plugin_from_url(url)
+            if "error" in result:
+                self.send_json(400, result)
+            else:
+                self.send_json(200, result)
+        if u.path == "/api/plugins/uninstall":
+            # 卸载插件
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n).decode("utf-8") or "{}"
+                data = json.loads(body)
+            except Exception:
+                return self.send_json(400, {"error": "JSON解析失败"})
+            pid = data.get("id", "").strip()
+            if not pid:
+                return self.send_json(400, {"error": "缺少 id 参数"})
+            result = uninstall_plugin(pid)
+            if "error" in result:
+                self.send_json(400, result)
+            else:
+                self.send_json(200, result)
+        if u.path == "/api/plugins/scan":
+            # 扫描 plugins 文件夹
+            scan_plugins_dir()
+            self.send_json(200, {"ok": True})
+        if u.path == "/api/plugins/upload":
+            # 上传 .plug 文件（拖拽安装）
+            ct = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ct != "application/octet-stream":
+                return self.send_json(400, {"error": "只接受 .plug 文件"})
+            n = int(self.headers.get("Content-Length") or 0)
+            if n == 0 or n > 50 * 1024 * 1024:
+                return self.send_json(400, {"error": "文件过大或为空"})
+            body = self.rfile.read(n)
+            import tempfile, zipfile
+            tmp = tempfile.NamedTemporaryFile(suffix='.plug', delete=False)
+            try:
+                tmp.write(body)
+                tmp.close()
+                result = _install_plugin_from_zip(tmp.name)
+                if "error" in result:
+                    self.send_json(400, result)
+                else:
+                    self.send_json(200, result)
+            except Exception as e:
+                self.send_json(500, {"error": repr(e)[:200]})
+            finally:
+                if os.path.exists(tmp.name):
+                    os.unlink(tmp.name)
         return self.send_error(404)
 
     def version_string(self):
@@ -1967,6 +2278,34 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
 .wizard-loading-spinner{width:40px;height:40px;border:3px solid var(--field-border);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 12px}
 @keyframes spin{to{transform:rotate(360deg)}}
 .wizard-loading-text{font-size:13px;color:var(--sub)}
+
+/* -- 插件市场弹窗 -- */
+.market-modal{position:fixed;inset:0;z-index:1001;background:rgba(0,0,0,.5);backdrop-filter:blur(6px);display:none;align-items:center;justify-content:center;padding:20px}
+.market-modal.open{display:flex}
+.market-box{background:var(--card);border-radius:18px;padding:0;width:min(92vw,640px);max-height:85vh;box-shadow:0 20px 60px rgba(0,0,0,.45);animation:popIn .3s cubic-bezier(.34,1.56,.64,1) both;display:flex;flex-direction:column;overflow:hidden}
+.market-header{display:flex;align-items:center;justify-content:space-between;padding:18px 20px;border-bottom:1px solid var(--field-border)}
+.market-title{font-size:16px;font-weight:700}
+.market-body{padding:16px 20px;overflow-y:auto;flex:1}
+.market-url-row{display:flex;gap:8px;margin-bottom:16px}
+.market-url-input{flex:1;padding:10px 14px;border-radius:10px;border:1px solid var(--field-border);background:var(--field-bg);color:var(--text);font-size:13px;font-family:Consolas,monospace}
+.market-url-input:focus{outline:none;border-color:var(--accent)}
+.market-load-btn{padding:10px 16px;border-radius:10px;border:none;background:var(--accent);color:var(--accent-ink);font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap}
+.market-list{display:flex;flex-direction:column;gap:8px}
+.market-item{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:12px;background:var(--field-bg);border:1px solid var(--field-border)}
+.market-item-icon{font-size:28px;width:44px;text-align:center;flex-shrink:0}
+.market-item-info{flex:1;min-width:0}
+.market-item-name{font-size:14px;font-weight:600}
+.market-item-desc{font-size:11px;color:var(--sub);margin-top:2px;line-height:1.4}
+.market-item-actions{display:flex;align-items:center;gap:8px}
+.market-install-btn{padding:8px 16px;border-radius:10px;border:none;background:var(--accent);color:var(--accent-ink);font-size:13px;font-weight:700;cursor:pointer}
+.market-install-btn:disabled{opacity:.5;cursor:not-allowed}
+.market-installed{font-size:11px;color:#34C759;font-weight:600}
+.market-empty{color:var(--sub);text-align:center;padding:30px 0;font-size:13px}
+/* -- 拖拽安装覆盖层 -- */
+.drop-overlay{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;flex-direction:column;gap:16px}
+.drop-overlay.active{display:flex}
+.drop-overlay-box{border:3px dashed rgba(255,255,255,.5);border-radius:24px;padding:60px 80px;text-align:center;color:#fff;font-size:18px;font-weight:700;background:rgba(255,255,255,.05)}
+.drop-overlay-icon{font-size:48px;margin-bottom:12px}
 </style>
 <header class=topbar>
  <div class=banner id=banner>
@@ -2025,6 +2364,7 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
    <div id=plugin-list class=plugin-list></div>
    <div class=plugin-add>
     <button class=plugin-add-btn onclick="startAddPlugin()" data-l data-zh="➕ 添加自定义数据源" data-en="➕ Add Custom Source">➕ 添加自定义数据源</button>
+    <button class=plugin-add-btn onclick="openMarket()" style="margin-top:8px" data-l data-zh="🛒 获取更多数据源" data-en="🛒 Get More Sources">🛒 获取更多数据源</button>
    </div>
   </div>
  </div>
@@ -2039,6 +2379,28 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
  </div>
 </div>
 </header>
+
+<div id=market-modal class=market-modal>
+ <div class=market-box>
+  <div class=market-header>
+   <div class=market-title data-l data-zh="🛒 插件市场" data-en="🛒 Plugin Market">🛒 插件市场</div>
+   <button class=settings-close onclick=closeMarket()>✕</button>
+  </div>
+  <div class=market-body>
+   <div class=market-url-row>
+    <input class=market-url-input id=market-url placeholder="市场链接 (默认官方)" onkeydown="if(event.key==='Enter')loadMarket()">
+    <button class=market-load-btn onclick="loadMarket()" data-l data-zh="加载" data-en="Load">加载</button>
+   </div>
+   <div id=market-list class=market-list></div>
+  </div>
+ </div>
+</div>
+<div id=drop-overlay class=drop-overlay>
+ <div class=drop-overlay-box>
+  <div class=drop-overlay-icon>📦</div>
+  <div data-l data-zh="松开鼠标安装插件" data-en="Release to install plugin">松开鼠标安装插件</div>
+ </div>
+</div>
 <div id=crop-modal class=crop-modal>
  <div class=crop-box>
   <div class=crop-title data-l data-zh="✂ 裁剪图片 — 框内就是要显示的区域" data-en="✂ Crop Image — area inside frame is what shows">✂ 裁剪图片 — 框内就是要显示的区域</div>
@@ -2595,6 +2957,129 @@ function deletePlugin(id){
   });
 }
 
+
+// ===== 插件市场 =====
+let MARKET_CACHE = null;
+let MARKET_URL_USED = '';
+
+function openMarket(){
+  document.getElementById('market-modal').classList.add('open');
+  if(!MARKET_CACHE) loadMarket();
+}
+function closeMarket(){
+  document.getElementById('market-modal').classList.remove('open');
+}
+async function loadMarket(){
+  const urlInput = document.getElementById('market-url');
+  const url = urlInput.value.trim() || '';
+  const list = document.getElementById('market-list');
+  list.innerHTML = '<div class=market-empty">加载中...</div>';
+  try {
+    const r = await fetch('/api/plugins/market' + (url ? '?url=' + encodeURIComponent(url) : ''));
+    const d = await r.json();
+    if(d.error){ list.innerHTML = '<div class="market-empty">❌ ' + esc(d.error) + '</div>'; return; }
+    MARKET_CACHE = d.plugins || [];
+    MARKET_URL_USED = d.url || '';
+    renderMarket(d.plugins || []);
+  } catch(e){
+    list.innerHTML = '<div class="market-empty">❌ 请求失败: ' + esc(e.message) + '</div>';
+  }
+}
+function renderMarket(plugins){
+  const list = document.getElementById('market-list');
+  if(!plugins.length){ list.innerHTML = '<div class="market-empty">暂无可安装的插件</div>'; return; }
+  const installed = new Set(PLUGINS.map(p=>p.id));
+  list.innerHTML = plugins.map(p => {
+    const isInstalled = installed.has(p.id);
+    return `<div class="market-item">
+      <div class="market-item-icon">${esc(p.icon||'📦')}</div>
+      <div class="market-item-info">
+        <div class="market-item-name">${esc(p.name||p.id)}</div>
+        <div class="market-item-desc">${esc(p.description||'')}</div>
+      </div>
+      <div class="market-item-actions">
+        ${isInstalled ? '<span class="market-installed">✓ 已安装</span>' :
+          '<button class="market-install-btn" onclick="installMarketPlugin(''+esc(p.id)+'',''+esc(p.download_url||'')+'')">安装</button>'}
+      </div>
+    </div>`;
+  }).join('');
+}
+async function installMarketPlugin(pid, url){
+  if(!url){ alert('该插件没有提供下载链接'); return; }
+  try {
+    const r = await fetch('/api/plugins/install', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({url})
+    });
+    const d = await r.json();
+    if(d.error){ alert('安装失败: ' + d.error); return; }
+    // 重新加载插件列表
+    await loadPluginsList();
+    closeMarket();
+    alert('✅ ' + (d.name||pid) + ' 安装成功！');
+  } catch(e){
+    alert('安装失败: ' + e.message);
+  }
+}
+async function loadPluginsList(){
+  try {
+    const r = await fetch('/api/plugins');
+    const d = await r.json();
+    PLUGINS = d.plugins || [];
+    renderPluginButtons();
+    renderPluginList && renderPluginList();
+  } catch(e){}
+}
+
+// ===== 拖拽安装 =====
+(function(){
+  let dragCounter = 0;
+  const overlay = document.getElementById('drop-overlay');
+  document.addEventListener('dragenter', e => {
+    e.preventDefault();
+    dragCounter++;
+    if(e.dataTransfer && e.dataTransfer.types.includes('Files')){
+      overlay.classList.add('active');
+    }
+  });
+  document.addEventListener('dragleave', e => {
+    e.preventDefault();
+    dragCounter = Math.max(0, dragCounter - 1);
+    if(dragCounter === 0) overlay.classList.remove('active');
+  });
+  document.addEventListener('dragover', e => { e.preventDefault(); });
+  document.addEventListener('drop', async e => {
+    e.preventDefault();
+    dragCounter = 0;
+    overlay.classList.remove('active');
+    const files = e.dataTransfer.files;
+    if(!files.length) return;
+    let installed = 0;
+    let errors = [];
+    for(const f of files){
+      if(!f.name.endsWith('.plug')){ continue; }
+      try {
+        const buf = await f.arrayBuffer();
+        const r = await fetch('/api/plugins/upload', {
+          method:'POST',
+          headers:{'Content-Type':'application/octet-stream', 'Content-Length': buf.byteLength.toString()},
+          body: buf
+        });
+        const d = await r.json();
+        if(d.error){ errors.push(f.name + ': ' + d.error); }
+        else { installed++; }
+      } catch(err){ errors.push(f.name + ': ' + err.message); }
+    }
+    if(installed > 0){
+      await loadPluginsList();
+      alert('✅ 已安装 ' + installed + ' 个插件！' + (errors.length ? '\n\n失败:\n' + errors.join('\n') : ''));
+    } else if(errors.length){
+      alert('❌ 安装失败:\n' + errors.join('\n'));
+    }
+  });
+})();
+
 // ===== 添加数据源向导 =====
 function startAddPlugin(){
   closeSettings();
@@ -2944,7 +3429,7 @@ async function go(){
   }
   
   g.innerHTML = d.items.map(it => {
-    const thumbUrl = it.thumb || it.url || '';
+
     const isDemo = DATASRC === 'demo' && MODE === 'pixiv';
     
     if(isDemo){
@@ -2958,10 +3443,13 @@ async function go(){
     
     const goUrl = it.url || '#';
     const goText = LANG==='zh' ? '🔗 打开' : '🔗 Open';
+    // 处理 URL: 如果是 pximg 图片链接, 转为作品页面链接
+    const pixivArtUrl = `https://www.pixiv.net/artworks/${it.id}`;
+    const finalGoUrl = goUrl.includes('i.pximg.net') ? pixivArtUrl : goUrl;
     
     return `<div class=card>
-      <a href="${esc(goUrl)}" target="_blank">
-        <img loading=lazy decoding=async src="${esc(thumbUrl)}" onerror="this.onerror=null;this.style.visibility='hidden'">
+      <a href="${esc(finalGoUrl)}" target="_blank">
+        <img loading=lazy decoding=async src="/thumb/${it.id}?lang=${LANG}" onerror="this.onerror=null;this.style.visibility='hidden'">
         <div class=tt>${hlText(it.title, it.hl)}</div>
         <div class=au>${esc(it.author || '')}</div>
       </a>
