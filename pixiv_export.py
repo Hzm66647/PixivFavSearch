@@ -125,6 +125,18 @@ def main():
         r = cmd("Network.getCookies", {"urls": ["https://www.pixiv.net"]})
         return r.get("cookies", [])
 
+    # 快速健康检查: 5 秒内看 CDP 是否正常响应
+    print("检查 CDP 连接...", flush=True)
+    _test_start = time.time()
+    try:
+        _test_r = cmd("Network.getCookies", {"urls": ["https://www.pixiv.net"]}, timeout=5)
+        _test_ck = _test_r.get("cookies", [])
+        print(f"CDP 响应正常, 已获取 {len(_test_ck)} 个 cookie(耗时 {time.time()-_test_start:.1f}s)", flush=True)
+    except Exception as e:
+        print(f"CDP 健康检查失败: {e}, 尝试重新连接...", flush=True)
+        reconnect()
+        cmd("Network.enable")
+
     cookies = get_cookies()
     phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
     if not phpsessid:

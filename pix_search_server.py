@@ -535,12 +535,23 @@ def import_status():
     return s
 
 def _import_worker():
-    """后台线程: 调用 pixiv_export.main() 抓取收藏, 写 bookmarks.json 后触发热重载。"""
+    """后台线程: 调用 pixiv_export.main() 抓取收藏, 写 bookmarks.json 后触发热重载。
+
+    同时把 pixiv_export 的 stdout/stderr 逐行转发到日志(DEBUG), 方便诊断卡点。
+    """
     global _import_state
     log_info("开始导入收藏 | Import bookmarks started")
+    import io as _io
+    import contextlib as _ctx
+    _buf = _io.StringIO()
     try:
-        import pixiv_export as _ex
-        code = _ex.main()
+        with _ctx.redirect_stdout(_buf), _ctx.redirect_stderr(_buf):
+            import pixiv_export as _ex
+            code = _ex.main()
+        # 把子模块的 print 输出逐行写入日志(DEBUG), 便于定位失败阶段
+        for _line in _buf.getvalue().splitlines():
+            if _line.strip():
+                log_debug(f"[pixiv_export] {_line} | {_line}")
         count = len(BOOKMARKS)
         # 触发热重载(每次搜索前也会自动检查, 这里主动重载一次)
         reload_pixiv_if_changed()
@@ -553,6 +564,10 @@ def _import_worker():
             log_error(f"收藏导入失败(code={code}) | Import failed (code={code})")
         _import_state.update({"running": False, "code": code, "msg": msg, "count": count, "t": time.time()})
     except Exception as e:
+        # 异常时也要把已缓存的子模块输出写入日志
+        for _line in _buf.getvalue().splitlines():
+            if _line.strip():
+                log_debug(f"[pixiv_export] {_line} | {_line}")
         log_error(f"收藏导入异常: {repr(e)} | Import exception: {repr(e)}")
         _import_state.update({"running": False, "code": -1, "msg": f"导入异常: {repr(e)}", "count": 0, "t": time.time()})
 
