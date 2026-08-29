@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""PixivFavSearch 收藏导出器 (CDP 方案, cookie 不落盘)
+"""PixivFavSearch 收藏导出器 (CDP 读 cookie + Python 直发, cookie 不落盘)
 
-原理: 连接 Edge/Chrome 的 CDP 调试端口, 在已登录的浏览器会话内
-用页面 JS fetch 抓取收藏数据, 全程不读取/保存 cookie。
+原理:
+1. 连接 Edge/Chrome 的 CDP 调试端口, 用 Network.getCookies 读取页面 cookie
+   (含 HttpOnly 的 PHPSESSID 登录态), 全程不把 cookie 写入磁盘。
+2. 用 Python urllib.request 直接请求 pixiv ajax API 抓取收藏——
+   完全绕过页面 Service Worker 对 fetch 的拦截(页面内 JS fetch 会被 SW
+   拦截后挂起, 永不 resolve)。
 """
 import os, sys, json, re, time, socket, subprocess, urllib.request, urllib.parse, base64
 
@@ -68,26 +72,24 @@ def main():
     pages = ensure_cdp_browser() and cdp_targets()
     if not pages:
         return 1
-    # 优先复用已有的 pixiv 收藏页(已登录, 带 /users/{uid}/bookmarks 路径)
-    def is_bookmarks(p):
-        return p.get("type") == "page" and "pixiv" in (p.get("url") or "") and "/bookmarks" in (p.get("url") or "")
-    page = next((p for p in pages if is_bookmarks(p)), None)
-    if not page:
-        # 退而求其次: 任意 pixiv 页面
-        page = next((p for p in pages if p.get("type") == "page" and "pixiv" in (p.get("url") or "")), None)
+    # 任意 type=page 的 target 即可 —— 只需要它的 CDP 会话读 cookie, 不需要书签页
+    page = next((p for p in pages if p.get("type") == "page"), None)
     if page:
         ws_url = page["webSocketDebuggerUrl"]
+        page_url = page.get("url") or ""
     else:
-        # 新建一个干净标签页打开收藏页入口(会自动跳转到用户收藏页)
+        # 新建一个干净标签页打开收藏页入口
         try:
             with urllib.request.urlopen(
-                f"http://127.0.0.1:{PORT}/json/new?{urllib.parse.quote('https://www.pixiv.net/bookmark.php?rest=show')}", timeout=5
+                f"http://127.0.0.1:{PORT}/json/new?{urllib.parse.quote(PIXIV)}", timeout=5
             ) as r:
                 page = json.loads(r.read())
             ws_url = page["webSocketDebuggerUrl"]
+            page_url = page.get("url") or ""
         except Exception as e:
             print(f"新建标签页失败: {e}")
             return 1
+
     ws = create_connection(ws_url, timeout=30)
     _id = 0
 
@@ -106,96 +108,135 @@ def main():
             print(f"CDP 命令超时/断开: {method} - {e}")
             return {}
 
-    cmd("Page.enable")
-    cmd("Runtime.enable")
+    def reconnect():
+        """断开并重连 WebSocket(登录等待/导航时用)。"""
+        nonlocal ws, _id
+        try:
+            ws.close()
+        except Exception:
+            pass
+        ws = create_connection(ws_url, timeout=30)
+        _id = 0
 
-    # 若当前页面不是收藏页, 导航到收藏页入口(自动跳转到 /users/{uid}/bookmarks/artworks)
-    uid = None
-    r = cmd("Runtime.evaluate", {"expression": "location.pathname", "returnByValue": True})
-    path = (r.get("result") or {}).get("value", "")
-    if "bookmarks" not in path:
-        print("导航到收藏页...", flush=True)
+    def get_cookies():
+        """读页面全部 cookie(含 HttpOnly 的 PHPSESSID)。"""
+        reconnect()
+        cmd("Network.enable")
+        r = cmd("Network.getCookies", {"urls": ["https://www.pixiv.net"]})
+        return r.get("cookies", [])
+
+    cookies = get_cookies()
+    phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
+    if not phpsessid:
+        print("未检测到登录态，请在弹出的 Pixiv 页面登录后重试", flush=True)
+        waited = 0
+        while waited < 120:
+            time.sleep(3)
+            waited += 3
+            cookies = get_cookies()
+            phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
+            if phpsessid:
+                break
+        else:
+            print("等待登录超时。")
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return 1
+        time.sleep(3)
+
+    cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+
+    # 获取用户ID: 优先从页面 URL 提取
+    m = re.search(r".*/users/(\d+)/.*", page_url)
+    uid = m.group(1) if m else None
+    if not uid:
+        # 兜底1: cookie 里的 yuid_b 带用户ID
+        yuid = next((c["value"] for c in cookies if c["name"] == "yuid_b"), None)
+        m = re.search(r"\d{4,}", yuid or "")
+        if m:
+            uid = m.group(0)
+    if not uid:
+        # 兜底2: 导航标签页到收藏页入口(会自动跳转到 /users/{uid}/bookmarks), 取 pathname
+        print("导航到收藏页获取用户ID...", flush=True)
+        reconnect()
         cmd("Page.navigate", {"url": "https://www.pixiv.net/bookmark.php?rest=show"})
-        # 等跳转完成(最多 15s)
+        path = ""
         for _ in range(15):
             time.sleep(1)
             r = cmd("Runtime.evaluate", {"expression": "location.pathname", "returnByValue": True})
             path = (r.get("result") or {}).get("value", "")
             if "/bookmarks" in path:
                 break
-    m = re.match(r".*/users/(\d+)/.*", path or "")
-    if m:
-        uid = m.group(1)
+        m = re.search(r".*/users/(\d+)/.*", path or "")
+        if m:
+            uid = m.group(1)
+    try:
+        ws.close()
+    except Exception:
+        pass
     if not uid:
-        print(f"无法从页面 URL 获取用户ID (path={path!r})")
-        ws.close()
+        print("无法从页面获取用户ID。")
         return 1
 
-    # 检查是否登录(在收藏页上出现导航栏 = 已登录)
-    r = cmd("Runtime.evaluate", {"expression": "!!document.querySelector('nav') || document.body.innerText.includes('ログイン')===false", "returnByValue": True})
-    logged = (r.get("result") or {}).get("value")
-    if not logged:
-        print("检测到未登录, 请在刚打开的 Pixiv 页面登录(最多等 2 分钟)...", flush=True)
-        waited = 0
-        while waited < 120:
-            time.sleep(3)
-            waited += 3
-            r = cmd("Runtime.evaluate", {"expression": "!!document.querySelector('nav') || document.body.innerText.includes('ログイン')===false", "returnByValue": True})
-            if (r.get("result") or {}).get("value"):
+    # 直发请求抓取收藏 (Python urllib, 完全绕过页面 Service Worker 拦截)
+    print("开始抓取收藏...", flush=True)
+    all_items = []
+    offset = 0
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"),
+        "Referer": "https://www.pixiv.net/",
+        "Cookie": cookie_header,
+        "Accept": "application/json, text/plain, */*",
+    }
+    while True:
+        url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
+               f"?tag=&offset={offset}&limit=48&rest=show&order=desc&mode=all&lang=zh")
+        works = None
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    d = json.loads(resp.read())
+                works = (d.get("body") or {}).get("works") or []
                 break
-        else:
-            print("等待登录超时。")
-            ws.close()
-            return 1
-        time.sleep(3)
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2)
+                else:
+                    print(f"第 {offset // 48 + 1} 页抓取失败: {e}")
+        if not works:
+            break
+        for w in works:
+            all_items.append({
+                "id": str(w.get("id")),
+                "title": w.get("title", ""),
+                "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
+                         for t in (w.get("tags") or [])],
+                "description": w.get("description", ""),
+                "url": w.get("url", ""),   # ⚠️ 缩略图URL (i.pximg.net), 不是作品页URL
+                "userId": str(w.get("userId", "")),
+                "userName": w.get("userName", ""),
+                "width": w.get("width"),
+                "height": w.get("height"),
+                "pageCount": w.get("pageCount"),
+                "createDate": w.get("createDate", ""),
+                "aiType": w.get("aiType"),
+            })
+        offset += len(works)
+        if len(works) < 48:
+            break
+        time.sleep(0.3)  # 避免请求过快
 
-    # 页面内 fetch 抓取收藏 (浏览器会话内, cookie 不落盘)
-    js = r"""
-    (async () => {
-      const m = location.pathname.match(/\/users\/(\d+)/);
-      if (!m) return JSON.stringify({error: '无法从页面获取用户ID'});
-      const uid = m[1];
-      let items=[], offset=0, page=1;
-      while(true){
-        const url = 'https://www.pixiv.net/ajax/user/'+uid+'/illusts/bookmarks?tag=&offset='+offset+'&limit=48&rest=show&order=desc&mode=all&lang=zh';
-        const r = await fetch(url, {credentials:'include'});
-        if(!r.ok) break;
-        const d = await r.json();
-        const works = d?.body?.works || [];
-        if(!works.length) break;
-        items.push(...works.map(w => ({
-          id: String(w.id), title: w.title,
-          tags: (w.tags||[]).map(t => typeof t === 'object' ? t.tag : String(t)),
-          description: w.description||'',
-          url: w.url || ('https://www.pixiv.net/artworks/'+w.id),
-          userId: String(w.userId), userName: w.userName,
-          width: w.width, height: w.height,
-          pageCount: w.pageCount, createDate: w.createDate,
-          aiType: w.aiType,
-        })));
-        if(works.length < 48) break;
-        offset += works.length; page++;
-      }
-      return JSON.stringify({items});
-    })()
-    """
-    r = cmd("Runtime.evaluate", {"expression": js, "awaitPromise": True, "returnByValue": True})
-    raw = r.get("result", {}).get("value")
-    if not raw:
-        print("抓取失败, 可能是登录态或页面结构问题。")
-        ws.close()
-        return 1
-    data = json.loads(raw)
-    items = data.get("items", [])
-    if not items:
-        print("未抓取到收藏。若刚登录过, 请刷新后重试。")
-        ws.close()
+    if not all_items:
+        print("未抓取到收藏。请确认已登录后重试。")
         return 1
 
     with open(DATA, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=1)
-    ws.close()
-    print(f"[OK] 已导出 {len(items)} 幅收藏到 data/bookmarks.json")
+        json.dump(all_items, f, ensure_ascii=False, indent=1)
+    print(f"[OK] 已导出 {len(all_items)} 幅收藏到 data/bookmarks.json")
     print("  缩略图在下次搜索时会按需下载。")
     return 0
 
