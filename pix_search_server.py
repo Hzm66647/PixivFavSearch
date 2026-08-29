@@ -1123,14 +1123,26 @@ def thumb_for(item, lang="zh"):
             class NoRedirect(urllib.request.HTTPRedirectHandler):
                 def redirect_request(self, *a, **k):
                     return None
-            op = urllib.request.build_opener(NoRedirect)
-            with op.open(req, timeout=12) as r, open(local, "wb") as f:
+            # 走系统代理 (v2rayN 等)
+            proxies = urllib.request.getproxies()
+            if proxies:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), NoRedirect)
+            else:
+                opener = urllib.request.build_opener(NoRedirect)
+            with opener.open(req, timeout=12) as r, open(local, "wb") as f:
                 data = r.read(5 * 1024 * 1024 + 1)
                 if len(data) > 5 * 1024 * 1024:
                     return None
                 f.write(data)
             return local if os.path.getsize(local) > 500 else None
-        except Exception:
+        except Exception as e:
+            # 日志: 缩略图下载失败原因 (首次失败时打印)
+            if not hasattr(thumb_for, '_err_logged'):
+                thumb_for._err_logged = set()
+            err_key = type(e).__name__
+            if err_key not in thumb_for._err_logged:
+                thumb_for._err_logged.add(err_key)
+                log_warn(f"缩略图下载失败: {e} | Thumb download failed: {e}")
             return None
 
 # ========== 局域网访问安全(白名单 + Host校验 + 访问令牌 + 限速) ==========
@@ -1458,7 +1470,7 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/import-status":
             self.send_json(200, import_status())
         elif u.path.startswith("/thumb/"):
-            pid = os.path.basename(u.path)
+            pid = os.path.basename(u.path).split("?")[0]
             it = next((x for x in BOOKMARKS if str(x["id"])==pid), None)
             if not it:
                 return self.send_error(404)
