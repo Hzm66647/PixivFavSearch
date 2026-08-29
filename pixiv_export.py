@@ -18,6 +18,13 @@ os.makedirs(OUT, exist_ok=True)
 PORT = int(os.environ.get("CDP_PORT", "9222"))
 PIXIV = "https://www.pixiv.net/bookmark.php?rest=show"
 
+# 调试日志开关: 环境变量 PIXIV_DEBUG=1 启用详细日志
+_DEBUG = os.environ.get("PIXIV_DEBUG", "0") == "1"
+
+def _log(tag, msg):
+    """带标签的调试日志, 格式: [tag] msg"""
+    print(f"[{tag}] {msg}", flush=True)
+
 # 本地 CDP 请求必须直连, 绝不能走系统/环境代理
 # (否则 urllib 会把 http://127.0.0.1:9222 通过 SOCKS5/HTTP 代理转发,
 # 代理没开或拒绝时本地调试端口永远连不上 → 导入失败)
@@ -33,10 +40,19 @@ except ImportError:
 
 def cdp_targets():
     try:
+        _t0 = time.time()
         with _LOCAL_OPENER.open(f"http://127.0.0.1:{PORT}/json", timeout=3) as r:
-            return json.loads(r.read())
+            data = json.loads(r.read())
+        _ms = (time.time() - _t0) * 1000
+        if _DEBUG:
+            _pages = [p for p in data if p.get("type") == "page"]
+            _log("cdp", f"连接成功({_ms:.0f}ms), {len(data)} targets, {len(_pages)} pages")
+            for p in _pages[:3]:
+                _log("cdp", f"  page: {p.get('url','')[:80]}")
+        return data
     except Exception as e:
-        print(f"连接 CDP 端口 {PORT} 失败: {e}")
+        _ms = (time.time() - _t0) * 1000 if '_t0' in dir() else 0
+        _log("cdp", f"连接失败({_ms:.0f}ms): {e}")
         return None
 
 
@@ -52,11 +68,11 @@ def _launch_edge(headless=True):
     headless=False 时显示窗口(供首次登录 Pixiv 用)。"""
     edge = next((p for p in _EDGE_PATHS if os.path.exists(p)), None)
     if not edge:
-        print("未找到 Edge 浏览器, 无法自动启动调试实例。")
+        _log("edge", "未找到 Edge 浏览器")
         return False
     os.makedirs(_EDGE_PROFILE, exist_ok=True)
     mode = "无头" if headless else "有头(登录用)"
-    print(f"自动启动调试版 Edge [{mode}] (profile: {_EDGE_PROFILE}) ...", flush=True)
+    _log("edge", f"启动 [{mode}] profile={_EDGE_PROFILE}")
     args = [
         edge,
         f"--remote-debugging-port={PORT}",
@@ -66,38 +82,52 @@ def _launch_edge(headless=True):
         "--no-default-browser-check",
     ]
     if headless:
-        args[3:3] = ["--headless=new", "--disable-gpu"]  # 无头: 不弹窗
-    args.append(PIXIV)  # 直接打开收藏页
-    subprocess.Popen(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    # 等待 CDP 就绪(最多 20s)
-    for _ in range(20):
+        args[3:3] = ["--headless=new", "--disable-gpu"]
+    args.append(PIXIV)
+    _log("edge", f"cmdline: {' '.join(args[:4])} ...")
+    p = subprocess.Popen(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    _log("edge", f"PID={p.pid}, 等待CDP就绪(≤20s)...")
+    for i in range(20):
         time.sleep(1)
         if cdp_targets():
+            _log("edge", f"CDP 就绪 ({i+1}s)")
             return True
+    _log("edge", "启动超时 (20s)")
     return False
 
 
 def ensure_cdp_browser():
     """确保有调试浏览器可用。已连上返回 True; 否则自动拉起一个带调试端口的 Edge。"""
     if cdp_targets():
+        _log("edge", "复用已有调试实例")
         return True
+    _log("edge", "无可用调试实例, 自动拉起")
     if _launch_edge(headless=True):
         return True
-    print("调试 Edge 启动超时。")
+    _log("edge", "自动拉起失败")
     return False
 
 
 def main():
+    _log("main", f"=== 开始导入 (PORT={PORT}, DEBUG={'ON' if _DEBUG else 'OFF'}) ===")
+    _t_start = time.time()
+
+    # 阶段1: 确保 CDP 可用
+    _log("main", "[阶段1] 确保 CDP 浏览器就绪")
     pages = ensure_cdp_browser() and cdp_targets()
     if not pages:
+        _log("main", "CDP 不可用, 退出")
         return 1
-    # 任意 type=page 的 target 即可 —— 只需要它的 CDP 会话读 cookie, 不需要书签页
+    _log("main", f"CDP 就绪, {len(pages)} targets")
+
+    # 阶段2: 选择 page target
     page = next((p for p in pages if p.get("type") == "page"), None)
     if page:
         ws_url = page["webSocketDebuggerUrl"]
         page_url = page.get("url") or ""
+        _log("main", f"[阶段2] 复用已有 page: {page_url[:80]}")
     else:
-        # 新建一个干净标签页打开收藏页入口
+        _log("main", f"[阶段2] 无 page target, 新建标签页")
         try:
             with _LOCAL_OPENER.open(
                 f"http://127.0.0.1:{PORT}/json/new?{urllib.parse.quote(PIXIV)}", timeout=5
@@ -105,80 +135,105 @@ def main():
                 page = json.loads(r.read())
             ws_url = page["webSocketDebuggerUrl"]
             page_url = page.get("url") or ""
+            _log("main", f"新建标签页: {page_url[:80]}")
         except Exception as e:
-            print(f"新建标签页失败: {e}")
+            _log("main", f"新建标签页失败: {e}")
             return 1
 
-    ws = create_connection(ws_url, timeout=30)
+    # 阶段3: 连接 WebSocket
+    _log("main", f"[阶段3] 连接 WebSocket: {ws_url[:60]}...")
+    try:
+        ws = create_connection(ws_url, timeout=30)
+        _log("main", "WebSocket 连接成功")
+    except Exception as e:
+        _log("main", f"WebSocket 连接失败: {e}")
+        return 1
+
     _id = 0
 
     def cmd(method, params=None, timeout=60):
         nonlocal _id
         _id += 1
-        ws.send(json.dumps({"id": _id, "method": method, "params": params or {}}))
+        _cid = _id
+        _t0 = time.time()
+        if _DEBUG:
+            _log("cmd", f"#{_cid} {method} (timeout={timeout}s) params={json.dumps(params, ensure_ascii=False)[:100]}")
+        ws.send(json.dumps({"id": _cid, "method": method, "params": params or {}}))
         ws.settimeout(timeout)
         try:
             while True:
                 msg = json.loads(ws.recv())
-                # 跳过事件消息(没有 id), 只收响应
-                if msg.get("id") == _id:
-                    return msg.get("result", {})
+                if _DEBUG and msg.get("id") != _cid:
+                    _log("cmd", f"  收到事件: {msg.get('method','?')}")
+                if msg.get("id") == _cid:
+                    _ms = (time.time() - _t0) * 1000
+                    _res = msg.get("result", {})
+                    if _DEBUG:
+                        _log("cmd", f"#{_cid} 响应({_ms:.0f}ms) keys={list(_res.keys())}")
+                    return _res
         except Exception as e:
-            print(f"CDP 命令超时/断开: {method} - {e}")
+            _ms = (time.time() - _t0) * 1000
+            _log("cmd", f"#{_cid} 超时/断开({_ms:.0f}ms): {e}")
             return {}
 
     def reconnect():
         """断开并重连 WebSocket(登录等待/导航时用)。"""
         nonlocal ws, _id
+        _log("ws", "重连 WebSocket")
         try:
             ws.close()
         except Exception:
             pass
         ws = create_connection(ws_url, timeout=30)
         _id = 0
+        _log("ws", "重连完成")
 
     def get_cookies():
         """读页面全部 cookie(含 HttpOnly 的 PHPSESSID)。"""
         reconnect()
         cmd("Network.enable")
         r = cmd("Network.getCookies", {"urls": ["https://www.pixiv.net"]})
-        return r.get("cookies", [])
+        cookies = r.get("cookies", [])
+        _log("cookie", f"获取 {len(cookies)} 个 cookie")
+        return cookies
 
-    # 快速健康检查: 5 秒内看 CDP 是否正常响应
-    print("检查 CDP 连接...", flush=True)
+    # 阶段4: 健康检查
+    _log("main", "[阶段4] CDP 健康检查 (5s)")
     _test_start = time.time()
     try:
         _test_r = cmd("Network.getCookies", {"urls": ["https://www.pixiv.net"]}, timeout=5)
         _test_ck = _test_r.get("cookies", [])
-        print(f"CDP 响应正常, 已获取 {len(_test_ck)} 个 cookie(耗时 {time.time()-_test_start:.1f}s)", flush=True)
+        _log("main", f"健康检查通过: {len(_test_ck)} cookie ({(time.time()-_test_start)*1000:.0f}ms)")
     except Exception as e:
-        print(f"CDP 健康检查失败: {e}, 尝试重新连接...", flush=True)
+        _log("main", f"健康检查失败({(time.time()-_test_start)*1000:.0f}ms): {e}, 尝试重连")
         reconnect()
         cmd("Network.enable")
 
+    # 阶段5: 获取 cookie + 登录态
+    _log("main", "[阶段5] 获取登录态")
     cookies = get_cookies()
     phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
-    if not phpsessid:
+    if phpsessid:
+        _log("main", f"已登录 (PHPSESSID={phpsessid[:8]}...)")
+    else:
+        _log("main", "未登录")
         print("未检测到登录态，无头模式下无法看到登录页，切换可见模式...", flush=True)
-        # 1. 关掉当前无头连接
         try:
             ws.close()
         except Exception:
             pass
-        # 2. 精确杀掉当前无头调试 Edge(只杀带 edge_profile 的, 不碰用户日常 Edge)
         subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process -Filter \"CommandLine like '%edge_profile%'\" | Stop-Process -Force"],
             capture_output=True, timeout=10)
+        _log("edge", "杀掉无头实例, 等待2s")
         time.sleep(2)
-        # 3. 用有头模式重启(弹出窗口, 用户可登录)
         if not _launch_edge(headless=False):
-            print("无法启动可见模式调试 Edge, 请确保已安装 Edge。")
+            _log("edge", "有头模式启动失败")
             return 1
-        # 4. 重新连接 CDP
         pages = cdp_targets()
         if not pages:
-            print("可见模式 Edge 启动后 CDP 连接失败。")
+            _log("edge", "有头模式 CDP 不可用")
             return 1
         page = next((p for p in pages if p.get("type") == "page"), None)
         if page:
@@ -191,13 +246,13 @@ def main():
                     page = json.loads(r.read())
                 ws_url = page["webSocketDebuggerUrl"]
             except Exception as e:
-                print(f"新建标签页失败: {e}")
+                _log("main", f"新建标签页失败: {e}")
                 return 1
-        ws = create_connection(ws_url, timeout=30)
-        _id = 0
+        reconnect()
         cookies = get_cookies()
         phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
         print("请在弹出的 Pixiv 页面登录后重试", flush=True)
+        _log("main", "等待用户登录 (≤120s)...")
         waited = 0
         while waited < 120:
             time.sleep(3)
@@ -205,9 +260,10 @@ def main():
             cookies = get_cookies()
             phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
             if phpsessid:
+                _log("main", f"登录成功 (等待{waited}s)")
                 break
         else:
-            print("等待登录超时。")
+            _log("main", "登录超时")
             try:
                 ws.close()
             except Exception:
@@ -217,49 +273,51 @@ def main():
 
     cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
-    # 获取用户ID: 优先从页面 URL 提取
+    # 阶段6: 获取用户ID
+    _log("main", "[阶段6] 提取用户ID")
     m = re.search(r".*/users/(\d+)/.*", page_url)
     uid = m.group(1) if m else None
-    if not uid:
-        # 兜底1: cookie 里的 yuid_b 带用户ID
+    if uid:
+        _log("main", f"从 page URL 提取 uid={uid}")
+    else:
         yuid = next((c["value"] for c in cookies if c["name"] == "yuid_b"), None)
         m = re.search(r"\d{4,}", yuid or "")
         if m:
             uid = m.group(0)
+            _log("main", f"从 yuid_b 提取 uid={uid}")
     if not uid:
-        # 兜底2: 导航标签页到收藏页入口(会自动跳转到 /users/{uid}/bookmarks), 取 pathname
-        print("导航到收藏页获取用户ID...", flush=True)
+        _log("main", "导航到收藏页获取 uid")
         reconnect()
         cmd("Page.navigate", {"url": "https://www.pixiv.net/bookmark.php?rest=show"})
         path = ""
-        for _ in range(15):
+        for i in range(15):
             time.sleep(1)
             r = cmd("Runtime.evaluate", {"expression": "location.pathname", "returnByValue": True})
             path = (r.get("result") or {}).get("value", "")
+            if _DEBUG:
+                _log("nav", f"  pathname[{i+1}]: {path}")
             if "/bookmarks" in path:
                 break
         m = re.search(r".*/users/(\d+)/.*", path or "")
         if m:
             uid = m.group(1)
+            _log("main", f"从导航 pathname 提取 uid={uid}")
     try:
         ws.close()
     except Exception:
         pass
     if not uid:
-        print("无法从页面获取用户ID。")
+        _log("main", "无法获取 uid")
         return 1
+    _log("main", f"最终 uid={uid}")
 
-    # 直发请求抓取收藏 (Python urllib, 完全绕过页面 Service Worker 拦截)
-    print("开始抓取收藏...", flush=True)
+    # 阶段7: 抓取收藏
+    _log("main", "[阶段7] 抓取收藏 (Python urllib 直发)")
     all_items = []
     offset = 0
-    # 诊断用: 记录当前 urllib 实际走的代理(便于定位抓取超时时看代理配置)
-    try:
-        _proxies = urllib.request.getproxies()
-        if _proxies:
-            print(f"[debug] 当前环境代理: {_proxies}", flush=True)
-    except Exception:
-        pass
+    _proxies = urllib.request.getproxies()
+    if _proxies:
+        _log("proxy", f"环境代理: {_proxies}")
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"),
@@ -267,23 +325,33 @@ def main():
         "Cookie": cookie_header,
         "Accept": "application/json, text/plain, */*",
     }
+    _page_num = 0
     while True:
+        _page_num += 1
         url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
                f"?tag=&offset={offset}&limit=48&rest=show&order=desc&mode=all&lang=zh")
         works = None
         for attempt in range(3):
+            _t0 = time.time()
             try:
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    d = json.loads(resp.read())
+                    _ms = (time.time() - _t0) * 1000
+                    _raw = resp.read()
+                    d = json.loads(_raw)
                 works = (d.get("body") or {}).get("works") or []
+                _log("fetch", f"第{_page_num}页(尝试{attempt+1}) {_ms:.0f}ms, {len(works)} works, {len(_raw)} bytes")
                 break
             except Exception as e:
+                _ms = (time.time() - _t0) * 1000
                 if attempt < 2:
+                    _log("fetch", f"第{_page_num}页(尝试{attempt+1}) 失败({_ms:.0f}ms): {e}, 2s后重试")
                     time.sleep(2)
                 else:
-                    print(f"第 {offset // 48 + 1} 页抓取失败: {e}")
+                    _log("fetch", f"第{_page_num}页(尝试{attempt+1}) 最终失败({_ms:.0f}ms): {e}")
         if not works:
+            if _page_num == 1:
+                _log("main", "第1页即无数据, 退出")
             break
         for w in works:
             all_items.append({
@@ -292,7 +360,7 @@ def main():
                 "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
                          for t in (w.get("tags") or [])],
                 "description": w.get("description", ""),
-                "url": w.get("url", ""),   # ⚠️ 缩略图URL (i.pximg.net), 不是作品页URL
+                "url": w.get("url", ""),
                 "userId": str(w.get("userId", "")),
                 "userName": w.get("userName", ""),
                 "width": w.get("width"),
@@ -302,16 +370,20 @@ def main():
                 "aiType": w.get("aiType"),
             })
         offset += len(works)
+        _log("fetch", f"累计 {len(all_items)} works")
         if len(works) < 48:
+            _log("fetch", f"末页({len(works)}<48), 结束")
             break
-        time.sleep(0.3)  # 避免请求过快
+        time.sleep(0.3)
 
     if not all_items:
+        _log("main", "未抓取到任何收藏")
         print("未抓取到收藏。请确认已登录后重试。")
         return 1
 
     with open(DATA, "w", encoding="utf-8") as f:
         json.dump(all_items, f, ensure_ascii=False, indent=1)
+    _log("main", f"=== 完成: 导出 {len(all_items)} 幅收藏到 {DATA} (耗时 {time.time()-_t_start:.1f}s) ===")
     print(f"[OK] 已导出 {len(all_items)} 幅收藏到 data/bookmarks.json")
     print("  缩略图在下次搜索时会按需下载。")
     return 0
