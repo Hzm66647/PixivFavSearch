@@ -52,6 +52,38 @@ os.makedirs(ASSETS, exist_ok=True)
 POS_FILE = os.path.join(ASSETS, "pos.json")
 PORT = int(os.environ.get("PIX_PORT", "8897"))
 
+# --- 日志系统: %LOCALAPPDATA%\PixivFavSearch\log\YYYY-MM.txt (DEBUG 精度, 中英双语) ---
+import datetime as _dt
+LOG_DIR = os.path.join(APP_DATA, "log")
+os.makedirs(LOG_DIR, exist_ok=True)
+_LOG_LOCK = threading.Lock()
+
+def _log_path():
+    """返回当前年月对应的日志文件路径。按年-月建文件, 如 2026-08.txt"""
+    _now = _dt.datetime.now()
+    return os.path.join(LOG_DIR, f"{_now.year}-{_now.month:02d}.txt")
+
+def _write_log(level, zh, en=""):
+    """写入日志文件。年月轮转: 跨月自动建新文件。"""
+    try:
+        _now = _dt.datetime.now()
+        _ts = _now.strftime("%Y-%m-%d %H:%M:%S")
+        _en_part = f" | {en}" if en else ""
+        _line = f"[{_ts}] [{level}] {zh}{_en_part}\n"
+        with _LOG_LOCK:
+            with open(_log_path(), "a", encoding="utf-8") as _f:
+                _f.write(_line)
+    except Exception:
+        pass  # 日志本身不能崩
+
+def log_debug(zh, en=""): _write_log("DEBUG", zh, en)
+def log_info(zh, en=""):  _write_log("INFO",  zh, en)
+def log_warn(zh, en=""):  _write_log("WARN",  zh, en)
+def log_error(zh, en=""): _write_log("ERROR", zh, en)
+
+# 日志函数别名(供 desktop_app 等外部模块导入用)
+__all__ = [x for x in dir() if x.startswith("log_")]
+
 # --- 内置更新检查(启动时后台查一次 GitHub 最新 release, 非强制) ---
 LATEST_VER = {"checking": True, "ok": False, "version": None, "url": None}
 def _check_update():
@@ -489,8 +521,10 @@ def reload_pixiv_if_changed():
             BOOKMARKS = data
             BOOKMARKS_LOAD_TIME = mtime
             print(f"pixiv 数据热更新: {len(BOOKMARKS)} 幅书签")
+            log_info(f"收藏数据热更新 {len(BOOKMARKS)} 条 | Bookmark data hot-reloaded: {len(BOOKMARKS)} items")
         except Exception as e:
             print("pixiv 热更新失败:", repr(e))
+            log_error(f"收藏数据热更新失败: {repr(e)} | Bookmark hot-reload failed: {repr(e)}")
 
 # --- 收藏导入/更新(CDP 抓取最新收藏) ---
 _import_state = {"running": False, "code": None, "msg": "", "count": 0, "t": 0.0}
@@ -503,6 +537,7 @@ def import_status():
 def _import_worker():
     """后台线程: 调用 pixiv_export.main() 抓取收藏, 写 bookmarks.json 后触发热重载。"""
     global _import_state
+    log_info("开始导入收藏 | Import bookmarks started")
     try:
         import pixiv_export as _ex
         code = _ex.main()
@@ -512,10 +547,13 @@ def _import_worker():
         count = len(BOOKMARKS)
         if code == 0:
             msg = f"导入完成, 当前共 {count} 幅收藏"
+            log_info(f"收藏导入完成, 共 {count} 幅 | Import finished, {count} bookmarks")
         else:
             msg = "导入失败。已尝试自动启动调试浏览器, 请在弹出的 Pixiv 页面确认已登录, 再点一次导入"
+            log_error(f"收藏导入失败(code={code}) | Import failed (code={code})")
         _import_state.update({"running": False, "code": code, "msg": msg, "count": count, "t": time.time()})
     except Exception as e:
+        log_error(f"收藏导入异常: {repr(e)} | Import exception: {repr(e)}")
         _import_state.update({"running": False, "code": -1, "msg": f"导入异常: {repr(e)}", "count": 0, "t": time.time()})
 
 def start_import():
@@ -914,7 +952,9 @@ class H(BaseHTTPRequestHandler):
                 pass
 
     def _handle_get(self):
+        _start_t = time.time()
         if not (self._ip_ok() and self._host_ok()):
+            log_warn(f"拒绝访问: IP/Host 不在白名单 | Access denied: IP/Host not in whitelist")
             self._deny()
             return
         if not self._origin_ok():
@@ -931,6 +971,7 @@ class H(BaseHTTPRequestHandler):
             return
         u = urllib.parse.urlparse(self.path)
         if u.path == "/":
+            log_debug(f"GET / 首页 | GET / index page")
             if getattr(self, "_set_cookie", False):
                 # key 用后即清: 已种 Cookie, 302 跳到无 key 的 URL, key 不进地址栏/历史/日志
                 self.send_response(302)
@@ -945,6 +986,8 @@ class H(BaseHTTPRequestHandler):
             tagf = urllib.parse.parse_qs(u.query).get("tag", [""])[0].strip().lower()
             colt = urllib.parse.parse_qs(u.query).get("coltag", [""])[0].strip()
             q_lower = q.lower()
+            # 搜索词脱敏: 只记长度不记内容(防隐私泄露到日志)
+            log_debug(f"搜索: 关键词长度={len(q)}, 标签={tagf or '-'}, 收藏标签={colt or '-'} | Search: q_len={len(q)}, tag={tagf or '-'}, coltag={colt or '-'}")
             reload_pixiv_if_changed()  # pixiv 数据热重载(增量更新后免重启)
             q_rom = romanize(q).lower()
             q_norm = _norm_cjk(q).lower()
@@ -1090,12 +1133,14 @@ class H(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         if u.path == "/api/import":
             # 从 Pixiv 抓取最新收藏(CDP)。启动导入线程, 返回是否已启动
+            log_info("POST /api/import 触发导入 | POST /api/import triggered")
             started = start_import()
             self.send_json(200, {"ok": True, "started": started})
             return
         m = _re.match(r"^/api/asset/(banner|avatar)$", u.path)
         if m:
             kind = m.group(1)
+            log_debug(f"POST /api/asset/{kind} 上传封面 | POST /api/asset/{kind} upload cover")
             ct = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             ext = ASSET_EXT.get(ct)
             if not ext:
@@ -1851,6 +1896,7 @@ def start_server(host="127.0.0.1", port=None, daemon=True):
     t = threading.Thread(target=srv.serve_forever, daemon=daemon)
     srv._serving_thread = t
     t.start()
+    log_info(f"服务已启动 http://{host}:{port} | Server started at http://{host}:{port}")
     return srv
 
 def stop_server():
@@ -1860,6 +1906,7 @@ def stop_server():
         except Exception: pass
         try: _server.server_close()
         except Exception: pass
+        log_info("服务已停止 | Server stopped")
         _server = None
 
 if __name__ == "__main__":
