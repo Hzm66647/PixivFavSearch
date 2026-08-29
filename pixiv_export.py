@@ -312,12 +312,41 @@ def main():
     _log("main", f"最终 uid={uid}")
 
     # 阶段7: 抓取收藏
-    _log("main", "[阶段7] 抓取收藏 (Python urllib 直发)")
+    _log("main", "[阶段7] 抓取收藏")
     all_items = []
     offset = 0
     _proxies = urllib.request.getproxies()
     if _proxies:
         _log("proxy", f"环境代理: {_proxies}")
+
+    # 诊断: 用 CDP 在浏览器内发 fetch, 对比 Python urllib
+    # (浏览器能加载 pixiv 页面, 但 Python 走代理可能超时; 用来区分是代理问题还是 Python 特有问题)
+    _diag_url = f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks?tag=&offset=0&limit=4&rest=show&order=desc&mode=all&lang=zh"
+    _log("diag", f"浏览器内 fetch 测试: {_diag_url[:80]}...")
+    try:
+        _diag_js = f"""
+        (async () => {{
+            const t0 = performance.now();
+            try {{
+                const r = await fetch("{_diag_url}", {{credentials: "include"}});
+                const d = await r.json();
+                const ms = (performance.now() - t0).toFixed(0);
+                return JSON.stringify({{ok: true, ms: ms, works: (d.body?.works || []).length, status: r.status}});
+            }} catch(e) {{
+                const ms = (performance.now() - t0).toFixed(0);
+                return JSON.stringify({{ok: false, ms: ms, err: e.message}});
+            }}
+        }})()
+        """
+        _diag_r = cmd("Runtime.evaluate", {"expression": _diag_js, "awaitPromise": True, "returnByValue": True}, timeout=15)
+        _diag_res = json.loads((_diag_r.get("result") or {}).get("value", "{}"))
+        if _diag_res.get("ok"):
+            _log("diag", f"浏览器内 fetch 成功: {_diag_res.get('ms')}ms, {_diag_res.get('works')} works")
+        else:
+            _log("diag", f"浏览器内 fetch 失败: {_diag_res.get('ms')}ms, err={_diag_res.get('err','')}")
+    except Exception as e:
+        _log("diag", f"浏览器内 fetch 测试异常: {e}")
+
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"),
