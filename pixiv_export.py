@@ -17,6 +17,13 @@ os.makedirs(OUT, exist_ok=True)
 
 PORT = int(os.environ.get("CDP_PORT", "9222"))
 PIXIV = "https://www.pixiv.net/bookmark.php?rest=show"
+
+# 本地 CDP 请求必须直连, 绝不能走系统/环境代理
+# (否则 urllib 会把 http://127.0.0.1:9222 通过 SOCKS5/HTTP 代理转发,
+# 代理没开或拒绝时本地调试端口永远连不上 → 导入失败)
+_NO_PROXY = urllib.request.ProxyHandler({})
+_LOCAL_OPENER = urllib.request.build_opener(_NO_PROXY)
+
 try:
     from websocket import create_connection  # websocket-client
 except ImportError:
@@ -26,7 +33,7 @@ except ImportError:
 
 def cdp_targets():
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json", timeout=3) as r:
+        with _LOCAL_OPENER.open(f"http://127.0.0.1:{PORT}/json", timeout=3) as r:
             return json.loads(r.read())
     except Exception as e:
         print(f"连接 CDP 端口 {PORT} 失败: {e}")
@@ -80,7 +87,7 @@ def main():
     else:
         # 新建一个干净标签页打开收藏页入口
         try:
-            with urllib.request.urlopen(
+            with _LOCAL_OPENER.open(
                 f"http://127.0.0.1:{PORT}/json/new?{urllib.parse.quote(PIXIV)}", timeout=5
             ) as r:
                 page = json.loads(r.read())
