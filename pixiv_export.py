@@ -253,6 +253,13 @@ def main():
     print("开始抓取收藏...", flush=True)
     all_items = []
     offset = 0
+    # 诊断用: 记录当前 urllib 实际走的代理(便于定位抓取超时时看代理配置)
+    try:
+        _proxies = urllib.request.getproxies()
+        if _proxies:
+            print(f"[debug] 当前环境代理: {_proxies}", flush=True)
+    except Exception:
+        pass
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"),
