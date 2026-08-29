@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""PixivFavSearch 收藏导出器 (CDP 读 cookie + Python 直发, cookie 不落盘)
+"""PixivFavSearch 收藏导出器 (多方案回退, cookie 不落盘)
 
-原理:
-1. 连接 Edge/Chrome 的 CDP 调试端口, 用 Network.getCookies 读取页面 cookie
-   (含 HttpOnly 的 PHPSESSID 登录态), 全程不把 cookie 写入磁盘。
-2. 用 Python urllib.request 直接请求 pixiv ajax API 抓取收藏——
-   完全绕过页面 Service Worker 对 fetch 的拦截(页面内 JS fetch 会被 SW
-   拦截后挂起, 永不 resolve)。
+抓取路径 (按优先级尝试):
+  A. CDP 读已有调试浏览器 + Python urllib 直发  (主路径)
+  B. CDP 浏览器内 fetch (绕过代理)
+  C. 启动新调试 Edge 实例 + 自动登录流程
 """
-import os, sys, json, re, time, socket, subprocess, urllib.request, urllib.parse, base64, platform
+import os, sys, json, re, time, socket, subprocess, urllib.request, urllib.parse, platform
 
-# 可选依赖: psutil (进程健康检测, 没有也能跑)
+# 可选依赖
 try:
     import psutil
     _HAS_PSUTIL = True
@@ -20,592 +18,423 @@ except ImportError:
 APP_DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PixivFavSearch")
 OUT = os.path.join(APP_DATA, "data")
 DATA = os.path.join(OUT, "bookmarks.json")
+SETTINGS = os.path.join(OUT, "settings.json")
 os.makedirs(OUT, exist_ok=True)
 
 PORT = int(os.environ.get("CDP_PORT", "9222"))
 PIXIV = "https://www.pixiv.net/bookmark.php?rest=show"
 
-# 调试日志开关: 环境变量 PIXIV_DEBUG=1 启用详细日志
 _DEBUG = os.environ.get("PIXIV_DEBUG", "0") == "1"
 
-# 全局统计
-_stat = {
-    "retry_count": 0,
-    "total_backoff": 0.0,
-    "pages_fetched": 0,
-    "pages_failed": 0,
-}
+_stat = {"retry_count": 0, "total_backoff": 0.0, "pages_fetched": 0, "pages_failed": 0}
 
 def _log(tag, msg):
-    """带标签的调试日志, 格式: [tag] msg"""
     print(f"[{tag}] {msg}", flush=True)
 
 def _err_type(e):
-    """分类 urllib 错误类型"""
-    if isinstance(e, socket.timeout) or "timed out" in str(e).lower():
-        return "TIMEOUT"
-    if isinstance(e, ConnectionRefusedError) or "10061" in str(e):
-        return "REFUSED"
-    if "10054" in str(e) or "reset" in str(e).lower():
-        return "RESET"
-    if "10051" in str(e) or "unreachable" in str(e).lower():
-        return "UNREACHABLE"
-    if "10060" in str(e):
-        return "TIMEOUT"
-    if "10065" in str(e):
-        return "HOST_UNREACHABLE"
-    if "remote end closed" in str(e).lower() or "connection aborted" in str(e).lower():
-        return "PROXY_RESET"
-    if "name resolution" in str(e).lower() or "getaddrinfo" in str(e).lower():
-        return "DNS_FAIL"
-    if "ssl" in str(e).lower() or "certificate" in str(e).lower():
-        return "TLS_FAIL"
-    if isinstance(e, urllib.error.HTTPError):
-        return f"HTTP_{e.code}"
+    if isinstance(e, socket.timeout) or "timed out" in str(e).lower(): return "TIMEOUT"
+    if isinstance(e, ConnectionRefusedError) or "10061" in str(e): return "REFUSED"
+    if "10054" in str(e) or "reset" in str(e).lower(): return "RESET"
+    if "10051" in str(e) or "unreachable" in str(e).lower(): return "UNREACHABLE"
+    if "10060" in str(e): return "TIMEOUT"
+    if "10065" in str(e): return "HOST_UNREACHABLE"
+    if "remote end closed" in str(e).lower() or "connection aborted" in str(e).lower(): return "PROXY_RESET"
+    if "name resolution" in str(e).lower() or "getaddrinfo" in str(e).lower(): return "DNS_FAIL"
+    if "ssl" in str(e).lower() or "certificate" in str(e).lower(): return "TLS_FAIL"
+    if isinstance(e, urllib.error.HTTPError): return f"HTTP_{e.code}"
     return f"OTHER:{type(e).__name__}"
 
-# 本地 CDP 请求必须直连, 绝不能走系统/环境代理
-# (否则 urllib 会把 http://127.0.0.1:9222 通过 SOCKS5/HTTP 代理转发,
-# 代理没开或拒绝时本地调试端口永远连不上 → 导入失败)
 _NO_PROXY = urllib.request.ProxyHandler({})
 _LOCAL_OPENER = urllib.request.build_opener(_NO_PROXY)
 
 try:
-    from websocket import create_connection  # websocket-client
+    from websocket import create_connection
 except ImportError:
-    print("缺少 websocket-client, 请先: python -m pip install websocket-client")
+    print("缺少 websocket-client")
     sys.exit(1)
-
 
 def cdp_targets():
     try:
         _t0 = time.time()
         with _LOCAL_OPENER.open(f"http://127.0.0.1:{PORT}/json", timeout=3) as r:
             data = json.loads(r.read())
-        _ms = (time.time() - _t0) * 1000
-        if _DEBUG:
-            _pages = [p for p in data if p.get("type") == "page"]
-            _log("cdp", f"连接成功({_ms:.0f}ms), {len(data)} targets, {len(_pages)} pages")
-            for p in _pages[:3]:
-                _log("cdp", f"  page: {p.get('url','')[:80]}")
         return data
     except Exception as e:
-        _ms = (time.time() - _t0) * 1000 if '_t0' in dir() else 0
-        _log("cdp", f"连接失败({_ms:.0f}ms): {_err_type(e)} {e}")
         return None
 
-
 _EDGE_PATHS = [
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    r"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
 ]
-_EDGE_PROFILE = os.path.join(APP_DATA, "edge_profile")  # 独立配置, 不干扰日常浏览器
-
+_EDGE_PROFILE = os.path.join(APP_DATA, "edge_profile")
 
 def _launch_edge(headless=True):
-    """拉起调试版 Edge。headless=True 时不弹窗(后台跑 CDP);
-    headless=False 时显示窗口(供首次登录 Pixiv 用)。"""
     edge = next((p for p in _EDGE_PATHS if os.path.exists(p)), None)
     if not edge:
-        _log("edge", "未找到 Edge 浏览器")
         return False
     os.makedirs(_EDGE_PROFILE, exist_ok=True)
-    mode = "无头" if headless else "有头(登录用)"
-    _log("edge", f"启动 [{mode}] path={edge}")
-    _log("edge", f"  profile={_EDGE_PROFILE}")
-    args = [
-        edge,
-        f"--remote-debugging-port={PORT}",
-        "--remote-allow-origins=*",
-        f"--user-data-dir={_EDGE_PROFILE}",
-        "--no-first-run",
-        "--no-default-browser-check",
-    ]
+    args = [edge, f"--remote-debugging-port={PORT}", "--remote-allow-origins=*",
+            f"--user-data-dir={_EDGE_PROFILE}", "--no-first-run", "--no-default-browser-check"]
     if headless:
         args[3:3] = ["--headless=new", "--disable-gpu"]
     args.append(PIXIV)
-    _log("edge", f"cmdline: {' '.join(args[:4])} ...")
     p = subprocess.Popen(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    _log("edge", f"PID={p.pid}, 等待CDP就绪(≤20s)...")
     for i in range(20):
         time.sleep(1)
         if cdp_targets():
-            _log("edge", f"CDP 就绪 ({i+1}s)")
             return True
-    _log("edge", "启动超时 (20s)")
     return False
 
+def _load_settings():
+    if os.path.exists(SETTINGS):
+        try:
+            with open(SETTINGS, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
 
-def ensure_cdp_browser():
-    """确保有调试浏览器可用。已连上返回 True; 否则自动拉起一个带调试端口的 Edge。"""
-    if cdp_targets():
-        _log("edge", "复用已有调试实例")
-        return True
-    _log("edge", "无可用调试实例, 自动拉起")
-    if _launch_edge(headless=True):
-        return True
-    _log("edge", "自动拉起失败")
-    return False
-
-
-def _probe_proxy():
-    """测试代理实际连通性 (不只是打印配置)"""
-    _proxies = urllib.request.getproxies()
-    if not _proxies:
-        _log("proxy_test", "无代理配置 (直连)")
-        return "DIRECT"
-    _log("proxy_test", f"配置: {_proxies}")
-    _t0 = time.time()
+def _save_settings(settings):
     try:
-        _req = urllib.request.Request("https://www.pixiv.net/", headers={"User-Agent": "Mozilla/5.0"})
-        _resp = urllib.request.urlopen(_req, timeout=8)
-        _ms = (time.time() - _t0) * 1000
-        _log("proxy_test", f"OK: status={_resp.status}, {_ms:.0f}ms")
-        return "OK"
-    except Exception as e:
-        _ms = (time.time() - _t0) * 1000
-        _log("proxy_test", f"FAIL: {_err_type(e)} ({_ms:.0f}ms) {e}")
-        return "FAIL"
-
-
-def _check_edge_health(pid):
-    """检查 Edge 进程健康状态"""
-    if not _HAS_PSUTIL:
-        return
-    try:
-        _proc = psutil.Process(pid)
-        _rss = _proc.memory_info().rss / 1024**2
-        _cpu = _proc.cpu_percent(interval=0.1)
-        _threads = _proc.num_threads()
-        _log("edge_health", f"PID={pid} RSS={_rss:.0f}MB CPU={_cpu:.0f}% threads={_threads}")
-    except Exception as e:
-        _log("edge_health", f"PID={pid} 无法读取: {e}")
-
-
-def main():
-    _log("main", f"=== 开始导入 (PORT={PORT}, DEBUG={'ON' if _DEBUG else 'OFF'}) ===")
-    _t_start = time.time()
-
-    # P2-13: 启动环境快照
-    _log("env", f"Python {sys.version.split()[0]} | {platform.platform()} | {platform.machine()}")
-    _log("env", f"APP_DATA={APP_DATA}")
-    _edge_path = next((p for p in _EDGE_PATHS if os.path.exists(p)), "NOT_FOUND")
-    _log("env", f"Edge={_edge_path}")
-    if _HAS_PSUTIL:
-        _log("env", f"psutil=OK")
-    else:
-        _log("env", f"psutil=MISSING (pip install psutil 启用进程健康检测)")
-
-    # 阶段1: 确保 CDP 可用
-    _log("main", "[阶段1] 确保 CDP 浏览器就绪")
-    _t_stage1 = time.time()
-    pages = ensure_cdp_browser() and cdp_targets()
-    if not pages:
-        _log("main", "CDP 不可用, 退出")
-        return 1
-    _log("main", f"CDP 就绪, {len(pages)} targets ({(time.time()-_t_stage1):.1f}s)")
-
-    # P0-5: Edge CDP 版本
-    try:
-        _ver = cmd("Browser.getVersion") if False else None  # 延迟到 ws 连接后
-    except Exception:
+        with open(SETTINGS, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+    except:
         pass
 
-    # 阶段2: 选择 page target
-    page = next((p for p in pages if p.get("type") == "page"), None)
-    if page:
-        ws_url = page["webSocketDebuggerUrl"]
-        page_url = page.get("url") or ""
-        _log("main", f"[阶段2] 复用已有 page: {page_url[:80]}")
-    else:
-        _log("main", f"[阶段2] 无 page target, 新建标签页")
+def _detect_uid_from_edge(profile_path=None):
+    """尝试从 Edge profile 的 Preferences 文件读取 uid"""
+    if profile_path is None:
+        profile_path = _EDGE_PROFILE
+    prefs = os.path.join(profile_path, "Default", "Preferences")
+    if os.path.exists(prefs):
         try:
-            with _LOCAL_OPENER.open(
-                f"http://127.0.0.1:{PORT}/json/new?{urllib.parse.quote(PIXIV)}", timeout=5
-            ) as r:
-                page = json.loads(r.read())
-            ws_url = page["webSocketDebuggerUrl"]
-            page_url = page.get("url") or ""
-            _log("main", f"新建标签页: {page_url[:80]}")
-        except Exception as e:
-            _log("main", f"新建标签页失败: {_err_type(e)} {e}")
-            return 1
+            with open(prefs, "r", encoding="utf-8") as f:
+                prefs_data = json.load(f)
+            cookies = prefs_data.get("cookies", [])
+            for c in cookies:
+                if c.get("name") == "yuid_b":
+                    m = re.search(r"\d{4,}", c.get("value", ""))
+                    if m:
+                        return m.group(0)
+        except:
+            pass
+    return None
 
-    # 阶段3: 连接 WebSocket
-    _log("main", f"[阶段3] 连接 WebSocket: {ws_url[:60]}...")
+def _get_user_default_edge_profile():
+    """获取用户默认 Edge 配置目录"""
+    local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    default_profile = os.path.join(local_appdata, "Microsoft", "Edge", "User Data")
+    if os.path.exists(os.path.join(default_profile, "Default")):
+        return default_profile
+    return None
+
+def _is_user_edge_running():
+    """检查用户日常 Edge 是否在运行"""
+    if not _HAS_PSUTIL:
+        return False
     try:
-        ws = create_connection(ws_url, timeout=30)
-        _log("main", "WebSocket 连接成功")
-    except Exception as e:
-        _log("main", f"WebSocket 连接失败: {_err_type(e)} {e}")
-        return 1
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] and 'msedge' in proc.info['name'].lower():
+                return True
+    except:
+        pass
+    return False
 
+# ══════════════════════════════════════════════════════════════
+# 方案 B: CDP 浏览器内 fetch (绕过代理, 需要 CDP)
+# ══════════════════════════════════════════════════════════════
+def _fetch_browser_internal(ws_url, uid):
+    """通过 CDP 在浏览器内部发 fetch, 绕过系统代理"""
+    _log("main", "[方案B] 尝试 CDP 浏览器内 fetch")
+    ws = create_connection(ws_url, timeout=30)
     _id = 0
-
-    def cmd(method, params=None, timeout=60):
+    def cdp(method, params=None, timeout=30):
         nonlocal _id
         _id += 1
-        _cid = _id
-        _t0 = time.time()
-        if _DEBUG:
-            _log("cmd", f"#{_cid} {method} (timeout={timeout}s) params={json.dumps(params, ensure_ascii=False)[:100]}")
-        ws.send(json.dumps({"id": _cid, "method": method, "params": params or {}}))
+        ws.send(json.dumps({"id": _id, "method": method, "params": params or {}}))
         ws.settimeout(timeout)
-        try:
-            while True:
-                msg = json.loads(ws.recv())
-                if _DEBUG and msg.get("id") != _cid:
-                    _log("cmd", f"  收到事件: {msg.get('method','?')}")
-                if msg.get("id") == _cid:
-                    _ms = (time.time() - _t0) * 1000
-                    _res = msg.get("result", {})
-                    _err = msg.get("error")
-                    # P1-16: CDP 错误响应
-                    if _err and _DEBUG:
-                        _log("cmd_err", f"#{_cid} CDP错误: {_err.get('code')} {_err.get('message','')[:100]}")
-                    if _DEBUG:
-                        _log("cmd", f"#{_cid} 响应({_ms:.0f}ms) keys={list(_res.keys())}")
-                    return _res
-        except Exception as e:
-            _ms = (time.time() - _t0) * 1000
-            _log("cmd", f"#{_cid} 超时/断开({_ms:.0f}ms): {_err_type(e)} {e}")
-            return {}
-
-    def reconnect():
-        """断开并重连 WebSocket(登录等待/导航时用)。"""
-        nonlocal ws, _id
-        _log("ws", "重连 WebSocket")
-        try:
-            ws.close()
-        except Exception:
-            pass
-        ws = create_connection(ws_url, timeout=30)
-        _id = 0
-        _log("ws", "重连完成")
-
-    def get_cookies():
-        """读页面全部 cookie(含 HttpOnly 的 PHPSESSID)。"""
-        reconnect()
-        cmd("Network.enable")
-        r = cmd("Network.getCookies", {"urls": ["https://www.pixiv.net"]})
-        cookies = r.get("cookies", [])
-        _log("cookie", f"获取 {len(cookies)} 个 cookie")
-        # P1-8: Cookie 过期时间
-        if cookies and _DEBUG:
-            _sess = next((c for c in cookies if c.get("name") == "PHPSESSID"), None)
-            if _sess:
-                _exp = _sess.get("expires", -1)
-                if _exp == -1:
-                    _log("cookie", f"PHPSESSID session cookie (无过期时间)")
-                else:
-                    _remain = _exp - time.time()
-                    _log("cookie", f"PHPSESSID expires_in={_remain:.0f}s")
-        # P2-18: Cookie scope
-        _domains = set(c.get("domain","") for c in cookies)
-        if _DEBUG:
-            _log("cookie", f"domains: {','.join(sorted(_domains))}")
-        return cookies
-
-    # P0-5: Edge CDP 版本 (ws 已连接)
-    try:
-        _ver = cmd("Browser.getVersion", timeout=5)
-        if _ver:
-            _log("cdp_ver", f"product={_ver.get('product','?')} protocol={_ver.get('protocolVersion','?')} userAgent={_ver.get('userAgent','?')[:60]}")
-    except Exception as e:
-        _log("cdp_ver", f"获取失败: {e}")
-
-    # P2-14: Service Worker 检测
-    try:
-        _sw_r = cmd("Runtime.evaluate", {"expression": "navigator.serviceWorker?.controller?.scriptURL || null", "returnByValue": True}, timeout=5)
-        _sw_url = (_sw_r.get("result") or {}).get("value")
-        if _sw_url:
-            _log("sw", f"ServiceWorker active: {_sw_url}")
-        else:
-            _log("sw", "ServiceWorker: none")
-    except Exception as e:
-        _log("sw", f"检测失败: {e}")
-
-    # 阶段4: 健康检查
-    _log("main", "[阶段4] CDP 健康检查 (5s)")
-    _test_start = time.time()
-    try:
-        _test_r = cmd("Network.getCookies", {"urls": ["https://www.pixiv.net"]}, timeout=5)
-        _test_ck = _test_r.get("cookies", [])
-        _log("main", f"健康检查通过: {len(_test_ck)} cookie ({(time.time()-_test_start)*1000:.0f}ms)")
-    except Exception as e:
-        _log("main", f"健康检查失败({(time.time()-_test_start)*1000:.0f}ms): {_err_type(e)} {e}, 尝试重连")
-        reconnect()
-        cmd("Network.enable")
-
-    # 阶段5: 获取 cookie + 登录态
-    _log("main", "[阶段5] 获取登录态")
-    cookies = get_cookies()
-    phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
-    if phpsessid:
-        _log("main", f"已登录 (PHPSESSID={phpsessid[:8]}...)")
-    else:
-        _log("main", "未登录")
-        print("未检测到登录态，无头模式下无法看到登录页，切换可见模式...", flush=True)
-        try:
-            ws.close()
-        except Exception:
-            pass
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-CimInstance Win32_Process -Filter \"CommandLine like '%edge_profile%'\" | Stop-Process -Force"],
-            capture_output=True, timeout=10)
-        _log("edge", "杀掉无头实例, 等待2s")
-        time.sleep(2)
-        if not _launch_edge(headless=False):
-            _log("edge", "有头模式启动失败")
-            return 1
-        pages = cdp_targets()
-        if not pages:
-            _log("edge", "有头模式 CDP 不可用")
-            return 1
-        page = next((p for p in pages if p.get("type") == "page"), None)
-        if page:
-            ws_url = page["webSocketDebuggerUrl"]
-        else:
-            try:
-                with _LOCAL_OPENER.open(
-                    f"http://127.0.0.1:{PORT}/json/new?{urllib.parse.quote(PIXIV)}", timeout=5
-                ) as r:
-                    page = json.loads(r.read())
-                ws_url = page["webSocketDebuggerUrl"]
-            except Exception as e:
-                _log("main", f"新建标签页失败: {_err_type(e)} {e}")
-                return 1
-        reconnect()
-        cookies = get_cookies()
-        phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
-        print("请在弹出的 Pixiv 页面登录后重试", flush=True)
-        _log("main", "等待用户登录 (≤120s)...")
-        waited = 0
-        while waited < 120:
-            time.sleep(3)
-            waited += 3
-            cookies = get_cookies()
-            phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
-            if phpsessid:
-                _log("main", f"登录成功 (等待{waited}s)")
-                break
-        else:
-            _log("main", "登录超时")
-            try:
-                ws.close()
-            except Exception:
-                pass
-            return 1
-        time.sleep(3)
-
-    cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-
-    # 阶段6: 获取用户ID
-    _log("main", "[阶段6] 提取用户ID")
-    m = re.search(r".*/users/(\d+)/.*", page_url)
-    uid = m.group(1) if m else None
-    if uid:
-        _log("main", f"从 page URL 提取 uid={uid}")
-    else:
-        yuid = next((c["value"] for c in cookies if c["name"] == "yuid_b"), None)
-        m = re.search(r"\d{4,}", yuid or "")
-        if m:
-            uid = m.group(0)
-            _log("main", f"从 yuid_b 提取 uid={uid}")
-    if not uid:
-        _log("main", "导航到收藏页获取 uid")
-        reconnect()
-        cmd("Page.navigate", {"url": "https://www.pixiv.net/bookmark.php?rest=show"})
-        path = ""
-        for i in range(15):
-            time.sleep(1)
-            r = cmd("Runtime.evaluate", {"expression": "location.pathname", "returnByValue": True})
-            path = (r.get("result") or {}).get("value", "")
-            if _DEBUG:
-                _log("nav", f"  pathname[{i+1}]: {path}")
-            if "/bookmarks" in path:
-                break
-        m = re.search(r".*/users/(\d+)/.*", path or "")
-        if m:
-            uid = m.group(1)
-            _log("main", f"从导航 pathname 提取 uid={uid}")
-    try:
-        ws.close()
-    except Exception:
-        pass
-    if not uid:
-        _log("main", "无法获取 uid")
-        return 1
-    _log("main", f"最终 uid={uid}")
-
-    # 阶段7: 抓取收藏
-    _log("main", "[阶段7] 抓取收藏")
-    _t_stage7 = time.time()
+        while True:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == _id:
+                return msg.get("result", {})
     all_items = []
     offset = 0
-    _proxies = urllib.request.getproxies()
-    if _proxies:
-        _log("proxy", f"环境代理: {_proxies}")
-
-    # P0-3: 代理实际连通性测试
-    _proxy_status = _probe_proxy()
-    if _proxy_status == "FAIL":
-        _log("main", "代理测试失败, 跳过抓取。请检查代理设置或关闭代理后重试。")
-        print("代理无法访问 Pixiv。请检查代理设置或关闭代理后重试。")
-        return 1
-
-    # 诊断: 用 CDP 在浏览器内发 fetch, 对比 Python urllib
-    # 注意: 阶段6结束时 ws.close() 了, 需要先 reconnect 才能用 CDP
-    try:
-        reconnect()
-    except Exception as e:
-        _log("diag", f"重连失败, 跳过浏览器内 fetch: {_err_type(e)} {e}")
-    _diag_url = f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks?tag=&offset=0&limit=4&rest=show&order=desc&mode=all&lang=zh"
-    _log("diag", f"浏览器内 fetch 测试: {_diag_url[:80]}...")
-    try:
-        _diag_js = f"""
+    while True:
+        url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
+               f"?tag=&offset={offset}&limit=48&rest=show&order=desc&mode=all&lang=zh")
+        js = f"""
         (async () => {{
             const t0 = performance.now();
             try {{
-                const r = await fetch("{_diag_url}", {{credentials: "include"}});
+                const r = await fetch("{url}", {{credentials: "include"}});
                 const d = await r.json();
                 const ms = (performance.now() - t0).toFixed(0);
-                return JSON.stringify({{ok: true, ms: ms, works: (d.body?.works || []).length, status: r.status}});
+                return JSON.stringify({{ok: true, ms: ms, body: d.body}});
             }} catch(e) {{
-                const ms = (performance.now() - t0).toFixed(0);
-                return JSON.stringify({{ok: false, ms: ms, err: e.message}});
+                return JSON.stringify({{ok: false, err: e.message}});
             }}
         }})()
         """
-        _diag_r = cmd("Runtime.evaluate", {"expression": _diag_js, "awaitPromise": True, "returnByValue": True}, timeout=15)
-        _diag_res = json.loads((_diag_r.get("result") or {}).get("value", "{}"))
-        if _diag_res.get("ok"):
-            _log("diag", f"浏览器内 fetch 成功: {_diag_res.get('ms')}ms, {_diag_res.get('works')} works")
-        else:
-            _log("diag", f"浏览器内 fetch 失败: {_diag_res.get('ms')}ms, err={_diag_res.get('err','')}")
-    except Exception as e:
-        _log("diag", f"浏览器内 fetch 测试异常: {_err_type(e)} {e}")
+        try:
+            res = cdp("Runtime.evaluate", {"expression": js, "awaitPromise": True, "returnByValue": True}, timeout=15)
+            val = json.loads((res.get("result") or {}).get("value", "{}"))
+            if not val.get("ok"):
+                _log("fetch", f"[方案B] fetch 失败: {val.get('err','')}")
+                break
+            works = (val.get("body") or {}).get("works") or []
+            if not works:
+                break
+            for w in works:
+                all_items.append({
+                    "id": str(w.get("id")),
+                    "title": w.get("title", ""),
+                    "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
+                             for t in (w.get("tags") or [])],
+                    "description": w.get("description", ""),
+                    "url": w.get("url", ""),
+                    "userId": str(w.get("userId", "")),
+                    "userName": w.get("userName", ""),
+                    "width": w.get("width"),
+                    "height": w.get("height"),
+                    "pageCount": w.get("pageCount"),
+                    "createDate": w.get("createDate", ""),
+                    "aiType": w.get("aiType"),
+                })
+            _log("fetch", f"[方案B] 第{len(all_items)//48+1}页: {len(works)} works (累计 {len(all_items)})")
+            if len(works) < 48:
+                break
+            offset += len(works)
+            time.sleep(0.3)
+        except Exception as e:
+            _log("fetch", f"[方案B] 异常: {_err_type(e)} {e}")
+            break
+    try:
+        ws.close()
+    except:
+        pass
+    return all_items
 
+# ══════════════════════════════════════════════════════════════
+# 方案 A: CDP + Python urllib (主路径)
+# ══════════════════════════════════════════════════════════════
+def _fetch_via_cdp(pages):
+    """主路径: CDP 读 cookie → Python urllib 直发"""
+    page = next((p for p in pages if p.get("type") == "page"), None)
+    if not page:
+        try:
+            with _LOCAL_OPENER.open(f"http://127.0.0.1:{PORT}/json/new", timeout=5) as r:
+                page = json.loads(r.read())
+        except:
+            return None, "", ""
+    
+    ws_url = page["webSocketDebuggerUrl"]
+    page_url = page.get("url", "")
+    
+    ws = create_connection(ws_url, timeout=30)
+    _id = 0
+    def cdp(method, params=None, timeout=60):
+        nonlocal _id
+        _id += 1
+        ws.send(json.dumps({"id": _id, "method": method, "params": params or {}}))
+        ws.settimeout(timeout)
+        while True:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == _id:
+                return msg.get("result", {})
+    
+    cdp("Network.enable")
+    r = cdp("Network.getCookies", {"urls": ["https://www.pixiv.net"]})
+    cookies = r.get("cookies", [])
+    phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
+    
+    if not phpsessid:
+        try: ws.close()
+        except: pass
+        return None, page_url, "NO_LOGIN"
+    
+    cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+    
+    m = re.search(r".*/users/(\d+)/.*", page_url)
+    uid = m.group(1) if m else None
+    if not uid:
+        yuid = next((c["value"] for c in cookies if c["name"] == "yuid_b"), None)
+        m2 = re.search(r"\d{4,}", yuid or "")
+        uid = m2.group(0) if m2 else None
+    
+    if not uid:
+        try: ws.close()
+        except: pass
+        return None, page_url, "NO_UID"
+    
+    try: ws.close()
+    except: pass
+    
+    all_items = []
+    offset = 0
     headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"),
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
         "Referer": "https://www.pixiv.net/",
         "Cookie": cookie_header,
         "Accept": "application/json, text/plain, */*",
     }
-    _page_num = 0
-    _consecutive_fail = 0
     while True:
-        _page_num += 1
         url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
                f"?tag=&offset={offset}&limit=48&rest=show&order=desc&mode=all&lang=zh")
-        works = None
-        for attempt in range(3):
-            _t0 = time.time()
-            try:
-                # P0-6: 每页耗时拆解 (DNS / 连接 / 首字节 / 传输)
-                _dns_t0 = time.time()
-                _host = urllib.parse.urlparse(url).hostname
-                try:
-                    socket.getaddrinfo(_host, 443)
-                    _dns_ms = (time.time() - _dns_t0) * 1000
-                except Exception:
-                    _dns_ms = -1
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    _ttfb_ms = (time.time() - _t0) * 1000
-                    _raw = resp.read()
-                    _total_ms = (time.time() - _t0) * 1000
-                    _xfer_ms = _total_ms - _ttfb_ms
-                    # P0-1: HTTP 响应码
-                    _status = resp.status
-                    # P1-7: 服务端限速信号
-                    _retry_after = resp.headers.get("Retry-After", "")
-                    _rate_limit = resp.headers.get("X-RateLimit-Remaining", "")
-                    if _status == 429:
-                        _log("ratelimit", f"429! Retry-After={_retry_after}, X-RateLimit-Remaining={_rate_limit}")
-                    # P0-4: 响应体校验
-                    _content_type = resp.headers.get("Content-Type", "")
-                    if "json" not in _content_type and "text" not in _content_type:
-                        _log("body_warn", f"异常 Content-Type={_content_type}, len={len(_raw)}, preview={_raw[:80]}")
-                    if len(_raw) == 0:
-                        _log("body_warn", f"空响应体 (status={_status})")
-                    d = json.loads(_raw)
-                works = (d.get("body") or {}).get("works") or []
-                _log("fetch", f"第{_page_num}页(尝试{attempt+1}) {_total_ms:.0f}ms (DNS={_dns_ms:.0f} TTFB={_ttfb_ms:.0f} xfer={_xfer_ms:.0f}), status={_status}, {len(works)} works, {len(_raw)} bytes")
-                if _retry_after:
-                    _log("ratelimit", f"Retry-After={_retry_after}s, 等待后重试")
-                    time.sleep(int(_retry_after) if _retry_after.isdigit() else 5)
-                _consecutive_fail = 0
-                _stat["pages_fetched"] += 1
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                d = json.loads(raw)
+            works = (d.get("body") or {}).get("works") or []
+            if not works:
                 break
-            except Exception as e:
-                _ms = (time.time() - _t0) * 1000
-                _etype = _err_type(e)
-                _stat["retry_count"] += 1
-                _stat["total_backoff"] += 2
-                _consecutive_fail += 1
-                # P1-11: 响应体 hex dump (JSON 解析失败时)
-                if "json" in str(e).lower() and '_raw' in dir():
-                    _log("body_dump", f"JSON解析失败, raw[:200]={_raw[:200]}")
-                if attempt < 2:
-                    _log("fetch", f"第{_page_num}页(尝试{attempt+1}) 失败({_ms:.0f}ms): {_etype} {e}, 2s后重试")
-                    time.sleep(2)
-                else:
-                    _log("fetch", f"第{_page_num}页(尝试{attempt+1}) 最终失败({_ms:.0f}ms): {_etype} {e}")
-                    _stat["pages_failed"] += 1
-        if not works:
-            if _page_num == 1:
-                _log("main", "第1页即无数据, 退出")
-            break
-        for w in works:
-            all_items.append({
-                "id": str(w.get("id")),
-                "title": w.get("title", ""),
-                "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
-                         for t in (w.get("tags") or [])],
-                "description": w.get("description", ""),
-                "url": w.get("url", ""),
-                "userId": str(w.get("userId", "")),
-                "userName": w.get("userName", ""),
-                "width": w.get("width"),
-                "height": w.get("height"),
-                "pageCount": w.get("pageCount"),
-                "createDate": w.get("createDate", ""),
-                "aiType": w.get("aiType"),
-            })
-        offset += len(works)
-        _log("fetch", f"累计 {len(all_items)} works")
-        if len(works) < 48:
-            _log("fetch", f"末页({len(works)}<48), 结束")
-            break
-        time.sleep(0.3)
+            for w in works:
+                all_items.append({
+                    "id": str(w.get("id")),
+                    "title": w.get("title", ""),
+                    "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
+                             for t in (w.get("tags") or [])],
+                    "description": w.get("description", ""),
+                    "url": w.get("url", ""),
+                    "userId": str(w.get("userId", "")),
+                    "userName": w.get("userName", ""),
+                    "width": w.get("width"),
+                    "height": w.get("height"),
+                    "pageCount": w.get("pageCount"),
+                    "createDate": w.get("createDate", ""),
+                    "aiType": w.get("aiType"),
+                })
+            if len(works) < 48:
+                break
+            offset += len(works)
+            time.sleep(0.3)
+        except Exception as e:
+            _log("fetch", f"[方案A] 抓取失败: {_err_type(e)} {e}")
+            return all_items, page_url, f"FETCH_ERR:{_err_type(e)}"
+    
+    return all_items, page_url, "OK"
 
-    if not all_items:
-        _log("main", "未抓取到任何收藏")
-        print("未抓取到收藏。请确认已登录后重试。")
+def main():
+    _log("main", f"=== 开始导入 (PORT={PORT}) ===")
+    
+    # ── 多来源 uid 检测 ──
+    uid = ""
+    settings = _load_settings()
+    
+    # 1. 环境变量
+    uid = os.environ.get("PIXIV_UID", "")
+    
+    # 2. 配置文件
+    if not uid:
+        uid = settings.get("pixiv_uid", "")
+        if uid:
+            _log("main", f"从配置文件读取 uid={uid}")
+    
+    # 3. CDP page URL
+    pages = cdp_targets()
+    ws_url_for_b = None
+    if pages:
+        page = next((p for p in pages if p.get("type") == "page"), None)
+        if page:
+            page_url = page.get("url", "")
+            m = re.search(r".*/users/(\d+).*", page_url)
+            if m:
+                uid = m.group(1)
+                _log("main", f"从 CDP page URL 提取 uid={uid}")
+            ws_url_for_b = page["webSocketDebuggerUrl"]
+    
+    # 4. 工具自带 edge_profile
+    if not uid:
+        uid = _detect_uid_from_edge()
+        if uid:
+            _log("main", f"从工具 edge_profile 检测到 uid={uid}")
+    
+    # 5. 用户默认 Edge profile
+    if not uid:
+        user_profile = _get_user_default_edge_profile()
+        if user_profile:
+            uid = _detect_uid_from_edge(user_profile)
+            if uid:
+                _log("main", f"从用户默认 Edge profile 检测到 uid={uid}")
+    
+    if not uid:
+        _log("main", "无法自动检测 uid。请设置环境变量 PIXIV_UID=你的用户ID")
+        print("请在设置中填写你的 Pixiv 用户ID，或确保 Edge 已打开收藏页")
         return 1
-
-    # P2-15: 文件 I/O 日志
+    
+    # 记住 uid
+    if not settings.get("pixiv_uid"):
+        settings["pixiv_uid"] = uid
+        _save_settings(settings)
+    
+    _log("main", f"目标 uid={uid}")
+    all_items = []
+    method_used = ""
+    
+    # ── 尝试方案 A: CDP + urllib ──
+    if pages:
+        _log("main", "[方案A] 尝试 CDP + Python urllib...")
+        items, page_url, status = _fetch_via_cdp(pages)
+        if items:
+            all_items = items
+            method_used = "A:CDP+urllib"
+            _log("main", f"[方案A] 成功: {len(items)} works")
+        elif status == "NO_LOGIN":
+            _log("main", "[方案A] 无登录态, 尝试其他方案...")
+        else:
+            _log("main", f"[方案A] 失败: {status}, 尝试其他方案...")
+    
+    # ── 尝试方案 B: 浏览器内 fetch (需要 CDP) ──
+    if not all_items and ws_url_for_b:
+        _log("main", "[方案B] 尝试 CDP 浏览器内 fetch...")
+        items = _fetch_browser_internal(ws_url_for_b, uid)
+        if items:
+            all_items = items
+            method_used = "B:browser-fetch"
+            _log("main", f"[方案B] 成功: {len(items)} works")
+        else:
+            _log("main", "[方案B] 失败, 尝试下一方案...")
+    
+    # ── 尝试方案 C: 启动新调试 Edge ──
+    if not all_items:
+        _log("main", "[方案C] 尝试启动新的调试 Edge 实例...")
+        if _launch_edge(headless=True):
+            pages = cdp_targets()
+            if pages:
+                items, page_url, status = _fetch_via_cdp(pages)
+                if items:
+                    all_items = items
+                    method_used = "C:new-edge+urllib"
+                    _log("main", f"[方案C] 成功: {len(items)} works")
+                elif status == "NO_LOGIN":
+                    _log("main", "[方案C] 新实例无登录态, 尝试有头模式...")
+                    # 杀掉无头，启动有头
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Get-CimInstance Win32_Process -Filter \"CommandLine like '%edge_profile%'\" | Stop-Process -Force"],
+                        capture_output=True, timeout=10)
+                    time.sleep(2)
+                    if _launch_edge(headless=False):
+                        print("请在弹出的 Pixiv 页面登录后重试")
+                        return 1
+    
+    # ── 全部失败 ──
+    if not all_items:
+        _log("main", "所有方案均失败")
+        print("导入失败。请检查:")
+        print("  1. 网络连接是否正常")
+        print("  2. 已在 Edge 中登录 Pixiv")
+        print("  3. 收藏是否设置为公开")
+        return 1
+    
+    # 写入文件
     _json_data = json.dumps(all_items, ensure_ascii=False, indent=1)
-    _log("io", f"写入 {len(_json_data)} bytes 到 {DATA}")
     with open(DATA, "w", encoding="utf-8") as f:
         f.write(_json_data)
-    _written = os.path.getsize(DATA)
-    _log("io", f"写入完成: {_written} bytes")
-
-    # P1-12: 各阶段耗时占比
-    _total = time.time() - _t_start
-    _log("profile", f"总耗时 {_total:.1f}s | 阶段7(抓取)={time.time()-_t_stage7:.1f}s")
-    # P1-10: 重试统计
-    _log("stat", f"pages_fetched={_stat['pages_fetched']} pages_failed={_stat['pages_failed']} retries={_stat['retry_count']} backoff={_stat['total_backoff']:.0f}s")
-
-    _log("main", f"=== 完成: 导出 {len(all_items)} 幅收藏到 {DATA} (耗时 {_total:.1f}s) ===")
-    print(f"[OK] 已导出 {len(all_items)} 幅收藏到 data/bookmarks.json")
-    print("  缩略图在下次搜索时会按需下载。")
+    
+    _log("main", f"=== 完成: 导出 {len(all_items)} 幅收藏 (方案: {method_used}) ===")
+    print(f"[OK] 已导出 {len(all_items)} 幅收藏到 data/bookmarks.json (方案: {method_used})")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
