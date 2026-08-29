@@ -176,11 +176,29 @@ def _fetch_via_load_resource(pages, uid):
                 break
         return json.loads(body), 200
     
-    # 先尝试私密收藏 (rest=hide)
+    # 先检测是否有私密收藏 (用官方 tags API)
     all_items = []
     has_private = False
     
-    for rest, label in (("hide", "PRIVATE"), ("show", "PUBLIC")):
+    try:
+        tags_url = f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmark/tags?lang=zh"
+        tags_d, _ = ajax(tags_url)
+        if tags_d and not tags_d.get("error"):
+            private_tags = (tags_d.get("body") or {}).get("private") or []
+            public_tags = (tags_d.get("body") or {}).get("public") or []
+            _log("main", f"[方案A] 收藏统计: 公开标签 {len(public_tags)} 个, 私密标签 {len(private_tags)} 个")
+            if private_tags:
+                has_private = True
+    except Exception as e:
+        _log("main", f"[方案A] 私密标签检测失败: {_err_type(e)} {e}, 将尝试抓取私密收藏")
+
+    # 根据检测结果决定抓取顺序
+    if has_private:
+        rest_order = (("hide", "PRIVATE"), ("show", "PUBLIC"))
+    else:
+        rest_order = (("show", "PUBLIC"),)
+    
+    for rest, label in rest_order:
         offset = 0
         page_num = 0
         while True:
@@ -211,8 +229,6 @@ def _fetch_via_load_resource(pages, uid):
                         "aiType": w.get("aiType"),
                     })
                 _log("fetch", f"[方案A/{label}] 第{page_num}页: {len(works)} works (累计 {len(all_items)})")
-                if rest == "hide" and works:
-                    has_private = True
                 if len(works) < 48:
                     break
                 offset += len(works)
