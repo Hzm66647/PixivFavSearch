@@ -47,30 +47,42 @@ _EDGE_PATHS = [
 _EDGE_PROFILE = os.path.join(APP_DATA, "edge_profile")  # 独立配置, 不干扰日常浏览器
 
 
-def ensure_cdp_browser():
-    """确保有调试浏览器可用。已连上返回 True; 否则自动拉起一个带调试端口的 Edge。"""
-    if cdp_targets():
-        return True
+def _launch_edge(headless=True):
+    """拉起调试版 Edge。headless=True 时不弹窗(后台跑 CDP);
+    headless=False 时显示窗口(供首次登录 Pixiv 用)。"""
     edge = next((p for p in _EDGE_PATHS if os.path.exists(p)), None)
     if not edge:
         print("未找到 Edge 浏览器, 无法自动启动调试实例。")
         return False
     os.makedirs(_EDGE_PROFILE, exist_ok=True)
-    print(f"自动启动调试版 Edge (profile: {_EDGE_PROFILE}) ...", flush=True)
-    subprocess.Popen([
+    mode = "无头" if headless else "有头(登录用)"
+    print(f"自动启动调试版 Edge [{mode}] (profile: {_EDGE_PROFILE}) ...", flush=True)
+    args = [
         edge,
         f"--remote-debugging-port={PORT}",
         "--remote-allow-origins=*",
         f"--user-data-dir={_EDGE_PROFILE}",
         "--no-first-run",
         "--no-default-browser-check",
-        PIXIV,  # 直接打开收藏页
-    ], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    ]
+    if headless:
+        args[3:3] = ["--headless=new", "--disable-gpu"]  # 无头: 不弹窗
+    args.append(PIXIV)  # 直接打开收藏页
+    subprocess.Popen(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     # 等待 CDP 就绪(最多 20s)
     for _ in range(20):
         time.sleep(1)
         if cdp_targets():
             return True
+    return False
+
+
+def ensure_cdp_browser():
+    """确保有调试浏览器可用。已连上返回 True; 否则自动拉起一个带调试端口的 Edge。"""
+    if cdp_targets():
+        return True
+    if _launch_edge(headless=True):
+        return True
     print("调试 Edge 启动超时。")
     return False
 
@@ -147,7 +159,45 @@ def main():
     cookies = get_cookies()
     phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
     if not phpsessid:
-        print("未检测到登录态，请在弹出的 Pixiv 页面登录后重试", flush=True)
+        print("未检测到登录态，无头模式下无法看到登录页，切换可见模式...", flush=True)
+        # 1. 关掉当前无头连接
+        try:
+            ws.close()
+        except Exception:
+            pass
+        # 2. 精确杀掉当前无头调试 Edge(只杀带 edge_profile 的, 不碰用户日常 Edge)
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -Filter \"CommandLine like '%edge_profile%'\" | Stop-Process -Force"],
+            capture_output=True, timeout=10)
+        time.sleep(2)
+        # 3. 用有头模式重启(弹出窗口, 用户可登录)
+        if not _launch_edge(headless=False):
+            print("无法启动可见模式调试 Edge, 请确保已安装 Edge。")
+            return 1
+        # 4. 重新连接 CDP
+        pages = cdp_targets()
+        if not pages:
+            print("可见模式 Edge 启动后 CDP 连接失败。")
+            return 1
+        page = next((p for p in pages if p.get("type") == "page"), None)
+        if page:
+            ws_url = page["webSocketDebuggerUrl"]
+        else:
+            try:
+                with _LOCAL_OPENER.open(
+                    f"http://127.0.0.1:{PORT}/json/new?{urllib.parse.quote(PIXIV)}", timeout=5
+                ) as r:
+                    page = json.loads(r.read())
+                ws_url = page["webSocketDebuggerUrl"]
+            except Exception as e:
+                print(f"新建标签页失败: {e}")
+                return 1
+        ws = create_connection(ws_url, timeout=30)
+        _id = 0
+        cookies = get_cookies()
+        phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
+        print("请在弹出的 Pixiv 页面登录后重试", flush=True)
         waited = 0
         while waited < 120:
             time.sleep(3)
