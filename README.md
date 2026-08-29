@@ -2,7 +2,7 @@
 
 > 本地运行、一键启动的 Pixiv 收藏搜索工具 🔍
 
-双击一个 `.bat` 文件，自动下载绿色 Python，自动装好依赖，浏览器自动打开——**开箱即用**。
+下载一个 exe，双击即用——桌面窗口打开，无需浏览器、无需安装 Python、无需配代理。**开箱即用**。
 
 ---
 
@@ -22,46 +22,48 @@
 
 ## 快速开始 🚀
 
-> **仅限 Windows**，其他系统暂不支持
+> **仅限 Windows 10/11**（需 WebView2 运行时，Win11 已内置），其他系统暂不支持
 
-1. 下载 [最新版 PixivFavSearch](https://github.com/Hzm66647/PixivFavSearch/releases) 的 zip 包，解压
-2. 双击 **`启动.bat`**
-3. 等待命令行窗口自动下载 Python、安装依赖
-4. 浏览器自动打开 `http://127.0.0.1:8897`，开始使用！
+1. 下载 [最新版 PixivFavSearch](https://github.com/Hzm66647/PixivFavSearch/releases) 的 **PixivFavSearch.exe**
+2. **双击 exe**，等待 10-15 秒（首次解压运行时资源）
+3. 桌面窗口自动弹出，开始使用！
 
-> ⚠️ 首次启动会下载约 30MB 的便携 Python + 安装依赖，**需要联网，耗时约 1-3 分钟**。之后启动秒开。
+> ⚠️ 点窗口右上角的 **× 只是把窗口收进系统托盘**（右下角图标区），不会退出程序。要彻底退出，右键托盘图标选「退出」。
+>
+> 🎨 启动后若显示「效果预览」横幅，说明还没导入你自己的收藏，正在用内置示例数据。导入后即可搜你自己的收藏。
 
 ---
 
-## 导出你的收藏 📥
+## 导入你的收藏 📥
 
 如果你有自己的 Pixiv 收藏想导入：
 
-1. 双击 **`导出收藏.bat`**
-2. 浏览器会自动弹出 Pixiv 登录页面
+1. 打开软件，点击界面上的 **「📥 导入/更新收藏」** 按钮
+2. 浏览器（或内置窗口）自动弹出 Pixiv 登录页
 3. 登录你的 Pixiv 账号
-4. 脚本自动抓取你的收藏，保存到 `data/` 目录
-5. 之后启动服务，搜索的就是你自己的收藏了
+4. 程序自动抓取你的收藏并保存
+5. 之后搜索的就是你自己的收藏了
 
-> 🔒 **你的 Cookie 不会保存到硬盘上**，登录态只在本次会话中使用，用完即弃。
+> 🔒 **你的 Cookie 不会保存到硬盘上**，登录态只在本次抓取会话中于内存使用，用完即弃。
+
+> 💡 也可双击 `导出收藏.bat`（源码版/zip 包内）走同样流程。
 
 ---
 
 ## 数据说明 📁
 
+桌面版的数据不再放在程序目录，而是统一存到 **用户数据目录**：
+
 ```
-PixivFavSearch/
-├── data/
-│   ├── demo_data.json    ← 示例数据（自带，可删除）
-│   ├── 你的收藏.json     ← 你自己的收藏（导出后生成）
-│   └── thumbs/           ← 缩略图缓存
-├── 启动.bat              ← 一键启动
-├── 导出收藏.bat          ← 一键导出收藏
-└── pix_search_server.py  ← 搜索服务
+%LOCALAPPDATA%\PixivFavSearch\
+├── data\
+│   ├── bookmarks.json    ← 你的收藏（导入后生成）
+│   └── thumbs\           ← 缩略图缓存
+└── pix_assets\           ← 上传的封面图等
 ```
 
-- 所有数据都在 `data/` 目录下，**删除整个文件夹不会影响程序**
-- 想还原出厂状态？删掉 `data/` 和 `python/` 文件夹，重新双击 `启动.bat` 即可
+- 数据跟随 Windows 用户账号，卸载/覆盖程序不影响收藏
+- 想还原出厂状态？关掉程序，删掉 `%LOCALAPPDATA%\PixivFavSearch` 文件夹即可
 
 ---
 
@@ -69,16 +71,38 @@ PixivFavSearch/
 
 **Pixiv 在国内部分地区可能无法直接访问。**
 
-- `启动.bat` 会自动检测能否连通 Pixiv
-- 如果不通，会提示你手动开启代理（如 v2rayN、Clash 等）
+- 软件启动时自动检测能否连通 Pixiv
+- 如果不通，请先开启你的代理软件（如 v2rayN、Clash）
 - 开启代理后，程序会自动走系统代理
+
+---
+
+## 从源码编译 exe 🔨
+
+想自己动手编译（比如改了代码）：
+
+### 准备
+- Python 3.9+（开发用 3.11）
+- 安装依赖：`pip install pywebview pystray pillow pykakasi jieba PySocks requests websocket-client`
+
+### 编译
+```bat
+python -m PyInstaller PixivFavSearch.spec --noconfirm --clean
+```
+产物在 `dist\PixivFavSearch.exe`。
+
+### 编译要点（踩过的坑）
+- `.spec` 已内置配置：**pykakasi 的字典 `.db` 文件必须手动收集**，否则 exe 启动即崩（MEI 临时目录找不到数据）——spec 里已用 `glob` 自动收集，别删
+- onefile 模式，`console=False`（GUI 应用无黑窗）
+- 程序图标 `icon.ico` 已在 spec 里指定
+- 需要 `freeze_support`：多进程 GUI（主进程 + pywebview 子进程）在 onefile 下必须，`desktop_app.py` 已处理
 
 ---
 
 ## 常见问题 ❓
 
 详见 [FAQ.md](./FAQ.md)，包含：
-- 启动后浏览器没自动打开？
+- 双击 exe 没反应/白屏？
 - 搜索没结果？
 - 缩略图加载不出来？
 - 如何更新到新版本？
@@ -108,18 +132,26 @@ MIT License © 2026 HZm66647
 
 ## Quick Start 🚀
 
-> **Windows only**
+> **Windows 10/11 only** (WebView2 required, preinstalled on Win11)
 
-1. Download the [latest release](https://github.com/Hzm66647/PixivFavSearch/releases) zip and extract
-2. Double-click **`启动.bat`**
-3. Wait for portable Python to download and dependencies to install
-4. Browser opens automatically at `http://127.0.0.1:8897`
+1. Download **PixivFavSearch.exe** from the [latest release](https://github.com/Hzm66647/PixivFavSearch/releases)
+2. Double-click the exe, wait 10-15s on first launch
+3. Desktop window opens — start searching!
 
-> ⚠️ First run downloads ~30MB portable Python + installs deps (1-3 min). Subsequent runs are instant.
+> ⚠️ Clicking **× only hides the window to the system tray** (near the clock). Right-click the tray icon → "Exit" to fully quit.
 
-## Export Your Bookmarks 📥
+## Import Your Bookmarks 📥
 
-Double-click **`导出收藏.bat`** → browser opens Pixiv login → log in → bookmarks are fetched automatically. **Your cookie never touches the disk.**
+Click **"📥 Import / Update"** in the app → login to Pixiv when prompted → bookmarks are fetched automatically. **Your cookie never touches the disk.**
+
+## Build from Source 🔨
+
+```bat
+pip install pywebview pystray pillow pykakasi jieba PySocks requests websocket-client
+python -m PyInstaller PixivFavSearch.spec --noconfirm --clean
+```
+
+Output in `dist\PixivFavSearch.exe`. The `.spec` already handles pykakasi `.db` data files (required or the exe crashes on startup).
 
 ## License 📄
 
