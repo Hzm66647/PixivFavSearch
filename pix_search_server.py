@@ -4,7 +4,7 @@
 缩略图按需下载并缓存到 data/thumbs/
 """
 VERSION = "1.0.0"
-import os, sys, re, json, time, threading, urllib.request, urllib.parse, subprocess, socks as pysocks, socket as pysocket
+import os, sys, re, json, time, threading, urllib.request, urllib.parse, subprocess, socks as pysocks, socket as pysocket, zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ⚠️ 无窗口启动: venv 的 pythonw.exe 实际会转调 uv python.exe(控制台程序),
@@ -57,6 +57,18 @@ import datetime as _dt
 LOG_DIR = os.path.join(APP_DATA, "log")
 os.makedirs(LOG_DIR, exist_ok=True)
 _LOG_LOCK = threading.Lock()
+
+# 搜索缓存 LRU 32条
+_sc_cache = {}
+_sc_order = []
+_SC_MAX = 32
+def _sc_get(q,t,c,m): return _sc_cache.get((q,t,c,m))
+def _sc_set(q,t,c,m,r):
+    k=(q,t,c,m)
+    if k in _sc_cache: _sc_order.remove(k)
+    _sc_order.append(k); _sc_cache[k]=r
+    while len(_sc_order)>_SC_MAX: del _sc_cache[_sc_order.pop(0)]
+def _sc_clear(): _sc_cache.clear(); _sc_order.clear()
 
 def _log_path():
     """返回当前年月对应的日志文件路径。按年-月建文件, 如 2026-08.txt"""
@@ -1659,7 +1671,11 @@ class H(BaseHTTPRequestHandler):
             # 按相关度排序(同分保持收藏顺序稳定)
             scored.sort(key=lambda x: (-x[0], x[2].get("id", "")))
             merged += [_pub(it, hl) for _, _, it, hl in scored]
-            self.send_json(200, {"total": len(merged), "items": merged[:200]})
+            _sc_set(q, tagf, colt, mode, merged)
+            page = max(0, int(urllib.parse.parse_qs(u.query).get("page", ["0"])[0]))
+            ps = 50
+            s, e = page*ps, (page+1)*ps
+            self.send_json(200, {"total": len(merged), "page": page, "page_size": ps, "total_pages": (len(merged)+ps-1)//ps, "items": merged[s:e]})
         elif u.path == "/api/version":
             # 返回当前版本 + 是否有新版本(启动时后台查过 GitHub)
             v = LATEST_VER
@@ -1695,6 +1711,19 @@ class H(BaseHTTPRequestHandler):
                 self.send_json(200, st)
         elif u.path == "/api/import-status":
             self.send_json(200, import_status())
+        elif u.path == "/api/import-stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self._sec_headers()
+            self.end_headers()
+            import time as _t
+            while True:
+                st = import_status()
+                self.wfile.write(f"data: {json.dumps(st)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                if not st.get("running", False): break
+                _t.sleep(1)
         elif u.path.startswith("/thumb/"):
             pid = os.path.basename(u.path).split("?")[0]
             it = next((x for x in BOOKMARKS if str(x["id"])==pid), None)
@@ -2052,6 +2081,10 @@ class H(BaseHTTPRequestHandler):
 
     def send_json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        ae = self.headers.get("Accept-Encoding", "")
+        if len(body) > 1024 and "gzip" in ae:
+            body = zlib.compress(body, 6)
+            self.send_header("Content-Encoding", "gzip")
         self.send_response(code)
         self._sec_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2784,7 +2817,7 @@ async function go(){
  const r=await fetch('/api/search?mode='+MODE+'&q='+encodeURIComponent(q)+'&tag='+encodeURIComponent(tag)+'&coltag='+encodeURIComponent(colt));
  const d=await r.json();
  m.textContent=(LANG==='zh'
- ?(colt?'收藏标签「'+esc(colt)+'」内 · ':'')+(tag?'作品标签「'+esc(tag)+'」内 · ':'')+'共 '+d.total+' 幅作品命中(标题+标签+说明文字)'+(d.total>200?'，显示前200':'')
+ ?(colt?'收藏标签「'+esc(colt)+'」内 · ':'')+(tag?'作品标签「'+esc(tag)+'」内 · ':'')+'共 '+d.total+' 幅作品'+(d.total_pages>1?'，共 '+d.total_pages+' 页':'')
  :(colt?'In coltag "'+esc(colt)+'" · ':'')+(tag?'In tag "'+esc(tag)+'" · ':'')+d.total+' works'+(d.total>200?' · showing first 200':''));
  if(!d.items.length){g.innerHTML='<div class=empty>'+(LANG==='zh'?'没有匹配的作品':'No matching works')+'</div>';return;}
  g.innerHTML=d.items.map(it=>{
