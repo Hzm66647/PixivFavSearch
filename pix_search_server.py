@@ -2724,15 +2724,19 @@ async function go(){
    <div class=tg>🏷 ${LANG==='zh'?'示例标签':'Sample tag'}</div>
   </div>`;
   }
+  const goUrl = it.url || '#';
+  const goText = LANG==='zh' ? '🔗 打开' : '🔗 Open';
+  const pixivArtUrl = `https://www.pixiv.net/artworks/${it.id}`;
+  const finalGoUrl = goUrl.includes('i.pximg.net') ? pixivArtUrl : goUrl;
   return `<div class=card>
-   <a href="https://www.pixiv.net/artworks/${it.id}">
-     <img loading=lazy decoding=async src="/thumb/${it.id}" onerror="this.onerror=null;this.style.visibility='hidden'">
+   <a href="${esc(finalGoUrl)}" target="_blank">
+     <img loading=lazy decoding=async src="/thumb/${it.id}?lang=${LANG}" onerror="this.onerror=null;this.style.visibility='hidden'">
      <div class=tt>${hlText(it.title, it.hl)}</div>
-     <div class=au>${esc(it.userName)}</div>
+     <div class=au>${esc(it.userName || it.author || '')}</div>
    </a>
    <div class=tg>🏷 ${esc(tagsOf(it))}</div>
-   <a class=go href="https://www.pixiv.net/artworks/${it.id}">🔗 ${LANG==='zh'?'打开 Pixiv':'Open Pixiv'}</a>
- </div>`;
+   <a class=go href="${esc(goUrl)}" target="_blank">${goText}</a>
+  </div>`;
  }).join('');
  // 把搜索条件写进 URL(#参数),从外部页面按后退键回来时能自动恢复结果
  history.replaceState(history.state,'','#'+new URLSearchParams({mode:MODE,q:q,tag:tag,colt:colt}).toString());
