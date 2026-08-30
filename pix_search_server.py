@@ -728,8 +728,10 @@ def thumb_for(item, lang="zh"):
         return local
     url = item.get("url", "")
     if not url or "i.pximg.net" not in url:
-        # 不是图片 URL(旧数据可能是页面 URL), 直接跳过下载, 返回 None 让前端显示占位
-        return None
+        # url 缺失或不是图片 URL, 尝试从 pixiv API 获取
+        url = _fetch_thumb_url_from_api(pid)
+        if not url:
+            return None
     # 并发限制: 同时最多 3 个下载, 防止 200 张卡片请求占满服务线程
     with THUMB_SEM:
         # 二次检查(可能在排队期间已下载)
@@ -744,15 +746,54 @@ def thumb_for(item, lang="zh"):
             class NoRedirect(urllib.request.HTTPRedirectHandler):
                 def redirect_request(self, *a, **k):
                     return None
-            op = urllib.request.build_opener(NoRedirect)
-            with op.open(req, timeout=12) as r, open(local, "wb") as f:
+            # 走系统代理 (v2rayN 等)
+            proxies = urllib.request.getproxies()
+            if proxies:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), NoRedirect)
+            else:
+                opener = urllib.request.build_opener(NoRedirect)
+            with opener.open(req, timeout=12) as r, open(local, "wb") as f:
                 data = r.read(5 * 1024 * 1024 + 1)
                 if len(data) > 5 * 1024 * 1024:
                     return None
                 f.write(data)
             return local if os.path.getsize(local) > 500 else None
-        except Exception:
+        except Exception as e:
+            if not hasattr(thumb_for, '_err_logged'):
+                thumb_for._err_logged = set()
+            err_key = type(e).__name__
+            if err_key not in thumb_for._err_logged:
+                thumb_for._err_logged.add(err_key)
+                _log(f"缩略图下载失败: {e} | Thumb download failed: {e}")
             return None
+
+# pixiv API 获取缩略图 URL (缓存)
+_thumb_url_cache = {}
+def _fetch_thumb_url_from_api(pid):
+    """从 pixiv API 获取作品缩略图 URL"""
+    if pid in _thumb_url_cache:
+        return _thumb_url_cache[pid]
+    try:
+        api_url = f"https://www.pixiv.net/ajax/illust/{pid}?lang=zh"
+        req = urllib.request.Request(api_url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
+            "Referer": "https://www.pixiv.net/",
+        })
+        proxies = urllib.request.getproxies()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies)) if proxies else urllib.request.build_opener()
+        with opener.open(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        body = data.get("body", {})
+        url = (body.get("urls", {}).get("thumb") or 
+               body.get("urls", {}).get("small") or 
+               body.get("urls", {}).get("mini") or "")
+        if url and "i.pximg.net" in url:
+            _thumb_url_cache[pid] = url
+            return url
+    except:
+        pass
+    _thumb_url_cache[pid] = None
+    return None
 
 # ========== 局域网访问安全(白名单 + Host校验 + 访问令牌 + 限速) ==========
 # 只放行本机 + 手动添加的设备 IP。其余局域网设备一律 403。
