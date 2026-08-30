@@ -158,23 +158,33 @@ def _fetch_via_load_resource(pages, uid):
         ws.close()
         return None, "NO_FRAME", False
     
-    def ajax(url):
-        """用 loadNetworkResource 读 AJAX 响应"""
-        res = cdp("Network.loadNetworkResource", {
-            "frameId": frame_id,
-            "url": url,
-            "options": {"disableCache": False, "includeCredentials": True}
-        })["resource"]
-        stream = res.get("stream")
-        if not stream:
-            return None, res.get("httpStatusCode")
-        body = ""
-        while True:
-            d = cdp("IO.read", {"handle": stream})
-            body += d.get("data", "")
-            if d.get("eof"):
-                break
-        return json.loads(body), 200
+    def ajax(url, retries=2):
+        """用 loadNetworkResource 读 AJAX 响应, 支持重试"""
+        for attempt in range(retries + 1):
+            try:
+                res = cdp("Network.loadNetworkResource", {
+                    "frameId": frame_id,
+                    "url": url,
+                    "options": {"disableCache": False, "includeCredentials": True}
+                })["resource"]
+                stream = res.get("stream")
+                if not stream:
+                    return None, res.get("httpStatusCode")
+                body = ""
+                while True:
+                    d = cdp("IO.read", {"handle": stream})
+                    body += d.get("data", "")
+                    if d.get("eof"):
+                        break
+                return json.loads(body), 200
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                if "10054" in str(e) or "reset" in str(e).lower():
+                    _log("fetch", f"[方案A] 连接被重置, 重试 {attempt+1}/{retries}...")
+                    if attempt < retries:
+                        time.sleep(2 ** attempt)  # 退避: 1s, 2s
+                        continue
+                raise
+        return None, None
     
     # 先检测是否有私密收藏 (用官方 tags API)
     all_items = []
@@ -232,7 +242,7 @@ def _fetch_via_load_resource(pages, uid):
                 if len(works) < 48:
                     break
                 offset += len(works)
-                time.sleep(0.3)
+                time.sleep(0.5)  # 频率限制: 500ms 间隔
             except Exception as e:
                 _log("fetch", f"[方案A/{label}] 异常: {_err_type(e)} {e}")
                 break
@@ -312,7 +322,7 @@ def _fetch_via_browser_fetch(pages, uid):
                 if len(works) < 48:
                     break
                 offset += len(works)
-                time.sleep(0.3)
+                time.sleep(0.5)  # 频率限制: 500ms 间隔
             except:
                 break
     
@@ -398,7 +408,7 @@ def _fetch_via_cdp_urllib(pages, uid):
                 if len(works) < 48:
                     break
                 offset += len(works)
-                time.sleep(0.3)
+                time.sleep(0.5)  # 频率限制: 500ms 间隔
             except Exception as e:
                 break
     

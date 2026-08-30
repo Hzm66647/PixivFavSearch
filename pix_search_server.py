@@ -1855,7 +1855,6 @@ async function go(){
  if(!top||top.q!==cur.q||top.tag!==cur.tag||top.colt!==cur.colt||top.mode!==cur.mode){
   undoStack.push(cur);if(undoStack.length>50)undoStack.shift();
   markHistory(); // 多压一个历史项,让 Alt+←/鼠标后退 能先触发 popstate 事件
- }
  g.innerHTML='<div class=empty>搜索中…</div>';
  const r=await fetch('/api/search?mode='+MODE+'&q='+encodeURIComponent(q)+'&tag='+encodeURIComponent(tag)+'&coltag='+encodeURIComponent(colt));
  const d=await r.json();
