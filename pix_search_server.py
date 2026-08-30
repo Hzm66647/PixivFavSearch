@@ -279,12 +279,29 @@ def _build_plugin_index(items):
         it.setdefault("_title_py", _pinyin(title).lower())
 
 def _load_plugin(plugin):
-    """加载单个插件的数据"""
+    """加载单个插件的数据。返回 {"ok": True, "count": N} 或 {"error": "..."}"""
     pid = plugin["id"]
     mapping = plugin.get("mapping", {})
     config = plugin.get("config", {})
+    search_type = plugin.get("search_type", "local")  # "local" 或 "api"
     
     try:
+        # API 搜索模式: 不预加载数据,只验证 API 连通性
+        if search_type == "api":
+            api_url = config.get("api_url", "").strip()
+            if not api_url:
+                return {"error": "未配置 API 地址"}
+            # 测试连通性
+            try:
+                req = urllib.request.Request(api_url, headers={"User-Agent": "PixivFavSearch/1.0"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    # 只读取前 1KB 验证是有效响应
+                    r.read(1024)
+                return {"ok": True, "count": 0}  # API 模式不预加载数据
+            except Exception as e:
+                return {"error": f"API 连接失败: {repr(e)[:150]}"}
+        
+        # 本地数据模式 (默认)
         if plugin["type"] == "custom" and config.get("url"):
             # 自定义URL数据源
             url = config["url"]
@@ -1633,6 +1650,26 @@ class H(BaseHTTPRequestHandler):
             # 搜索词脱敏: 只记长度不记内容(防隐私泄露到日志)
             log_debug(f"搜索: 关键词长度={len(q)}, 标签={tagf or '-'}, 收藏标签={colt or '-'} | Search: q_len={len(q)}, tag={tagf or '-'}, coltag={colt or '-'}")
             load_plugins()  # 插件数据热重载(检测文件变化)
+            
+            # 检查是否是 API 模式的插件
+            plugin = next((p for p in PLUGIN_LIST if p["id"] == mode), None)
+            if plugin and plugin.get("search_type") == "api":
+                # API 搜索模式: 转发请求到远程 API
+                api_url = plugin.get("config", {}).get("api_url", "").strip()
+                if not api_url:
+                    return self.send_json(400, {"error": "插件未配置 API 地址"})
+                try:
+                    # 构建远程 API 请求 URL
+                    params = urllib.parse.urlencode({"q": q, "tag": tagf, "colt": colt})
+                    remote_url = f"{api_url}?{params}"
+                    req = urllib.request.Request(remote_url, headers={"User-Agent": "PixivFavSearch/1.0"})
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        remote_data = json.loads(r.read().decode("utf-8", "ignore"))
+                    # 直接返回远程 API 的响应
+                    return self.send_json(200, remote_data)
+                except Exception as e:
+                    return self.send_json(500, {"error": f"远程 API 调用失败: {repr(e)[:150]}"})
+            
             q_rom = romanize(q).lower()
             q_norm = _norm_cjk(q).lower()
             q_py = _pinyin(q).lower()
@@ -1931,6 +1968,8 @@ class H(BaseHTTPRequestHandler):
                 url = data.get("url", "").strip()
                 mapping = data.get("mapping", {})
                 icon = data.get("icon", "🔗")
+                search_type = data.get("search_type", "local")  # "local" 或 "api"
+                api_url = data.get("api_url", "").strip()
                 
                 if not name or not url:
                     return self.send_json(400, {"error": "缺少名称或URL | Missing name or url"})
@@ -1946,7 +1985,12 @@ class H(BaseHTTPRequestHandler):
                     "icon": icon,
                     "config": {"url": url},
                     "mapping": mapping,
+                    "search_type": search_type,
                 }
+                
+                # API 模式: 保存 api_url 到 config
+                if search_type == "api" and api_url:
+                    new_plugin["config"]["api_url"] = api_url
                 
                 PLUGIN_LIST.append(new_plugin)
                 save_plugin_config(PLUGIN_LIST)
@@ -2273,6 +2317,16 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
 .wizard-step-sub{font-size:13px;color:var(--sub);margin-bottom:16px}
 .wizard-url-input{width:100%;padding:12px 16px;border-radius:12px;border:1px solid var(--field-border);background:var(--field-bg);color:var(--text);font-size:14px;box-sizing:border-box;font-family:Consolas,monospace}
 .wizard-url-input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 30%,transparent)}
+.wizard-access-modes{display:flex;gap:12px;margin-bottom:16px}
+.wizard-access-mode{flex:1;position:relative;cursor:pointer}
+.wizard-access-mode input[type="radio"]{position:absolute;opacity:0;pointer-events:none}
+.wizard-access-mode-card{padding:16px;border-radius:14px;border:2px solid var(--field-border);background:var(--field-bg);transition:all .2s;text-align:center}
+.wizard-access-mode-card:hover{border-color:var(--accent);transform:translateY(-2px)}
+.wizard-access-mode input[type="radio"]:checked + .wizard-access-mode-card{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,transparent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 30%,transparent)}
+.wizard-access-mode-icon{font-size:32px;margin-bottom:8px}
+.wizard-access-mode-name{font-size:14px;font-weight:700;margin-bottom:4px}
+.wizard-access-mode-desc{font-size:12px;color:var(--sub);line-height:1.5}
+.wizard-url-section{margin-top:8px}
 .wizard-error{margin-top:12px;padding:12px 16px;border-radius:12px;background:rgba(255,69,58,.1);border:1px solid rgba(255,69,58,.3);color:#FF453A;font-size:13px;display:none}
 .wizard-error.show{display:block}
 .wizard-error-title{font-weight:700;margin-bottom:4px}
@@ -3115,7 +3169,7 @@ async function loadPluginsList(){
 // ===== 添加数据源向导 =====
 function startAddPlugin(){
   closeSettings();
-  WIZARD_STATE = {step: 1, url: '', detected: null, mapping: {}, name: '', preview: [], error: null};
+  WIZARD_STATE = {step: 1, url: '', detected: null, mapping: {}, name: '', preview: [], error: null, search_type: 'local'};
   openWizard();
   renderWizardStep();
 }
@@ -3133,12 +3187,40 @@ function renderWizardStep(){
   const state = WIZARD_STATE;
   
   if(state.step === 1){
-    title.textContent = LANG==='zh' ? '第1步: 粘贴数据链接' : 'Step 1: Paste Data URL';
+    title.textContent = LANG==='zh' ? '第1步: 选择接入方式' : 'Step 1: Choose Access Mode';
     body.innerHTML = `
       <div class="wizard-step active">
-        <div class="wizard-step-title">${LANG==='zh' ? '📎 粘贴你的数据链接' : '📎 Paste Your Data URL'}</div>
-        <div class="wizard-step-sub">${LANG==='zh' ? '把你的收藏文件链接粘贴到下面' : 'Paste the link to your collection file below'}</div>
-        <input class="wizard-url-input" id="wizard-url" placeholder="${LANG==='zh' ? 'https://example.com/my_collection.json' : 'https://example.com/my_collection.json'}" value="${esc(state.url)}">
+        <div class="wizard-step-title">${LANG==='zh' ? '🔌 你想怎么接入这个数据源?' : '🔌 How do you want to access this data?'}</div>
+        <div class="wizard-step-sub">${LANG==='zh' ? '选择一种方式.推荐: 本地数据模式(最稳定)' : 'Choose a mode. Recommended: Local data (most stable)'}</div>
+        <div class="wizard-access-modes">
+          <label class="wizard-access-mode">
+            <input type="radio" name="search_type" value="local" ${state.search_type !== 'api' ? 'checked' : ''} onchange="WIZARD_STATE.search_type='local';renderWizardStep();">
+            <div class="wizard-access-mode-card">
+              <div class="wizard-access-mode-icon">📁</div>
+              <div class="wizard-access-mode-name">${LANG==='zh' ? '本地数据模式' : 'Local Data Mode'}</div>
+              <div class="wizard-access-mode-desc">${LANG==='zh' ? '下载JSON到本地,搜索时本地查找<br>✅ 速度快,断网也能用' : 'Download JSON locally, search offline<br>✅ Fast, works offline'}</div>
+            </div>
+          </label>
+          <label class="wizard-access-mode">
+            <input type="radio" name="search_type" value="api" ${state.search_type === 'api' ? 'checked' : ''} onchange="WIZARD_STATE.search_type='api';renderWizardStep();">
+            <div class="wizard-access-mode-card">
+              <div class="wizard-access-mode-icon">🌐</div>
+              <div class="wizard-access-mode-name">${LANG==='zh' ? 'API 搜索模式' : 'API Search Mode'}</div>
+              <div class="wizard-access-mode-desc">${LANG==='zh' ? '把搜索请求发给远程API,返回结果<br>⚡ 需要远程服务在线,可能有延迟' : 'Forward search to remote API<br>⚡ Remote service must be online'}</div>
+            </div>
+          </label>
+        </div>
+        ${state.search_type === 'api' ? `
+          <div class="wizard-url-section">
+            <div class="wizard-step-sub" style="margin-top:16px">${LANG==='zh' ? '请输入API地址(搜索请求会发给这个地址):' : 'API endpoint (search requests will be sent here):'}</div>
+            <input class="wizard-url-input" id="wizard-url" placeholder="${LANG==='zh' ? 'https://example.com/api/search' : 'https://example.com/api/search'}" value="${esc(state.url)}">
+          </div>
+        ` : `
+          <div class="wizard-url-section">
+            <div class="wizard-step-sub" style="margin-top:16px">${LANG==='zh' ? '请输入JSON数据文件的下载链接:' : 'Download link for JSON data file:'}</div>
+            <input class="wizard-url-input" id="wizard-url" placeholder="${LANG==='zh' ? 'https://example.com/my_collection.json' : 'https://example.com/my_collection.json'}" value="${esc(state.url)}">
+          </div>
+        `}
         <div class="wizard-error" id="wizard-error">
           <div class="wizard-error-title">${LANG==='zh' ? '❌ 添加失败' : '❌ Failed'}</div>
           <div class="wizard-error-msg" id="wizard-error-msg"></div>
@@ -3244,6 +3326,29 @@ function wizardStep1Next(){
     return;
   }
   
+  // API 模式: 跳过 JSON 检测, 直接验证 API 连通性
+  if(WIZARD_STATE.search_type === 'api'){
+    const body = document.getElementById('wizard-body');
+    body.innerHTML = `<div class="wizard-loading">
+      <div class="wizard-loading-spinner"></div>
+      <div class="wizard-loading-text">${LANG==='zh' ? '正在测试 API 连通性...' : 'Testing API connectivity...'}</div>
+    </div>`;
+    
+    // 简单测试: 发一个空搜索请求看是否能连通
+    fetch(url + '?q=')
+      .then(r => r.json())
+      .then(d => {
+        WIZARD_STATE.url = url;
+        WIZARD_STATE.step = 3;  // 直接跳到完成步骤
+        renderWizardStep();
+      })
+      .catch(e => {
+        showWizardError((LANG==='zh' ? 'API 连接失败: ' : 'API connection failed: ') + e.message);
+      });
+    return;
+  }
+  
+  // 本地数据模式: 检测 JSON 结构
   // 显示加载状态
   const body = document.getElementById('wizard-body');
   body.innerHTML = `<div class="wizard-loading">
@@ -3323,12 +3428,21 @@ function wizardStep2Confirm(){
     <div class="wizard-loading-text">${LANG==='zh' ? '正在保存...' : 'Saving...'}</div>
   </div>`;
   
-  const name = WIZARD_STATE.name || WIZARD_STATE.url.split('/').pop().replace(/\\.json$/i, '') || 'Custom';
+  const name = WIZARD_STATE.name || WIZARD_STATE.url.split('/').pop().replace(/\\\.json$/i, '') || 'Custom';
+  const searchType = WIZARD_STATE.search_type || 'local';
+  
+  const reqBody = {action: 'add', name, mapping, icon: '🔗', search_type: searchType};
+  if (searchType === 'api') {
+    reqBody.url = WIZARD_STATE.url;
+    reqBody.api_url = WIZARD_STATE.url;
+  } else {
+    reqBody.url = WIZARD_STATE.url;
+  }
   
   fetch('/api/plugins/save', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'add', name, url: WIZARD_STATE.url, mapping, icon: '🔗'})
+    body: JSON.stringify(reqBody)
   }).then(r => r.json()).then(d => {
     if(d.ok){
       PLUGINS.push(d.plugin);
