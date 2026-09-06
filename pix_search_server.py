@@ -1478,6 +1478,7 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
 </div>
 <div id=meta></div><div id=grid class=grid></div>
 <div id=demo-bar data-l data-zh="🎨 当前为效果预览，导入收藏后即可正常使用" data-en="🎨 Preview mode - import your bookmarks to use" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:60;background:rgba(18,18,32,.78);backdrop-filter:blur(8px);color:#fff;font-size:13px;font-weight:600;padding:10px 20px;border-radius:22px;box-shadow:0 6px 18px rgba(0,0,0,.4);pointer-events:none;white-space:nowrap;max-width:92vw;text-align:center">🎨 当前为效果预览，导入收藏后即可正常使用</div>
+<div id=import-tip style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:59;background:rgba(40,40,80,.85);backdrop-filter:blur(8px);color:#fff;font-size:12px;padding:8px 16px;border-radius:18px;box-shadow:0 4px 12px rgba(0,0,0,.3);pointer-events:none;white-space:nowrap;max-width:92vw;text-align:center" data-l data-zh="💡 首次导入需在 WebView2 中登录一次 Pixiv，之后自动保存登录态" data-en="💡 First import requires logging into Pixiv in WebView2, login persists afterwards">💡 首次导入需在 WebView2 中登录一次 Pixiv，之后自动保存登录态</div>
 <button id=home-btn title="回到本站主页" data-l-t data-zh-t="回到本站主页" data-en-t="Back to homepage" onclick="location.href='/'"><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 10.5L12 3l9 7.5'/><path d='M5 9.5V21h14V9.5'/></svg><span class=ttip data-l data-zh="🏠 回到本站" data-en="🏠 Home">🏠 回到本站</span></button>
 <script>
  // --- 顶部按钮栏 ---
@@ -1701,11 +1702,19 @@ function hlText(s, words){
   (async()=>{await loadTags();})()
  ]);
  const _db=document.getElementById('demo-bar');
+ const _it=document.getElementById('import-tip');
  if(DATASRC==='demo'){
-  if(_db)_db.style.display='block'; // 底部固定提示条: 仅 demo 模式显示
-  if(!location.hash){ go(); } // 自动搜一次, 展示全部示例
+  if(_db)_db.style.display='block';
+  if(_it)_it.style.display='block'; // 显示首次导入提示
+  if(!location.hash){ go(); }
  }else if(_db){
-  _db.style.display='none'; // user/no-data 模式隐藏
+  _db.style.display='none';
+  // user/no-data 模式也显示导入提示 (仅首次)
+  if(_it && !localStorage.getItem('pfs_imported')){
+   _it.style.display='block';
+   // 5秒后淡出
+   setTimeout(()=>{ if(_it)_it.style.display='none'; }, 8000);
+  }
  }
 })();
  // 同步两个下拉的显示文本(undo/重放设置 select.value 后调用)
@@ -1895,7 +1904,7 @@ async function doImport(){
     hint.style.color=s.code===0?'#34C759':'#FF453A';
     hint.textContent=s.msg||(LANG==='zh'?'导入完成':'Done');
     btn.classList.remove('loading');btn.textContent=(LANG==='zh'?'📥 导入/更新收藏':'📥 Import / Update');
-    if(s.code===0){ await go(); } // 刷新搜索结果(数据已热重载)
+    if(s.code===0){ localStorage.setItem('pfs_imported','1'); await go(); } // 刷新搜索结果 + 标记已导入
     setTimeout(()=>{hint.style.color='';},6000);
     return;
    }
@@ -1968,7 +1977,7 @@ def stop_server():
 if __name__ == "__main__":
     # 命令行直接运行: 前台绑定 0.0.0.0 供局域网访问, 阻塞等待
     srv = start_server(host="0.0.0.0", daemon=False)
-    print(f"✅ 已启动: 浏览器打开 http://127.0.0.1:{PORT}/  (局域网白名单模式, 仅放行 {sorted(ALLOWED_IPS)})")
+    print(f"[OK] Started: http://127.0.0.1:{PORT}/ (whitelist={sorted(ALLOWED_IPS)})")
     try:
         while srv._serving_thread.is_alive():
             time.sleep(1)

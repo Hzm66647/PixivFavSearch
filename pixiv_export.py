@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
-"""PixivFavSearch 收藏导出器 (CDP Network.loadNetworkResource, 最优方案)
-
-方案优先级:
-  A. CDP loadNetworkResource (浏览器网络栈, 支持公开+私密, 零代理问题)
-  B. CDP 浏览器内fetch (备选)
-  C. CDP读cookie + Python urllib (兜底)
-"""
-import os, sys, json, re, time, socket, subprocess, urllib.request, urllib.parse, platform
-
-try:
-    import psutil
-    _HAS_PSUTIL = True
-except ImportError:
-    _HAS_PSUTIL = False
+"""PixivFavSearch 导出器 - WebView2 cookies + urllib with system proxy"""
+import os, sys, json, re, time, socket, urllib.request
 
 APP_DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PixivFavSearch")
 OUT = os.path.join(APP_DATA, "data")
@@ -21,242 +9,69 @@ SETTINGS = os.path.join(OUT, "settings.json")
 os.makedirs(OUT, exist_ok=True)
 
 PORT = int(os.environ.get("CDP_PORT", "9222"))
-PIXIV = "https://www.pixiv.net/bookmark.php?rest=show"
-
-_DEBUG = os.environ.get("PIXIV_DEBUG", "0") == "1"
-
-_stat = {"retry_count": 0, "total_backoff": 0.0, "pages_fetched": 0, "pages_failed": 0}
+_WEBVIEW2_PORT = 9223
 
 def _log(tag, msg):
     print(f"[{tag}] {msg}", flush=True)
 
-def _err_type(e):
-    if isinstance(e, socket.timeout) or "timed out" in str(e).lower(): return "TIMEOUT"
-    if isinstance(e, ConnectionRefusedError) or "10061" in str(e): return "REFUSED"
-    if "10054" in str(e) or "reset" in str(e).lower(): return "RESET"
-    if "10051" in str(e) or "unreachable" in str(e).lower(): return "UNREACHABLE"
-    if "10060" in str(e): return "TIMEOUT"
-    if "10065" in str(e): return "HOST_UNREACHABLE"
-    if "remote end closed" in str(e).lower() or "connection aborted" in str(e).lower(): return "PROXY_RESET"
-    if "name resolution" in str(e).lower() or "getaddrinfo" in str(e).lower(): return "DNS_FAIL"
-    if "ssl" in str(e).lower() or "certificate" in str(e).lower(): return "TLS_FAIL"
-    if isinstance(e, urllib.error.HTTPError): return f"HTTP_{e.code}"
-    return f"OTHER:{type(e).__name__}"
-
-_NO_PROXY = urllib.request.ProxyHandler({})
-_LOCAL_OPENER = urllib.request.build_opener(_NO_PROXY)
-
 try:
     from websocket import create_connection
 except ImportError:
-    print("缺少 websocket-client")
+    print("Missing websocket-client")
     sys.exit(1)
 
-def cdp_targets():
+def _get_targets(port):
     try:
-        with _LOCAL_OPENER.open(f"http://127.0.0.1:{PORT}/json", timeout=3) as r:
+        # Use system proxy for CDP connection too
+        proxy_handler = urllib.request.ProxyHandler({
+            'http': 'http://127.0.0.1:10808',
+            'https': 'http://127.0.0.1:10808'
+        })
+        opener = urllib.request.build_opener(proxy_handler)
+        with opener.open(f"http://127.0.0.1:{port}/json", timeout=3) as r:
             return json.loads(r.read())
     except:
-        return None
-
-_EDGE_PATHS = [
-    r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-    r"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
-]
-
-def _launch_edge(profile_dir=None, headless=False):
-    """启动调试 Edge, 可指定 profile 目录复用登录态"""
-    edge = next((p for p in _EDGE_PATHS if os.path.exists(p)), None)
-    if not edge:
-        return False
-    args = [edge, f"--remote-debugging-port={PORT}", "--remote-allow-origins=*",
-            "--no-first-run", "--no-default-browser-check"]
-    if profile_dir:
-        args.append(f"--profile-directory={profile_dir}")
-    else:
-        args.append(f"--user-data-dir={os.path.join(APP_DATA, 'edge_profile')}")
-    args.append(PIXIV)
-    p = subprocess.Popen(args, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    for i in range(30):
-        time.sleep(1)
-        if cdp_targets():
-            return True
-    return False
-
-def _load_settings():
-    if os.path.exists(SETTINGS):
+        # Fallback: direct connection
         try:
-            with open(SETTINGS, "r", encoding="utf-8") as f:
-                return json.load(f)
+            proxy_handler = urllib.request.ProxyHandler({})
+            opener = urllib.request.build_opener(proxy_handler)
+            with opener.open(f"http://127.0.0.1:{port}/json", timeout=3) as r:
+                return json.loads(r.read())
+        except:
+            return None
+
+def _detect_uid_from_cookies(cookies):
+    for c in cookies:
+        if c.get("name") == "yuid_b":
+            m = re.search(r"\d{4,}", c.get("value", ""))
+            if m:
+                return m.group(0)
+    return ""
+
+def _detect_uid():
+    uid = os.environ.get("PIXIV_UID", "")
+    if not uid and os.path.exists(SETTINGS):
+        try:
+            uid = json.load(open(SETTINGS, "r", encoding="utf-8")).get("pixiv_uid", "")
         except:
             pass
-    return {}
+    return uid
 
-def _save_settings(settings):
-    try:
-        with open(SETTINGS, "w", encoding="utf-8") as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
-    except:
-        pass
-
-def _get_user_default_edge_profile():
-    """获取用户默认 Edge profile 目录"""
-    local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
-    user_data = os.path.join(local_appdata, "Microsoft", "Edge", "User Data")
-    if os.path.exists(os.path.join(user_data, "Default")):
-        return "Default"
-    return None
-
-# ══════════════════════════════════════════════════════════════
-# 方案 A: CDP Network.loadNetworkResource (最优)
-# ══════════════════════════════════════════════════════════════
-def _fetch_via_load_resource(pages, uid):
-    """用 CDP Network.loadNetworkResource 走浏览器网络栈, 支持公开+私密"""
-    _log("main", "[方案A] 尝试 CDP Network.loadNetworkResource...")
+def _fetch_via_cdp_cookies(port, uid):
+    """Get cookies from CDP, then fetch with urllib + proxy"""
+    targets = _get_targets(port)
+    if not targets:
+        return None, "NO_TARGETS"
     
-    # 找 pixiv tab 或任意可用 tab
-    target = None
-    for p in pages:
-        if p.get("type") in ("page", "other") and "pixiv" in p.get("url", ""):
-            target = p
-            break
+    target = next((t for t in targets if t.get("type") == "page"), None)
     if not target:
-        for p in pages:
-            if p.get("type") in ("page", "other"):
-                target = p
-                break
+        return None, "NO_PAGE"
     
-    if not target:
-        _log("main", "[方案A] 无可用 tab")
-        return None, "NO_TAB"
+    ws_url = target.get("webSocketDebuggerUrl")
+    if not ws_url:
+        return None, "NO_WS"
     
-    ws_url = target["webSocketDebuggerUrl"]
-    ws = create_connection(ws_url, timeout=60)
-    _id = 0
-    def cdp(method, params=None, timeout=60):
-        nonlocal _id
-        _id += 1
-        ws.send(json.dumps({"id": _id, "method": method, "params": params or {}}))
-        ws.settimeout(timeout)
-        while True:
-            msg = json.loads(ws.recv())
-            if msg.get("id") == _id:
-                return msg.get("result", {})
-    
-    # 导航到 rest=show 页面 (提供 frame 上下文, 不要导航到 rest=hide)
-    cdp("Page.enable")
-    current_url = target.get("url", "")
-    if "rest=show" not in current_url and "rest=hide" not in current_url:
-        _log("main", f"[方案A] 导航到 rest=show 页面...")
-        cdp("Page.navigate", {"url": f"https://www.pixiv.net/users/{uid}/bookmarks/artworks?rest=show"})
-        time.sleep(6)  # SPA 加载
-    
-    # 获取 frameId
-    frame_tree = cdp("Page.getFrameTree")
-    frame_id = frame_tree.get("frameTree", {}).get("frame", {}).get("id")
-    if not frame_id:
-        ws.close()
-        return None, "NO_FRAME", False
-    
-    def ajax(url):
-        """用 loadNetworkResource 读 AJAX 响应"""
-        res = cdp("Network.loadNetworkResource", {
-            "frameId": frame_id,
-            "url": url,
-            "options": {"disableCache": False, "includeCredentials": True}
-        })["resource"]
-        stream = res.get("stream")
-        if not stream:
-            return None, res.get("httpStatusCode")
-        body = ""
-        while True:
-            d = cdp("IO.read", {"handle": stream})
-            body += d.get("data", "")
-            if d.get("eof"):
-                break
-        return json.loads(body), 200
-    
-    # 先检测是否有私密收藏 (用官方 tags API)
-    all_items = []
-    has_private = False
-    
-    try:
-        tags_url = f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmark/tags?lang=zh"
-        tags_d, _ = ajax(tags_url)
-        if tags_d and not tags_d.get("error"):
-            private_tags = (tags_d.get("body") or {}).get("private") or []
-            public_tags = (tags_d.get("body") or {}).get("public") or []
-            _log("main", f"[方案A] 收藏统计: 公开标签 {len(public_tags)} 个, 私密标签 {len(private_tags)} 个")
-            if private_tags:
-                has_private = True
-    except Exception as e:
-        _log("main", f"[方案A] 私密标签检测失败: {_err_type(e)} {e}, 将尝试抓取私密收藏")
-
-    # 根据检测结果决定抓取顺序
-    if has_private:
-        rest_order = (("hide", "PRIVATE"), ("show", "PUBLIC"))
-    else:
-        rest_order = (("show", "PUBLIC"),)
-    
-    for rest, label in rest_order:
-        offset = 0
-        page_num = 0
-        while True:
-            page_num += 1
-            url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
-                   f"?tag=&offset={offset}&limit=48&rest={rest}&order=desc&mode=all&lang=zh")
-            try:
-                d, status = ajax(url)
-                if not d or d.get("error"):
-                    break
-                works = d.get("body", {}).get("works") or []
-                if not works:
-                    break
-                for w in works:
-                    all_items.append({
-                        "id": str(w.get("id")),
-                        "title": w.get("title", ""),
-                        "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
-                                 for t in (w.get("tags") or [])],
-                        "description": w.get("description", ""),
-                        "url": w.get("url", ""),
-                        "userId": str(w.get("userId", "")),
-                        "userName": w.get("userName", ""),
-                        "width": w.get("width"),
-                        "height": w.get("height"),
-                        "pageCount": w.get("pageCount"),
-                        "createDate": w.get("createDate", ""),
-                        "aiType": w.get("aiType"),
-                    })
-                _log("fetch", f"[方案A/{label}] 第{page_num}页: {len(works)} works (累计 {len(all_items)})")
-                if len(works) < 48:
-                    break
-                offset += len(works)
-                time.sleep(0.3)
-            except Exception as e:
-                _log("fetch", f"[方案A/{label}] 异常: {_err_type(e)} {e}")
-                break
-    
-    try:
-        ws.close()
-    except:
-        pass
-    
-    if all_items:
-        return all_items, "OK", has_private
-    return None, "EMPTY", False
-
-# ══════════════════════════════════════════════════════════════
-# 方案 B: CDP 浏览器内 fetch (备选)
-# ══════════════════════════════════════════════════════════════
-def _fetch_via_browser_fetch(pages, uid):
-    """备选: Runtime.evaluate + fetch (可能冻结)"""
-    _log("main", "[方案B] 尝试 CDP 浏览器内 fetch...")
-    target = next((p for p in pages if p.get("type") in ("page", "other")), None)
-    if not target:
-        return None, "NO_TAB"
-    
-    ws = create_connection(target["webSocketDebuggerUrl"], timeout=60)
+    ws = create_connection(ws_url, timeout=120)
     _id = 0
     def cdp(method, params=None, timeout=30):
         nonlocal _id
@@ -268,114 +83,82 @@ def _fetch_via_browser_fetch(pages, uid):
             if msg.get("id") == _id:
                 return msg.get("result", {})
     
-    all_items = []
-    for rest in ("show", "hide"):
-        offset = 0
-        while True:
-            url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
-                   f"?tag=&offset={offset}&limit=48&rest={rest}&order=desc&mode=all&lang=zh")
-            js = f"""
-            (async () => {{
-                try {{
-                    const r = await fetch("{url}", {{credentials: "include"}});
-                    const d = await r.json();
-                    return JSON.stringify(d);
-                }} catch(e) {{
-                    return JSON.stringify({{error: true, err: e.message}});
-                }}
-            }})()
-            """
-            try:
-                res = cdp("Runtime.evaluate", {"expression": js, "awaitPromise": True, "returnByValue": True}, timeout=15)
-                d = json.loads((res.get("result") or {}).get("value", "{}"))
-                if d.get("error"):
-                    break
-                works = (d.get("body") or {}).get("works") or []
-                if not works:
-                    break
-                for w in works:
-                    all_items.append({
-                        "id": str(w.get("id")),
-                        "title": w.get("title", ""),
-                        "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
-                                 for t in (w.get("tags") or [])],
-                        "description": w.get("description", ""),
-                        "url": w.get("url", ""),
-                        "userId": str(w.get("userId", "")),
-                        "userName": w.get("userName", ""),
-                        "width": w.get("width"),
-                        "height": w.get("height"),
-                        "pageCount": w.get("pageCount"),
-                        "createDate": w.get("createDate", ""),
-                        "aiType": w.get("aiType"),
-                    })
-                if len(works) < 48:
-                    break
-                offset += len(works)
-                time.sleep(0.3)
-            except:
-                break
+    # Bypass Service Worker
+    cdp("Network.setBypassServiceWorker", {"bypass": True})
     
-    try:
-        ws.close()
-    except:
-        pass
-    
-    if all_items:
-        return all_items, "OK", False
-    return None, "EMPTY", False
-
-# ══════════════════════════════════════════════════════════════
-# 方案 C: CDP 读 cookie + Python urllib (兜底)
-# ══════════════════════════════════════════════════════════════
-def _fetch_via_cdp_urllib(pages, uid):
-    """兜底: CDP 读 cookie + Python urllib"""
-    _log("main", "[方案C] 尝试 CDP + Python urllib...")
-    target = next((p for p in pages if p.get("type") in ("page", "other")), None)
-    if not target:
-        return None, "NO_TAB"
-    
-    ws = create_connection(target["webSocketDebuggerUrl"], timeout=60)
-    _id = 0
-    def cdp(method, params=None, timeout=60):
-        nonlocal _id
-        _id += 1
-        ws.send(json.dumps({"id": _id, "method": method, "params": params or {}}))
-        ws.settimeout(timeout)
-        while True:
-            msg = json.loads(ws.recv())
-            if msg.get("id") == _id:
-                return msg.get("result", {})
-    
+    # Get cookies
     cdp("Network.enable")
     r = cdp("Network.getCookies", {"urls": ["https://www.pixiv.net"]})
     cookies = r.get("cookies", [])
-    phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
     
+    cookie_uid = _detect_uid_from_cookies(cookies)
+    if cookie_uid:
+        uid = cookie_uid
+    
+    # No login -> navigate to login and wait
+    if not cookies or not any(c["name"] == "PHPSESSID" for c in cookies):
+        _log("main", f"[CDP:{port}] No pixiv cookie, navigating to login...")
+        cdp("Page.navigate", {"url": "https://www.pixiv.net/login.php"})
+        time.sleep(3)
+        
+        _log("main", f"[CDP:{port}] Waiting for login...")
+        start = time.time()
+        while time.time() - start < 180:
+            time.sleep(3)
+            try:
+                res = cdp("Runtime.evaluate", {"expression": "location.href", "returnByValue": True})
+                url = res.get("result", {}).get("result", {}).get("value", "")
+                if "pixiv.net" in url and "login" not in url and "accounts" not in url:
+                    _log("main", f"[CDP:{port}] Login success!")
+                    break
+            except:
+                pass
+        
+        r = cdp("Network.getCookies", {"urls": ["https://www.pixiv.net"]})
+        cookies = r.get("cookies", [])
+        cookie_uid = _detect_uid_from_cookies(cookies)
+        if cookie_uid:
+            uid = cookie_uid
+    
+    if not cookies:
+        ws.close()
+        return None, "NO_COOKIES"
+    
+    phpsessid = next((c["value"] for c in cookies if c["name"] == "PHPSESSID"), None)
     if not phpsessid:
         ws.close()
-        return None, "NO_LOGIN"
+        return None, "NO_PHPSESSID"
     
     cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+    _log("main", f"[CDP:{port}] Got {len(cookies)} cookies, uid={uid}")
     ws.close()
     
+    # urllib with system proxy (v2rayN on 127.0.0.1:10808)
     all_items = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
-        "Referer": "https://www.pixiv.net/",
-        "Cookie": cookie_header,
-        "Accept": "application/json",
-    }
+    proxy_handler = urllib.request.ProxyHandler({
+        'http': 'http://127.0.0.1:10808',
+        'https': 'http://127.0.0.1:10808'
+    })
+    opener = urllib.request.build_opener(proxy_handler)
     
-    for rest in ("show",):
+    for rest in ("show", "hide"):
         offset = 0
         while True:
-            url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
-                   f"?tag=&offset={offset}&limit=48&rest={rest}&order=desc&mode=all&lang=zh")
+            ajax_url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
+                       f"?tag=&offset={offset}&limit=48&rest={rest}&order=desc&mode=all&lang=zh")
+            req = urllib.request.Request(ajax_url, headers={
+                "Cookie": cookie_header,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+                "Referer": "https://www.pixiv.net/",
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json",
+            })
             try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with opener.open(req, timeout=30) as resp:
                     d = json.loads(resp.read())
+                if d.get("error"):
+                    _log("main", f"[urllib/{rest}] API error at offset {offset}")
+                    break
                 works = (d.get("body") or {}).get("works") or []
                 if not works:
                     break
@@ -395,130 +178,80 @@ def _fetch_via_cdp_urllib(pages, uid):
                         "createDate": w.get("createDate", ""),
                         "aiType": w.get("aiType"),
                     })
+                _log("main", f"[urllib/{rest}] +{len(works)} (total {len(all_items)})")
                 if len(works) < 48:
                     break
                 offset += len(works)
                 time.sleep(0.3)
+            except urllib.error.HTTPError as e:
+                if e.code == 403:
+                    _log("main", f"[urllib/{rest}] 403 Forbidden (private bookmarks may need different auth)")
+                else:
+                    _log("main", f"[urllib/{rest}] HTTP {e.code}")
+                break
             except Exception as e:
+                _log("main", f"[urllib/{rest}] error: {e}")
                 break
     
     if all_items:
-        return all_items, "OK", False
-    return None, "EMPTY", False
-
-# ══════════════════════════════════════════════════════════════
-# uid 检测
-# ══════════════════════════════════════════════════════════════
-def _detect_uid(pages):
-    """多来源 uid 检测"""
-    uid = os.environ.get("PIXIV_UID", "")
-    
-    settings = _load_settings()
-    if not uid:
-        uid = settings.get("pixiv_uid", "")
-    
-    if pages:
-        for p in pages:
-            url = p.get("url", "")
-            m = re.search(r".*/users/(\d+).*", url)
-            if m:
-                uid = m.group(1)
-                break
-    
-    if not uid:
-        profile = _get_user_default_edge_profile()
-        if profile:
-            prefs = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "User Data", profile, "Preferences")
-            if os.path.exists(prefs):
-                try:
-                    with open(prefs, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    for c in data.get("cookies", []):
-                        if c.get("name") == "yuid_b":
-                            m = re.search(r"\d{4,}", c.get("value", ""))
-                            if m:
-                                uid = m.group(0)
-                                break
-                except:
-                    pass
-    
-    return uid
+        return all_items, "OK"
+    return None, "EMPTY"
 
 def main():
-    _log("main", f"=== 开始导入 (PORT={PORT}) ===")
+    _log("main", f"=== Import Start ===")
     
-    pages = cdp_targets()
-    uid = _detect_uid(pages or [])
-    
+    uid = _detect_uid()
     if not uid:
-        _log("main", "无法自动检测 uid")
-        print("请在设置中填写 Pixiv 用户ID，或确保 Edge 已打开收藏页")
+        _log("main", "Cannot detect uid")
         return 1
     
     if not os.path.exists(SETTINGS):
-        _save_settings({"pixiv_uid": uid})
+        json.dump({"pixiv_uid": uid}, open(SETTINGS, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     
-    _log("main", f"目标 uid={uid}")
+    _log("main", f"Initial uid={uid}")
     
-    # 如果无 CDP, 尝试启动用户 Edge (复用登录态)
-    if not pages:
-        _log("main", "无 CDP 实例, 尝试启动用户 Edge...")
-        profile = _get_user_default_edge_profile()
-        if profile:
-            _launch_edge(profile_dir=profile)
+    # Try WebView2 first
+    all_items, status = _fetch_via_cdp_cookies(_WEBVIEW2_PORT, uid)
+    if all_items:
+        method = "WebView2"
+    else:
+        _log("main", f"[WebView2] Failed: {status}, trying Edge...")
+        all_items, status = _fetch_via_cdp_cookies(PORT, uid)
+        if all_items:
+            method = "Edge"
         else:
-            _launch_edge()
-        pages = cdp_targets()
+            _log("main", f"[Edge] Failed: {status}")
+            print("Import failed. Please login to pixiv in WebView2 or Edge")
+            return 1
     
-    all_items = []
-    method_used = ""
-    has_private = False
+    # Update uid from data
+    if all_items and all_items[0].get("userId"):
+        correct_uid = all_items[0]["userId"]
+        if correct_uid != uid:
+            _log("main", f"Update uid: {uid} -> {correct_uid}")
+            json.dump({"pixiv_uid": correct_uid}, open(SETTINGS, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     
-    # ── 方案 A: loadNetworkResource ──
-    if pages:
-        items, status, priv = _fetch_via_load_resource(pages, uid)
-        if items:
-            all_items = items
-            has_private = priv
-            method_used = "A:loadNetworkResource"
-        else:
-            _log("main", f"[方案A] 失败: {status}")
+    # Write
+    json.dump(all_items, open(DATA, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     
-    # ── 方案 B: 浏览器内 fetch ──
-    if not all_items and pages:
-        items, status, priv = _fetch_via_browser_fetch(pages, uid)
-        if items:
-            all_items = items
-            has_private = priv
-            method_used = "B:browserFetch"
-        else:
-            _log("main", f"[方案B] 失败: {status}")
+    _log("main", f"=== Done: {len(all_items)} bookmarks ({method}) ===")
+    print(f"[OK] Exported {len(all_items)} bookmarks")
     
-    # ── 方案 C: CDP + urllib ──
-    if not all_items and pages:
-        items, status, priv = _fetch_via_cdp_urllib(pages, uid)
-        if items:
-            all_items = items
-            has_private = priv
-            method_used = "C:cdp+urllib"
-        else:
-            _log("main", f"[方案C] 失败: {status}")
+    # Always navigate WebView2 (9223) back to home page (8897)
+    try:
+        targets = _get_targets(_WEBVIEW2_PORT)
+        if targets:
+            t = next((t for t in targets if t.get("type") == "page"), None)
+            if t:
+                ws2 = create_connection(t["webSocketDebuggerUrl"], timeout=10)
+                ws2.send(json.dumps({"id":999,"method":"Page.navigate","params":{"url":"http://127.0.0.1:8897/"}}))
+                ws2.settimeout(5)
+                ws2.recv()
+                ws2.close()
+                _log("main", "WebView2: navigated back to home page")
+    except:
+        pass
     
-    if not all_items:
-        _log("main", "所有方案均失败")
-        print("导入失败。请检查:")
-        print("  1. 网络连接是否正常")
-        print("  2. 已在 Edge 中登录 Pixiv")
-        return 1
-    
-    # 写入文件
-    _json_data = json.dumps(all_items, ensure_ascii=False, indent=1)
-    with open(DATA, "w", encoding="utf-8") as f:
-        f.write(_json_data)
-    
-    privacy_note = " (含私密收藏)" if has_private else ""
-    _log("main", f"=== 完成: 导出 {len(all_items)} 幅收藏{privacy_note} (方案: {method_used}) ===")
-    print(f"[OK] 已导出 {len(all_items)} 幅收藏{privacy_note} (方案: {method_used})")
     return 0
 
 if __name__ == "__main__":
