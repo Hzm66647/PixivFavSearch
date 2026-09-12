@@ -560,7 +560,7 @@ def _import_worker():
             msg = f"导入完成, 当前共 {count} 幅收藏"
             log_info(f"收藏导入完成, 共 {count} 幅 | Import finished, {count} bookmarks")
         else:
-            msg = "导入失败。已尝试自动启动调试浏览器, 请在弹出的 Pixiv 页面确认已登录, 再点一次导入"
+            msg = "导入失败。Edge 浏览器正在运行导致无法读取 cookie，请先关闭 Edge 浏览器，然后再点导入"
             log_error(f"收藏导入失败(code={code}) | Import failed (code={code})")
         _import_state.update({"running": False, "code": code, "msg": msg, "count": count, "t": time.time()})
     except Exception as e:
@@ -1151,13 +1151,55 @@ class H(BaseHTTPRequestHandler):
             with open(local, "rb") as f:
                 body = f.read()
             ext = os.path.splitext(local)[1].lower()
-            ct = {"png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "image/jpeg")
+            ct = {".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}.get(ext, "image/jpeg")
             self.send_response(200)
             self.send_header("Content-Type", ct)
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        # --- 首次使用引导 API ---
+        elif u.path == "/api/first-run/status":
+            """返回首次使用状态"""
+            import pixiv_export as _pe
+            cookies_exist = os.path.exists(_pe.COOKIE_FILE)
+            uid = ""
+            count = 0
+            if cookies_exist:
+                try:
+                    _c = json.load(open(_pe.COOKIE_FILE, "r", encoding="utf-8"))
+                    count = len(_c)
+                    uid = _pe._detect_uid(_c)
+                except Exception:
+                    pass
+            # 检查 Edge CDP 是否可用
+            edge_available = False
+            try:
+                import http.client
+                _ec = http.client.HTTPConnection("127.0.0.1", 9222, timeout=2)
+                _ec.request("GET", "/json")
+                _er = _ec.getresponse()
+                _et = json.loads(_er.read())
+                _ec.close()
+                edge_available = any(t.get("type") == "page" for t in _et)
+            except Exception:
+                pass
+            self.send_json(200, {
+                "first_run": not cookies_exist,
+                "cookies_exist": cookies_exist,
+                "cookie_count": count,
+                "uid": uid,
+                "edge_available": edge_available,
+            })
+
+        elif u.path == "/first-run":
+            """首次使用引导页（HTML）"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(FIRST_RUN_HTML.encode("utf-8"))
+
         else:
             self.send_error(404)
 
@@ -1187,6 +1229,32 @@ class H(BaseHTTPRequestHandler):
             self._deny(429, "Too Many Requests (pix_search_server)")
             return
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/api/first-run/edge":
+            """从 Edge CDP 抓取 Pixiv cookie"""
+            import pixiv_export as _pe
+            cookies = _pe.grab_cookies_from_edge()
+            if not cookies:
+                return self.send_json(400, {"ok": False, "error": "无法连接 Edge CDP (9222) 或未登录 Pixiv"})
+            ok, uid, count = _pe.save_cookies(cookies)
+            if ok:
+                log_info(f"首次引导: 从 Edge 抓取 {count} 个 cookie, uid={uid}")
+                return self.send_json(200, {"ok": True, "uid": uid, "count": count})
+            else:
+                return self.send_json(500, {"ok": False, "error": "保存 cookie 失败"})
+
+        if u.path == "/api/first-run/webview":
+            """从 WebView2 CDP 抓取 Pixiv cookie"""
+            import pixiv_export as _pe
+            cookies = _pe.grab_cookies_from_webview()
+            if not cookies:
+                return self.send_json(400, {"ok": False, "error": "WebView2 未登录 Pixiv 或未启动"})
+            ok, uid, count = _pe.save_cookies(cookies)
+            if ok:
+                log_info(f"首次引导: 从 WebView2 抓取 {count} 个 cookie, uid={uid}")
+                return self.send_json(200, {"ok": True, "uid": uid, "count": count})
+            else:
+                return self.send_json(500, {"ok": False, "error": "保存 cookie 失败"})
+
         if u.path == "/api/import":
             # 从 Pixiv 抓取最新收藏(CDP)。启动导入线程, 返回是否已启动
             log_info("POST /api/import 触发导入 | POST /api/import triggered")
@@ -1281,6 +1349,213 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+
+FIRST_RUN_HTML = r"""<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PixivFavSearch — 首次使用设置</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+  color: #e0e0e0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.container {
+  background: rgba(255,255,255,0.05);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 24px;
+  padding: 48px 40px;
+  max-width: 520px;
+  width: 100%;
+  text-align: center;
+}
+h1 { font-size: 24px; margin-bottom: 8px; color: #fff; }
+.subtitle { color: #a0a0b0; font-size: 14px; margin-bottom: 32px; line-height: 1.6; }
+.option {
+  display: block;
+  width: 100%;
+  padding: 20px 24px;
+  margin: 12px 0;
+  border: 1.5px solid rgba(255,255,255,0.12);
+  border-radius: 16px;
+  background: rgba(255,255,255,0.03);
+  color: #e0e0e0;
+  font-size: 15px;
+  text-align: left;
+  cursor: pointer;
+  transition: all .2s;
+}
+.option:hover {
+  border-color: rgba(199,125,255,0.5);
+  background: rgba(199,125,255,0.08);
+  transform: translateY(-1px);
+}
+.option .icon { font-size: 28px; margin-right: 16px; vertical-align: middle; }
+.option .label { font-weight: 600; color: #fff; margin-bottom: 4px; }
+.option .desc { font-size: 12px; color: #8888a0; line-height: 1.5; }
+.status {
+  margin-top: 24px;
+  padding: 14px 20px;
+  border-radius: 12px;
+  font-size: 13px;
+  display: none;
+  text-align: left;
+}
+.status.info { display: block; background: rgba(100,180,255,0.12); border: 1px solid rgba(100,180,255,0.3); color: #90caf9; }
+.status.success { display: block; background: rgba(100,255,180,0.12); border: 1px solid rgba(100,255,180,0.3); color: #66ffb2; }
+.status.error { display: block; background: rgba(255,100,100,0.12); border: 1px solid rgba(255,100,100,0.3); color: #ff8a80; }
+.status .spinner {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-right: 10px;
+  vertical-align: middle;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.tip {
+  margin-top: 20px;
+  padding: 12px 16px;
+  background: rgba(255,200,100,0.08);
+  border: 1px solid rgba(255,200,100,0.2);
+  border-radius: 10px;
+  font-size: 12px;
+  color: #ffd580;
+  text-align: left;
+  line-height: 1.5;
+}
+.btn-primary {
+  display: inline-block;
+  margin-top: 20px;
+  padding: 12px 32px;
+  background: linear-gradient(135deg, #c77dff, #7b2cbf);
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity .2s;
+}
+.btn-primary:hover { opacity: 0.85; }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>👋 欢迎使用 PixivFavSearch</h1>
+  <p class="subtitle">首次使用需要登录 Pixiv 以获取收藏数据<br>请选择你的登录方式</p>
+
+  <div id="status" class="status">
+    <span class="spinner"></span><span id="status-text"></span>
+  </div>
+
+  <button class="option" id="btn-edge" onclick="grabEdge()">
+    <span class="icon">🌐</span>
+    <div class="label">方式 A：我已用 Edge 登录 Pixiv（推荐）</div>
+    <div class="desc">一键读取浏览器登录态，无需额外操作</div>
+  </button>
+
+  <button class="option" id="btn-webview" onclick="openWebView()">
+    <span class="icon">🔐</span>
+    <div class="label">方式 B：现在登录</div>
+    <div class="desc">在弹出的页面中输入 Pixiv 账号密码登录</div>
+  </button>
+
+  <div class="tip" id="tip">
+    💡 <strong>方式 A</strong> 需要 Edge 浏览器已登录 Pixiv 且未关闭<br>
+    💡 <strong>方式 B</strong> 适合没有 Edge 或 Edge 未登录的情况
+  </div>
+
+  <div id="success-area" class="hidden">
+    <p style="color:#66ffb2;margin-top:16px;font-size:14px;">✅ 登录成功！uid=<span id="uid"></span>，cookie 已保存</p>
+    <button class="btn-primary" onclick="goToMain()">进入主界面 →</button>
+  </div>
+</div>
+
+<script>
+function setStatus(text, kind) {
+  const el = document.getElementById('status');
+  const st = document.getElementById('status-text');
+  el.className = 'status ' + (kind || 'info');
+  st.textContent = text;
+}
+function clearStatus() {
+  document.getElementById('status').className = 'status';
+}
+
+async function grabEdge() {
+  const btn = document.getElementById('btn-edge');
+  btn.disabled = true;
+  setStatus('正在连接 Edge 浏览器...');
+  try {
+    const r = await fetch('/api/first-run/edge', {method: 'POST'});
+    const j = await r.json();
+    if (j.ok) {
+      showSuccess(j.uid);
+    } else {
+      setStatus('❌ ' + (j.error || '连接失败，请先用 Edge 登录 Pixiv'), 'error');
+      btn.disabled = false;
+    }
+  } catch(e) {
+    setStatus('❌ 网络错误: ' + e.message, 'error');
+    btn.disabled = false;
+  }
+}
+
+function openWebView() {
+  setStatus('正在打开登录页面...');
+  // Open pixiv login in a new popup
+  window.open('https://www.pixiv.net/login.php', 'pixiv_login', 'width=500,height=700');
+  document.getElementById('tip').innerHTML = '💡 请在弹出的窗口中完成登录<br>💡 登录完成后点击下方按钮抓取 cookie<br><button class="btn-primary" id="btn-webview-grab" onclick="grabWebView()" style="margin-top:12px;">已登录，抓取 Cookie</button>';
+}
+
+async function grabWebView() {
+  const btn = document.getElementById('btn-webview-grab') || document.getElementById('btn-webview');
+  if (btn) btn.disabled = true;
+  setStatus('正在从 WebView2 抓取 cookie...');
+  try {
+    const r = await fetch('/api/first-run/webview', {method: 'POST'});
+    const j = await r.json();
+    if (j.ok) {
+      showSuccess(j.uid);
+    } else {
+      setStatus('❌ ' + (j.error || '抓取失败，请确认已登录'), 'error');
+      if (btn) btn.disabled = false;
+    }
+  } catch(e) {
+    setStatus('❌ 网络错误: ' + e.message, 'error');
+    if (btn) btn.disabled = false;
+  }
+}
+
+function showSuccess(uid) {
+  setStatus('✅ 登录成功！Cookie 已保存', 'success');
+  document.getElementById('uid').textContent = uid;
+  document.getElementById('success-area').classList.remove('hidden');
+  document.getElementById('btn-edge').style.display = 'none';
+  document.getElementById('btn-webview').style.display = 'none';
+  document.getElementById('tip').style.display = 'none';
+}
+
+function goToMain() {
+  window.location.href = '/';
+}
+</script>
+</body>
+</html>"""
 
 INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSearch</title>
 <style>

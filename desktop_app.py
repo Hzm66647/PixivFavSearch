@@ -5,8 +5,11 @@
   主进程: 运行 HTTP 服务(thread) + 系统托盘图标(pystray, 主循环)
   子进程: 跑 pywebview GUI 窗口(加载 http://127.0.0.1:PORT/)
   用户关闭窗口 → 子进程退出, 托盘还在, 仅从托盘右键"退出"才真正结束程序
+
+首次使用引导: 启动时检查 cookies.json, 不存在则加载引导页
 """
 import os, sys, multiprocessing, threading
+import atexit
 
 # onefile 打包下, 子进程需要 freeze_support 才能正确 fork
 if __name__ == "__main__":
@@ -16,6 +19,13 @@ if __name__ == "__main__":
 _BASE = os.path.dirname(os.path.abspath(__file__))
 if _BASE not in sys.path:
     sys.path.insert(0, _BASE)
+
+# Single instance check - prevent multiple exe instances
+import ctypes
+_mutex = ctypes.windll.kernel32.CreateMutexW(None, 1, "PixivFavSearch_SingleInstance")
+if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    print("PixivFavSearch is already running!")
+    sys.exit(0)
 
 import webview
 from PIL import Image
@@ -27,17 +37,39 @@ import gui_worker
 
 
 # ----------------------------------------------------------------------
+# 首次使用检测
+# ----------------------------------------------------------------------
+def _cookies_exist():
+    """检查 cookies.json 是否存在"""
+    return os.path.exists(exporter.COOKIE_FILE)
+
+def _is_first_run():
+    """是否为首次使用（无 cookie 文件）"""
+    return not _cookies_exist()
+
+
+# ----------------------------------------------------------------------
 # GUI 子进程: pywebview (独立模块 gui_worker, PyInstaller spawn 兼容)
 # ----------------------------------------------------------------------
 _webview_proc = None
 
 
-def _start_webview():
+def _start_webview(url=None):
+    """启动 WebView2 窗口
+    
+    Args:
+        url: 自定义 URL，不传则根据首次使用状态自动选择
+    """
     global _webview_proc
     if _webview_proc is not None and _webview_proc.is_alive():
         return
     port = server.PORT
-    url = f"http://127.0.0.1:{port}/"
+    if url is None:
+        # 首次使用 → 引导页，否则 → 主界面
+        if _is_first_run():
+            url = f"http://127.0.0.1:{port}/first-run"
+        else:
+            url = f"http://127.0.0.1:{port}/"
     _webview_proc = multiprocessing.Process(target=gui_worker.start, args=(url,), daemon=True)
     _webview_proc.start()
 
