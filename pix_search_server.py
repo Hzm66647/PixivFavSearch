@@ -2087,9 +2087,31 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.06);border-radius:2px}
 ::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.12)}
+
+/* 更新提示条 */
+.update-bar{display:none;position:fixed;top:72px;left:50%;transform:translateX(-50%) translateY(-8px);width:min(560px,92vw);background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 12%,transparent),color-mix(in srgb,var(--accent) 6%,transparent));backdrop-filter:blur(24px);border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);border-radius:16px;padding:12px 16px;z-index:999;align-items:center;gap:12px;opacity:0;transition:all .4s var(--ease-punch)}
+.update-bar.show{display:flex;opacity:1;transform:translateX(-50%) translateY(0)}
+.ub-ico{font-size:20px;flex-shrink:0}
+.ub-txt{flex:1;min-width:0}
+.ub-ver{font-size:13px;font-weight:600;color:var(--txt)}
+.ub-cl{font-size:11px;color:var(--sub);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ub-btn{padding:7px 14px;border-radius:10px;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .25s var(--ease-snap);white-space:nowrap}
+.ub-btn:hover{transform:scale(1.06)}
+.ub-btn:active{transform:scale(.94)}
+.ub-btn.go{background:var(--accent);color:#fff}
+.ub-btn.later{background:rgba(255,255,255,.08);color:var(--txt);border:1px solid var(--glass-bd)}
 </style></head><body>
 
 <div class="safe-dot" id="safe-dot"><span class="dot"></span>安全模式</div>
+<div class="update-bar" id="update-bar">
+ <span class="ub-ico">🎉</span>
+ <div class="ub-txt">
+  <div class="ub-ver" id="ub-ver">v1.1.0 可用</div>
+  <div class="ub-cl" id="ub-cl">发现新版本，点击更新获取最新功能</div>
+ </div>
+ <button class="ub-btn go" onclick="doUpdate()">立即更新</button>
+ <button class="ub-btn later" onclick="dismissUpdate()">稍后</button>
+</div>
 <div class="progress" id="prog"></div>
 
 <!-- 灵动岛 -->
@@ -2379,6 +2401,27 @@ function breathingLoop(){
  if(fxState.breathing&&Date.now()-lastMove>3000){const btn=document.querySelectorAll('.island-btn')[2];if(btn)btn.style.animation='breathe 2s ease-in-out infinite'}
  else{const btn=document.querySelectorAll('.island-btn')[2];if(btn)btn.style.animation=''}
  requestAnimationFrame(breathingLoop)}breathingLoop();
+
+// 更新检查
+function checkForUpdates(){
+ fetch('/api/update/check').then(r=>r.json()).then(d=>{
+  if(d.ok&&d.hasUpdate){
+   document.getElementById('ub-ver').textContent='v'+d.latestVer+' 可用';
+   document.getElementById('ub-cl').textContent=d.changelog.slice(0,80)||'发现新版本，点击更新获取最新功能';
+   document.getElementById('update-bar').classList.add('show');
+  }
+ }).catch(()=>{});
+}
+function dismissUpdate(){document.getElementById('update-bar').classList.remove('show')}
+function doUpdate(){
+ const btn=document.querySelector('.ub-btn.go');
+ const orig=btn.textContent;btn.textContent='下载中...';
+ fetch('/api/update/download',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.json()).then(d=>{
+  if(d.ok){alert('下载完成！\n\n文件保存在：'+d.path+'\n\n请关闭本程序，运行该文件完成更新。');btn.textContent='已下载'}
+  else{btn.textContent=orig;alert('下载失败：'+d.error)}
+ }).catch(e=>{btn.textContent=orig;alert('下载失败：'+e.message)});
+}
+setTimeout(checkForUpdates,1500);
 
 renderWall();renderFavs();renderPresets();updateSliders();
 </script>
