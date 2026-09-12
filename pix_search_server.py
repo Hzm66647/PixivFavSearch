@@ -3,7 +3,67 @@
 输入标题关键词 -> 列出匹配作品(标题/作者/链接/缩略图)
 缩略图按需下载并缓存到 data/thumbs/
 """
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+UPDATE_CHECK_URL = "https://api.github.com/repos/Hzm66647/PixivFavSearch/releases/latest"
+UPDATE_DOWNLOAD_URL = "https://github.com/Hzm66647/PixivFavSearch/releases/latest/download/PixivFavSearch.exe"
+
+# --- 更新检查 ---
+def check_update():
+    """检查是否有新版本"""
+    try:
+        req = urllib.request.Request(
+            UPDATE_CHECK_URL,
+            headers={"User-Agent": "PixivFavSearch/" + VERSION}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        
+        latest_ver = (data.get("tag_name") or "").lstrip("v")
+        download_url = data.get("browser_download_url") or UPDATE_DOWNLOAD_URL
+        changelog = data.get("body") or "无更新说明"
+        published = data.get("published_at") or ""
+        
+        # 比较版本
+        def ver_tuple(v):
+            try: return tuple(int(x) for x in v.split("."))
+            except: return (0,)
+        
+        has_update = ver_tuple(latest_ver) > ver_tuple(VERSION)
+        
+        return {
+            "ok": True,
+            "hasUpdate": has_update,
+            "currentVer": VERSION,
+            "latestVer": latest_ver,
+            "downloadUrl": download_url,
+            "changelog": changelog[:500],
+            "publishedAt": published,
+            "checkTime": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def download_update(download_url):
+    """下载更新到临时目录"""
+    try:
+        temp_dir = os.path.join(os.environ.get("TEMP", ""), "PixivFavSearch_Update")
+        os.makedirs(temp_dir, exist_ok=True)
+        download_path = os.path.join(temp_dir, "PixivFavSearch_new.exe")
+        
+        # 下载文件
+        req = urllib.request.Request(download_url, headers={"User-Agent": "PixivFavSearch"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            with open(download_path, "wb") as f:
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        
+        return {"ok": True, "path": download_path}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 import os, sys, re, json, time, threading, urllib.request, urllib.parse, subprocess, socks as pysocks, socket as pysocket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1133,6 +1193,20 @@ class H(BaseHTTPRequestHandler):
                 "url": v.get("url"),
                 "update": bool(v.get("ok") and v.get("version") and _ver_gt(v["version"], VERSION)),
             })
+        elif u.path == "/api/update/check":
+            """检查是否有新版本"""
+            result = check_update()
+            self.send_json(200, result)
+        elif u.path == "/api/update/download":
+            """下载更新到临时目录"""
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            download_url = body.get("url", UPDATE_DOWNLOAD_URL)
+            result = download_update(download_url)
+            self.send_json(200, result)
         elif u.path == "/api/tags":
             # 返回用户所有收藏标签(去重+词频),供前端下拉
             c = {}
