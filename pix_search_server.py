@@ -1255,6 +1255,34 @@ class H(BaseHTTPRequestHandler):
             else:
                 return self.send_json(500, {"ok": False, "error": "保存 cookie 失败"})
 
+        if u.path == "/api/first-run/launch-login":
+            """启动 WebView2 登录窗口"""
+            try:
+                import subprocess
+                import sys
+                import gui_worker as _gw
+                proc = _gw.launch_login_window()
+                if proc:
+                    log_info(f"首次引导: 已启动 WebView2 登录窗口 PID={proc.pid}")
+                    return self.send_json(200, {"ok": True, "pid": proc.pid})
+                else:
+                    return self.send_json(500, {"ok": False, "error": "启动失败"})
+            except Exception as e:
+                log_error(f"首次引导: 启动登录窗口失败: {e}")
+                return self.send_json(500, {"ok": False, "error": str(e)})
+
+        if u.path == "/api/first-run/check":
+            """检查 cookies.json 是否已创建（供前端轮询等待登录完成）"""
+            import pixiv_export as _pe
+            if os.path.exists(_pe.COOKIE_FILE):
+                try:
+                    _c = json.load(open(_pe.COOKIE_FILE, "r", encoding="utf-8"))
+                    uid = _pe._detect_uid(_c)
+                    return self.send_json(200, {"ok": True, "ready": True, "uid": uid, "count": len(_c)})
+                except Exception:
+                    pass
+            return self.send_json(200, {"ok": True, "ready": False})
+
         if u.path == "/api/import":
             # 从 Pixiv 抓取最新收藏(CDP)。启动导入线程, 返回是否已启动
             log_info("POST /api/import 触发导入 | POST /api/import triggered")
@@ -1450,6 +1478,19 @@ h1 { font-size: 24px; margin-bottom: 8px; color: #fff; }
 }
 .btn-primary:hover { opacity: 0.85; }
 .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-skip {
+  display: inline-block;
+  margin-top: 12px;
+  padding: 8px 20px;
+  background: transparent;
+  color: #8888a0;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all .2s;
+}
+.btn-skip:hover { color: #fff; border-color: rgba(255,255,255,0.3); }
 .hidden { display: none !important; }
 </style>
 </head>
@@ -1471,17 +1512,21 @@ h1 { font-size: 24px; margin-bottom: 8px; color: #fff; }
   <button class="option" id="btn-webview" onclick="openWebView()">
     <span class="icon">🔐</span>
     <div class="label">方式 B：现在登录</div>
-    <div class="desc">在弹出的页面中输入 Pixiv 账号密码登录</div>
+    <div class="desc">在弹出的窗口中输入 Pixiv 账号密码登录</div>
   </button>
 
   <div class="tip" id="tip">
     💡 <strong>方式 A</strong> 需要 Edge 浏览器已登录 Pixiv 且未关闭<br>
-    💡 <strong>方式 B</strong> 适合没有 Edge 或 Edge 未登录的情况
+    💡 <strong>方式 B</strong> 会弹出一个独立登录窗口
   </div>
 
   <div id="success-area" class="hidden">
     <p style="color:#66ffb2;margin-top:16px;font-size:14px;">✅ 登录成功！uid=<span id="uid"></span>，cookie 已保存</p>
     <button class="btn-primary" onclick="goToMain()">进入主界面 →</button>
+  </div>
+
+  <div id="skip-area">
+    <button class="btn-skip" onclick="skipFirstRun()">跳过，稍后设置</button>
   </div>
 </div>
 
@@ -1515,17 +1560,35 @@ async function grabEdge() {
   }
 }
 
-function openWebView() {
-  setStatus('正在打开登录页面...');
-  // Open pixiv login in a new popup
-  window.open('https://www.pixiv.net/login.php', 'pixiv_login', 'width=500,height=700');
-  document.getElementById('tip').innerHTML = '💡 请在弹出的窗口中完成登录<br>💡 登录完成后点击下方按钮抓取 cookie<br><button class="btn-primary" id="btn-webview-grab" onclick="grabWebView()" style="margin-top:12px;">已登录，抓取 Cookie</button>';
+async function openWebView() {
+  setStatus('正在打开登录窗口...');
+  try {
+    // 通知后端启动 WebView2 登录窗口
+    const r = await fetch('/api/first-run/launch-login', {method: 'POST'});
+    const j = await r.json();
+    if (j.ok) {
+      setStatus('登录窗口已打开，请在弹出的窗口中完成登录，然后点击下方按钮', 'info');
+      document.getElementById('tip').innerHTML = '💡 请在弹出的 <strong>PixivFavSearch — 登录 Pixiv</strong> 窗口中完成登录<br>💡 登录完成后回到此处点击下方按钮';
+      // 显示抓取按钮
+      const grabBtn = document.createElement('button');
+      grabBtn.className = 'btn-primary';
+      grabBtn.id = 'btn-webview-grab';
+      grabBtn.textContent = '已登录，抓取 Cookie';
+      grabBtn.style.marginTop = '16px';
+      grabBtn.onclick = grabWebView;
+      document.getElementById('tip').appendChild(grabBtn);
+    } else {
+      setStatus('❌ ' + (j.error || '启动失败'), 'error');
+    }
+  } catch(e) {
+    setStatus('❌ 网络错误: ' + e.message, 'error');
+  }
 }
 
 async function grabWebView() {
   const btn = document.getElementById('btn-webview-grab') || document.getElementById('btn-webview');
   if (btn) btn.disabled = true;
-  setStatus('正在从 WebView2 抓取 cookie...');
+  setStatus('正在从登录窗口抓取 cookie...');
   try {
     const r = await fetch('/api/first-run/webview', {method: 'POST'});
     const j = await r.json();
@@ -1548,10 +1611,17 @@ function showSuccess(uid) {
   document.getElementById('btn-edge').style.display = 'none';
   document.getElementById('btn-webview').style.display = 'none';
   document.getElementById('tip').style.display = 'none';
+  document.getElementById('skip-area').style.display = 'none';
 }
 
 function goToMain() {
   window.location.href = '/';
+}
+
+function skipFirstRun() {
+  if (confirm('确定要跳过登录吗？跳过后将无法导入收藏，但可以随时从托盘菜单重新登录。')) {
+    window.location.href = '/';
+  }
 }
 </script>
 </body>

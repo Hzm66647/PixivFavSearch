@@ -74,23 +74,50 @@ def _start_webview(url=None):
     _webview_proc.start()
 
 
+def _start_login_window():
+    """启动独立的 WebView2 登录窗口（用于首次引导方式 B）"""
+    try:
+        proc = gui_worker.launch_login_window()
+        return proc
+    except Exception as e:
+        print(f"启动登录窗口失败: {e}")
+        return None
+
+
 # ----------------------------------------------------------------------
 # 托盘回调
 # ----------------------------------------------------------------------
 def _on_open(icon, item):
-    _start_webview()
+    """打开主界面"""
+    # 如果 cookies 已被创建（首次引导完成后），直接进主界面
+    # 否则进引导页
+    port = server.PORT
+    if _cookies_exist():
+        _start_webview(f"http://127.0.0.1:{port}/")
+    else:
+        _start_webview(f"http://127.0.0.1:{port}/first-run")
 
 
 def _on_export(icon, item):
-    """导出收藏(CDP 抓取, cookie 不落盘)"""
+    """导出收藏（从 cookies.json 读取，抓取最新收藏）"""
     def run():
         try:
             code = exporter.main()
-            icon.notify("已导出完成" if code == 0 else "导出未完成", "PixivFavSearch")
+            if code == 0:
+                icon.notify("导出完成", "PixivFavSearch")
+            else:
+                # 读取错误信息
+                icon.notify("导出失败，请检查 cookies.json 是否存在", "PixivFavSearch")
         except Exception as e:
             icon.notify(f"导出失败: {e}", "PixivFavSearch")
     t = threading.Thread(target=run, daemon=True)
     t.start()
+
+
+def _on_import_first_run(icon, item):
+    """首次使用/重新登录 — 打开引导页"""
+    port = server.PORT
+    _start_webview(f"http://127.0.0.1:{port}/first-run")
 
 
 def _on_exit(icon, item):
@@ -146,17 +173,19 @@ def main():
     server.start_server(host="127.0.0.1")
     port = server.PORT
     print(f"[OK] 服务已启动: http://127.0.0.1:{port}/  数据目录: {server.OUT}", flush=True)
+    print(f"[INFO] 首次使用: {_is_first_run()}")
 
     # 托盘图标
     menu = Menu(
         MenuItem("打开主界面", _on_open),
-        MenuItem("导出 Pixiv 收藏", _on_export),
+        MenuItem("导入/更新收藏", _on_export),
+        MenuItem("重新登录 Pixiv", _on_import_first_run),
         Menu.SEPARATOR,
         MenuItem("退出", _on_exit),
     )
     icon = Icon("pixivfavsearch", _make_tray_image(), "PixivFavSearch", menu)
 
-    # 首次启动自动打开主界面
+    # 首次启动自动打开主界面（或引导页）
     _start_webview()
 
     # 托盘主循环(阻塞)

@@ -3,6 +3,8 @@
 import os
 import time
 import threading
+import subprocess
+import sys
 
 # WebView2 remote debugging port
 local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
@@ -103,8 +105,26 @@ def check_webview2_cookies():
     except Exception:
         return False, 0
 
+def launch_login_window():
+    """启动独立的 WebView2 登录窗口（子进程）
+    
+    Returns:
+        subprocess.Popen: 登录窗口进程
+    """
+    # 获取当前 Python 解释器路径
+    python = sys.executable
+    # 获取当前脚本路径
+    script = os.path.abspath(__file__)
+    # 启动子进程
+    proc = subprocess.Popen(
+        [python, script, "--login"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+    )
+    return proc
+
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--login":
         start_login()
     else:
