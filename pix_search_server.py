@@ -1544,8 +1544,9 @@ h1 { font-size: 24px; margin-bottom: 8px; color: #fff; }
   </button>
 
   <div class="tip" id="tip">
-    💡 <strong>方式 A</strong> 需要 Edge 浏览器已登录 Pixiv 且未关闭<br>
-    💡 <strong>方式 B</strong> 会弹出一个独立登录窗口
+    💡 <strong>方式 A（推荐）</strong> 需要 Edge 浏览器已登录 Pixiv 且未关闭，一键读取<br>
+    ⚠️ <strong>方式 B</strong> 登录后 cookie <strong>不会持久化</strong>，每次启动都需要重新登录<br>
+    💡 强烈建议用方式 A，先打开 Edge 登录 Pixiv 再回来点按钮
   </div>
 
   <div id="success-area" class="hidden">
