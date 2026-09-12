@@ -34,7 +34,31 @@ DATA = os.path.join(OUT, "bookmarks.json")
 DEMO_DATA = os.path.join(OUT, "demo_data.json")
 THUMB = os.path.join(OUT, "thumbs")
 COLTAGS = os.path.join(OUT, "coltags.json")
+CONFIG_FILE = os.path.join(APP_DATA, "config.json")
 os.makedirs(THUMB, exist_ok=True)
+
+# --- 配置持久化(config.json) ---
+def load_config():
+    """加载配置文件,不存在则返回默认值"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            return json.load(open(CONFIG_FILE, "r", encoding="utf-8"))
+        except Exception:
+            pass
+    return {"proxy": "http://127.0.0.1:10808"}
+
+def save_config(config):
+    """保存配置文件"""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def get_proxy():
+    """从 config.json 读取代理地址, 默认 http://127.0.0.1:10808"""
+    return load_config().get("proxy", "http://127.0.0.1:10808")
 # onefile 打包: exe 内自带一份示例数据作为首次运行回退(在 _MEIPASS 临时解压目录)
 _MEIPASS = getattr(sys, "_MEIPASS", None)
 if _MEIPASS and not os.path.exists(DEMO_DATA):
@@ -1093,6 +1117,22 @@ class H(BaseHTTPRequestHandler):
             # 返回用户自建收藏标签(带数量),供前端下拉
             ct = [{"tag": k, "count": len(v)} for k, v in sorted(COLTAG_MAP.items(), key=lambda x: -len(x[1]))]
             self.send_json(200, {"total": len(ct), "tags": ct})
+        elif u.path == "/api/settings":
+            # 返回当前配置(proxy 等)
+            cfg = load_config()
+            self.send_json(200, {"proxy": cfg.get("proxy", "http://127.0.0.1:10808")})
+        elif u.path == "/api/about":
+            # 返回版本信息
+            v = LATEST_VER
+            self.send_json(200, {
+                "version": VERSION,
+                "github": "https://github.com/Hzm66647/PixivFavSearch",
+                "checking": v.get("checking", False),
+                "ok": v.get("ok", False),
+                "latest": v.get("version"),
+                "url": v.get("url"),
+                "update": bool(v.get("ok") and v.get("version") and _ver_gt(v["version"], VERSION)),
+            })
         elif u.path == "/api/tags":
             # 返回用户所有收藏标签(去重+词频),供前端下拉
             c = {}
@@ -1213,6 +1253,7 @@ class H(BaseHTTPRequestHandler):
                 pass
 
     def _handle_post(self):
+        global BOOKMARKS, BOOKMARKS_LOAD_TIME, COLTAG_MAP
         if not (self._ip_ok() and self._host_ok()):
             self._deny()
             return
@@ -1354,6 +1395,130 @@ class H(BaseHTTPRequestHandler):
             with open(POS_FILE, "w", encoding="utf-8") as f:
                 json.dump(old, f, ensure_ascii=False)
             return self.send_json(200, {"ok": True})
+
+        # --- 收藏标签管理 API ---
+        if u.path == "/api/coltags" and self.command == "POST":
+            # 创建新收藏标签
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                data = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                return self.send_json(400, {"error": "JSON 解析失败"})
+            name = (data.get("name") or "").strip()
+            if not name:
+                return self.send_json(400, {"error": "标签名不能为空"})
+            if name in COLTAG_MAP:
+                return self.send_json(400, {"error": "标签已存在"})
+            COLTAG_MAP[name] = set()
+            # 持久化
+            try:
+                raw = {}
+                for tag, ids in COLTAG_MAP.items():
+                    raw[tag] = list(ids)
+                with open(COLTAGS, "w", encoding="utf-8") as f:
+                    json.dump(raw, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                return self.send_json(500, {"error": f"保存失败: {e}"})
+            return self.send_json(200, {"ok": True, "tag": name, "count": 0})
+
+        # DELETE /api/coltags/{name} — 删除标签
+        m_del = _re.match(r"^/api/coltags/([^/]+)$", u.path)
+        if m_del and self.command == "DELETE":
+            name = urllib.parse.unquote(m_del.group(1))
+            if name not in COLTAG_MAP:
+                return self.send_json(404, {"error": "标签不存在"})
+            del COLTAG_MAP[name]
+            try:
+                raw = {}
+                for tag, ids in COLTAG_MAP.items():
+                    raw[tag] = list(ids)
+                with open(COLTAGS, "w", encoding="utf-8") as f:
+                    json.dump(raw, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                return self.send_json(500, {"error": f"保存失败: {e}"})
+            return self.send_json(200, {"ok": True})
+
+        # POST /api/coltags/{name}/toggle — 切换作品是否在标签中
+        m_tog = _re.match(r"^/api/coltags/([^/]+)/toggle$", u.path)
+        if m_tog and self.command == "POST":
+            name = urllib.parse.unquote(m_tog.group(1))
+            if name not in COLTAG_MAP:
+                return self.send_json(404, {"error": "标签不存在"})
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                data = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                return self.send_json(400, {"error": "JSON 解析失败"})
+            work_id = str(data.get("work_id", ""))
+            if not work_id:
+                return self.send_json(400, {"error": "缺少 work_id"})
+            added = False
+            if work_id in COLTAG_MAP[name]:
+                COLTAG_MAP[name].discard(work_id)
+            else:
+                COLTAG_MAP[name].add(work_id)
+                added = True
+            try:
+                raw = {}
+                for tag, ids in COLTAG_MAP.items():
+                    raw[tag] = list(ids)
+                with open(COLTAGS, "w", encoding="utf-8") as f:
+                    json.dump(raw, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                return self.send_json(500, {"error": f"保存失败: {e}"})
+            return self.send_json(200, {"ok": True, "added": added, "count": len(COLTAG_MAP[name])})
+
+        # GET /api/coltags/{name}/works — 获取标签下的作品
+        m_works = _re.match(r"^/api/coltags/([^/]+)/works$", u.path)
+        if m_works and self.command == "GET":
+            name = urllib.parse.unquote(m_works.group(1))
+            if name not in COLTAG_MAP:
+                return self.send_json(404, {"error": "标签不存在"})
+            ids = COLTAG_MAP[name]
+            items = [_pub(it, []) for it in BOOKMARKS if str(it.get("id")) in ids]
+            return self.send_json(200, {"total": len(items), "tag": name, "items": items})
+
+        # --- 设置 API ---
+        if u.path == "/api/settings" and self.command == "POST":
+            # 更新配置
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                data = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                return self.send_json(400, {"error": "JSON 解析失败"})
+            cfg = load_config()
+            if "proxy" in data:
+                cfg["proxy"] = data["proxy"]
+            if save_config(cfg):
+                return self.send_json(200, {"ok": True})
+            return self.send_json(500, {"error": "保存配置失败"})
+
+        if u.path == "/api/settings/clear-cookies" and self.command == "POST":
+            # 清除 cookie
+            import pixiv_export as _pe
+            if os.path.exists(_pe.COOKIE_FILE):
+                try:
+                    os.remove(_pe.COOKIE_FILE)
+                    return self.send_json(200, {"ok": True})
+                except Exception as e:
+                    return self.send_json(500, {"error": str(e)})
+            return self.send_json(200, {"ok": True})
+
+        if u.path == "/api/settings/clear-data" and self.command == "POST":
+            # 清除所有收藏数据
+            try:
+                if os.path.exists(DATA):
+                    os.remove(DATA)
+                if os.path.exists(COLTAGS):
+                    os.remove(COLTAGS)
+                with PIXIV_LOCK:
+                    BOOKMARKS = []
+                    BOOKMARKS_LOAD_TIME = 0.0
+                    COLTAG_MAP = {}
+                return self.send_json(200, {"ok": True})
+            except Exception as e:
+                return self.send_json(500, {"error": str(e)})
+
         return self.send_error(404)
 
     def version_string(self):
@@ -1662,16 +1827,29 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
   --bg:#F2F2F7;--card:#FFFFFF;--text:#1C1C1E;--sub:#8E8E93;--accent:#ef9eff;--accent-ink:#2b0030;
   --field-bg:#FFFFFF;--field-border:#E5E5EA;--topbar:rgba(242,242,247,.82);
   --shadow:0 2px 10px rgba(0,0,0,.05);--shadow-hover:0 12px 28px rgba(0,0,0,.13);
+  --sidebar-bg:#1C1C1E;--sidebar-text:#98989F;--sidebar-active:#ef9eff;
  }
  @media (prefers-color-scheme: dark){
   :root{
    --bg:#000000;--card:#1C1C1E;--text:#F2F2F7;--sub:#98989F;--accent:#ef9eff;--accent-ink:#2b0030;
    --field-bg:#2C2C2E;--field-border:#38383A;--topbar:rgba(0,0,0,.72);
    --shadow:0 2px 10px rgba(0,0,0,.45);--shadow-hover:0 12px 30px rgba(0,0,0,.65);
+   --sidebar-bg:#000000;--sidebar-text:#888888;--sidebar-active:#ef9eff;
   }
  }
- body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);margin:0;padding:24px 20px 60px;transition:background .3s,color .3s}
- .topbar{position:sticky;top:0;z-index:10;background:var(--topbar);backdrop-filter:blur(16px) saturate(180%);-webkit-backdrop-filter:blur(16px) saturate(180%);margin:-24px -20px 0;padding:12px 20px 10px}
+ body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);margin:0;padding:0;transition:background .3s,color .3s;display:flex;height:100vh;overflow:hidden}
+ /* -- 侧边栏 -- */
+ .sidebar{width:60px;min-width:60px;background:var(--sidebar-bg);display:flex;flex-direction:column;align-items:center;padding:16px 0;gap:8px;z-index:100;border-right:1px solid rgba(255,255,255,.06)}
+ .sidebar-btn{width:44px;height:44px;border-radius:12px;border:none;background:transparent;color:var(--sidebar-text);font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .2s;position:relative}
+ .sidebar-btn:hover{background:rgba(255,255,255,.08);color:#fff}
+ .sidebar-btn.active{background:linear-gradient(135deg,rgba(239,158,255,.25),rgba(199,125,255,.18));color:var(--sidebar-active)}
+ .sidebar-btn .tt{position:absolute;left:56px;top:50%;transform:translateY(-50%);background:rgba(0,0,0,.85);color:#fff;font-size:12px;padding:5px 10px;border-radius:6px;white-space:nowrap;opacity:0;pointer-events:none;transition:opacity .15s}
+ .sidebar-btn:hover .tt{opacity:1}
+ .sidebar-spacer{flex:1}
+ /* -- 主内容区 -- */
+ .main{flex:1;overflow-y:auto;padding:24px 20px 60px;position:relative}
+ .page-container{display:none}
+ .page-container.active{display:block}
  /* -- 顶部横幅(pixiv 风格,可替换大图) -- */
  .banner{position:relative;height:150px;border-radius:16px 16px 0 0;overflow:hidden;background:
    radial-gradient(120% 140% at 15% 20%,color-mix(in srgb,var(--accent) 30%,transparent) 0%,transparent 55%),
@@ -1780,16 +1958,65 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
  .card .go{display:block;margin:0 12px 12px;padding:9px 0;text-align:center;border-radius:10px;background:var(--accent);color:var(--accent-ink);font-size:13px;font-weight:700;transition:transform .18s cubic-bezier(.34,1.56,.64,1),background .15s,box-shadow .2s}
  .card .go:hover{background:color-mix(in srgb,var(--accent) 85%,#000);transform:scale(1.04);box-shadow:0 4px 12px color-mix(in srgb,var(--accent) 45%,transparent)}
  .card .go:active{transform:scale(.9)}
+ .card .fav-btn{display:block;margin:0 12px 8px;padding:7px 0;text-align:center;border-radius:10px;background:var(--field-bg);color:var(--text);font-size:12px;font-weight:600;border:1px solid var(--field-border);cursor:pointer;transition:all .15s}
+ .card .fav-btn:hover{border-color:var(--accent);color:var(--accent)}
+ .card .fav-btn.in-fav{background:color-mix(in srgb,var(--accent) 15%,transparent);border-color:var(--accent);color:var(--accent)}
  a{text-decoration:none;color:inherit}
  /* 悬浮回主页按钮(低调) */
-#home-btn{position:fixed;bottom:18px;right:18px;z-index:9999;width:32px;height:32px;border-radius:50%;background:rgba(0,0,0,.28);border:1px solid rgba(255,255,255,.1);color:var(--sub);font-size:15px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .2s;box-shadow:none;opacity:.4;backdrop-filter:blur(4px)}
-#home-btn:hover{opacity:.9;color:#ef9eff;border-color:rgba(239,158,255,.5)}
-#home-btn .ttip{position:absolute;right:40px;white-space:nowrap;background:rgba(0,0,0,.8);padding:3px 8px;border-radius:6px;font-size:11px;border:1px solid rgba(255,255,255,.1);opacity:0;pointer-events:none;transition:opacity .18s;color:var(--fg)}
-#home-btn:hover .ttip{opacity:1}
-.empty{color:var(--sub);padding:60px 0;text-align:center;font-size:14px;animation:popIn .4s cubic-bezier(.34,1.56,.64,1) both}
+ #home-btn{position:fixed;bottom:18px;right:18px;z-index:9999;width:32px;height:32px;border-radius:50%;background:rgba(0,0,0,.28);border:1px solid rgba(255,255,255,.1);color:var(--sub);font-size:15px;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all .2s;box-shadow:none;opacity:.4;backdrop-filter:blur(4px)}
+ #home-btn:hover{opacity:.9;color:#ef9eff;border-color:rgba(239,158,255,.5)}
+ #home-btn .ttip{position:absolute;right:40px;white-space:nowrap;background:rgba(0,0,0,.8);padding:3px 8px;border-radius:6px;font-size:11px;border:1px solid rgba(255,255,255,.1);opacity:0;pointer-events:none;transition:opacity .18s;color:var(--fg)}
+ #home-btn:hover .ttip{opacity:1}
+ .empty{color:var(--sub);padding:60px 0;text-align:center;font-size:14px;animation:popIn .4s cubic-bezier(.34,1.56,.64,1) both}
  @keyframes popIn{0%{opacity:0;transform:translateY(12px)}60%{opacity:1;transform:translateY(-4px)}100%{opacity:1;transform:translateY(0)}}
  ::-webkit-scrollbar{width:10px}::-webkit-scrollbar-thumb{background:var(--sub);border-radius:6px;border:2px solid var(--bg)}
+ /* -- 收藏夹页 -- */
+ .fav-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+ .fav-header h2{font-size:20px;font-weight:700;margin:0}
+ .fav-header .actions{display:flex;gap:8px}
+ .fav-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+ .fav-card{background:var(--card);border-radius:14px;padding:20px;box-shadow:var(--shadow);border:1px solid color-mix(in srgb,var(--field-border) 55%,transparent);cursor:pointer;transition:all .2s;position:relative}
+ .fav-card:hover{box-shadow:var(--shadow-hover);transform:translateY(-3px) scale(1.01)}
+ .fav-card .tag-name{font-size:15px;font-weight:600;margin-bottom:6px;word-break:break-all}
+ .fav-card .tag-count{font-size:12px;color:var(--sub)}
+ .fav-card .del-btn{position:absolute;top:10px;right:10px;width:24px;height:24px;border-radius:50%;border:none;background:transparent;color:var(--sub);font-size:14px;cursor:pointer;opacity:0;transition:all .15s;display:flex;align-items:center;justify-content:center}
+ .fav-card:hover .del-btn{opacity:1}
+ .fav-card .del-btn:hover{background:rgba(255,69,58,.15);color:#FF453A}
+ .fav-detail-header{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+ .fav-detail-header .back-btn{width:36px;height:36px;border-radius:10px;border:1px solid var(--field-border);background:var(--field-bg);color:var(--text);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s}
+ .fav-detail-header .back-btn:hover{border-color:var(--accent);color:var(--accent)}
+ .fav-detail-header h2{font-size:18px;font-weight:700;margin:0}
+ /* -- 设置页 -- */
+ .settings-section{background:var(--card);border-radius:14px;padding:20px;margin-bottom:16px;box-shadow:var(--shadow);border:1px solid color-mix(in srgb,var(--field-border) 55%,transparent)}
+ .settings-section h3{font-size:15px;font-weight:700;margin:0 0 4px}
+ .settings-section .desc{font-size:12px;color:var(--sub);margin-bottom:14px;line-height:1.5}
+ .settings-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+ .settings-row input{flex:1;min-width:200px}
+ .settings-row .status{font-size:12px;color:#34C759;font-weight:500}
+ .settings-row .status.error{color:#FF453A}
+ .modal-overlay{position:fixed;inset:0;z-index:998;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;padding:20px}
+ .modal-overlay.show{display:flex}
+ .modal-box{background:var(--card);border-radius:16px;padding:24px;width:min(92vw,400px);box-shadow:0 20px 60px rgba(0,0,0,.4);animation:popIn .25s cubic-bezier(.34,1.56,.64,1) both}
+ .modal-box h3{font-size:16px;font-weight:700;margin:0 0 14px}
+ .modal-box input{width:100%;margin-bottom:12px}
+ .modal-box .modal-actions{display:flex;justify-content:flex-end;gap:10px}
+ /* -- 标签选择器弹窗 -- */
+ .tag-picker{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;max-height:200px;overflow-y:auto}
+ .tag-picker .tag-chip{padding:6px 14px;border-radius:20px;border:1px solid var(--field-border);background:var(--field-bg);font-size:12px;cursor:pointer;transition:all .15s}
+ .tag-picker .tag-chip:hover{border-color:var(--accent)}
+ .tag-picker .tag-chip.selected{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
 </style>
+<!-- 侧边栏 -->
+<nav class=sidebar>
+ <button class="sidebar-btn active" data-page="search" onclick="switchPage('search')">🔍<span class=tt data-l data-zh="搜索" data-en="Search">搜索</span></button>
+ <button class="sidebar-btn" data-page="favorites" onclick="switchPage('favorites')">⭐<span class=tt data-l data-zh="收藏夹" data-en="Favorites">收藏夹</span></button>
+ <button class="sidebar-btn" data-page="settings" onclick="switchPage('settings')">⚙️<span class=tt data-l data-zh="设置" data-en="Settings">设置</span></button>
+ <div class=sidebar-spacer></div>
+</nav>
+<!-- 主内容区 -->
+<div class=main>
+ <!-- 搜索页 -->
+ <div class="page-container active" id="page-search">
 <header class=topbar>
  <div class=banner id=banner>
   <img id=banner-img src=/assets/banner alt='' onerror="this.style.display='none'">
@@ -1854,7 +2081,107 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
 <div id=demo-bar data-l data-zh="🎨 当前为效果预览，导入收藏后即可正常使用" data-en="🎨 Preview mode - import your bookmarks to use" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:60;background:rgba(18,18,32,.78);backdrop-filter:blur(8px);color:#fff;font-size:13px;font-weight:600;padding:10px 20px;border-radius:22px;box-shadow:0 6px 18px rgba(0,0,0,.4);pointer-events:none;white-space:nowrap;max-width:92vw;text-align:center">🎨 当前为效果预览，导入收藏后即可正常使用</div>
 <div id=import-tip style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:59;background:rgba(40,40,80,.85);backdrop-filter:blur(8px);color:#fff;font-size:12px;padding:8px 16px;border-radius:18px;box-shadow:0 4px 12px rgba(0,0,0,.3);pointer-events:none;white-space:nowrap;max-width:92vw;text-align:center" data-l data-zh="💡 首次导入需在 WebView2 中登录一次 Pixiv，之后自动保存登录态" data-en="💡 First import requires logging into Pixiv in WebView2, login persists afterwards">💡 首次导入需在 WebView2 中登录一次 Pixiv，之后自动保存登录态</div>
 <button id=home-btn title="回到本站主页" data-l-t data-zh-t="回到本站主页" data-en-t="Back to homepage" onclick="location.href='/'"><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 10.5L12 3l9 7.5'/><path d='M5 9.5V21h14V9.5'/></svg><span class=ttip data-l data-zh="🏠 回到本站" data-en="🏠 Home">🏠 回到本站</span></button>
+ </div><!-- /page-search -->
+
+ <!-- 收藏夹页 -->
+ <div class="page-container" id="page-favorites">
+  <div class="fav-header" id="fav-list-header">
+   <h2 data-l data-zh="收藏夹" data-en="Favorites">收藏夹</h2>
+   <div class=actions>
+    <button onclick="showCreateTagModal()" data-l data-zh="➕ 新建标签" data-en="➕ New Tag">➕ 新建标签</button>
+   </div>
+  </div>
+  <div class="fav-detail-header" id="fav-detail-header" style="display:none">
+   <button class=back-btn onclick="showFavList()">←</button>
+   <h2 id="fav-detail-title">Tag</h2>
+  </div>
+  <div class=fav-grid id=fav-grid></div>
+  <div id=fav-works style="display:none">
+   <div id=fav-works-grid class=grid style="margin-top:16px"></div>
+  </div>
+ </div><!-- /page-favorites -->
+
+ <!-- 设置页 -->
+ <div class="page-container" id="page-settings">
+  <h2 style="font-size:20px;font-weight:700;margin:0 0 20px" data-l data-zh="设置" data-en="Settings">设置</h2>
+  <!-- 代理配置 -->
+  <div class=settings-section>
+   <h3 data-l data-zh="🌐 代理配置" data-en="🌐 Proxy">🌐 代理配置</h3>
+   <div class=desc data-l data-zh="设置 HTTP 代理地址，用于连接 Pixiv" data-en="HTTP proxy for connecting to Pixiv">设置 HTTP 代理地址，用于连接 Pixiv</div>
+   <div class=settings-row>
+    <input id=proxy-input placeholder="http://127.0.0.1:10808">
+    <button onclick="saveProxy()" data-l data-zh="保存" data-en="Save">保存</button>
+    <span class=status id=proxy-status></span>
+   </div>
+  </div>
+  <!-- Cookie 管理 -->
+  <div class=settings-section>
+   <h3 data-l data-zh="🍪 Cookie 管理" data-en="🍪 Cookie">🍪 Cookie 管理</h3>
+   <div class=desc data-l data-zh="当前登录状态" data-en="Current login status">当前登录状态</div>
+   <div class=settings-row>
+    <span id=cookie-status style="flex:1;font-size:13px;color:var(--sub)">-</span>
+    <button onclick="clearCookies()" data-l data-zh="清除并重新登录" data-en="Clear & Re-login">清除并重新登录</button>
+   </div>
+  </div>
+  <!-- 数据管理 -->
+  <div class=settings-section>
+   <h3 data-l data-zh="💾 数据管理" data-en="💾 Data">💾 数据管理</h3>
+   <div class=desc data-l data-zh="管理本地收藏数据" data-en="Manage local bookmark data">管理本地收藏数据</div>
+   <div class=settings-row>
+    <span id=data-status style="flex:1;font-size:13px;color:var(--sub)">-</span>
+    <button onclick="clearAllData()" data-l data-zh="清空所有收藏" data-en="Clear All Data">清空所有收藏</button>
+   </div>
+  </div>
+  <!-- 关于 -->
+  <div class=settings-section>
+   <h3 data-l data=zh="ℹ️ 关于" data-en="ℹ️ About">ℹ️ 关于</h3>
+   <div class=desc>
+    <span data-l data-zh="版本" data-en="Version">版本</span>: <span id=about-version>1.0.0</span><br>
+    <a id=about-link href="https://github.com/Hzm66647/PixivFavSearch" target=_blank style="color:var(--accent)">GitHub</a>
+   </div>
+   <div class=settings-row>
+    <button onclick="checkUpdate()" data-l data-zh="检查更新" data-en="Check Update">检查更新</button>
+    <span class=status id=update-status></span>
+   </div>
+  </div>
+ </div><!-- /page-settings -->
+</div><!-- /main -->
+
+<!-- 新建标签弹窗 -->
+<div class=modal-overlay id=create-tag-modal>
+ <div class=modal-box>
+  <h3 data-l data-zh="新建收藏标签" data-en="New Collection Tag">新建收藏标签</h3>
+  <input id=new-tag-name placeholder="Tag name" data-l-ph data-zh="标签名" data-en="Tag name">
+  <div class=modal-actions>
+   <button class=crop-btn cancel onclick="closeCreateTagModal()" data-l data-zh="取消" data-en="Cancel">取消</button>
+   <button class=crop-btn ok onclick="createTag()" data-l data-zh="创建" data-en="Create">创建</button>
+  </div>
+ </div>
+</div>
+
+<!-- 加入收藏夹弹窗 -->
+<div class=modal-overlay id=fav-picker-modal>
+ <div class=modal-box>
+  <h3 data-l data-zh="加入收藏夹" data-en="Add to Favorites">加入收藏夹</h3>
+  <div class=tag-picker id=fav-picker-tags></div>
+  <div class=modal-actions style="margin-top:14px">
+   <button class=crop-btn cancel onclick="closeFavPicker()" data-l data-zh="关闭" data-en="Close">关闭</button>
+  </div>
+ </div>
+</div>
+
 <script>
+ // --- 侧边栏导航 ---
+ let currentPage='search';
+ function switchPage(page){
+  if(currentPage===page)return;
+  currentPage=page;
+  document.querySelectorAll('.page-container').forEach(p=>p.classList.remove('active'));
+  document.getElementById('page-'+page).classList.add('active');
+  document.querySelectorAll('.sidebar-btn').forEach(b=>b.classList.toggle('active',b.dataset.page===page));
+  if(page==='favorites')loadFavTags();
+  if(page==='settings')loadSettings();
+ }
  // --- 顶部按钮栏 ---
  let MODE='pixiv';
  let DATASRC='__DATASRC__'; // 'user'|'demo'|'no-data'(服务端注入)
@@ -1931,12 +2258,11 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
   const im=new Image();
   im.onload=()=>{
    crop.kind=kind;crop.url=url;crop.natW=im.naturalWidth;crop.natH=im.naturalHeight;
-   document.getElementById('crop-modal').style.display='flex'; // 先显示弹窗,再量 stage 尺寸
+   document.getElementById('crop-modal').style.display='flex';
    const stage=document.getElementById('crop-stage'),ci=document.getElementById('crop-img');
    const stw=stage.clientWidth,sth=stage.clientHeight;
    const r=Math.min(stw/crop.natW,sth/crop.natH);
    crop.bw=crop.natW*r;crop.bh=crop.natH*r;crop.tx=0;crop.ty=0;crop.s=1;
-   // 裁剪框比例:横幅按实际显示比例(容器宽/150),头像 1:1
    const ratio=kind==='banner'?Math.max(2.4,document.getElementById('banner').clientWidth/150):1;
    let fw,fh;
    if(ratio>=1){fw=Math.min(stw*0.94,sth*0.9*ratio);fh=fw/ratio;}
@@ -1960,8 +2286,6 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
   im.src=url;
  }
  function clampCrop(){
-  // 保证裁剪框始终在图片范围内(不露黑边)
-  // 图片中心相对 stage 中心的偏移 tx,须满足:图片左右缘包住裁剪框左右缘
   const bw=crop.bw*crop.s,bh=crop.bh*crop.s;
   const minTx=(crop.fw-bw)/2, maxTx=(bw-crop.fw)/2;
   const minTy=(crop.fh-bh)/2, maxTy=(bh-crop.fh)/2;
@@ -1989,11 +2313,9 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
  function cropConfirm(){
   if(!crop.kind)return;
   const stw=document.getElementById('crop-stage').clientWidth,sth=document.getElementById('crop-stage').clientHeight;
-  // 图片实际显示区域(左上角)
   const imgW=crop.bw*crop.s,imgH=crop.bh*crop.s;
   const imgLeft=stw/2+crop.tx-imgW/2,imgTop=sth/2+crop.ty-imgH/2;
   const frLeft=(stw-crop.fw)/2,frTop=(sth-crop.fh)/2;
-  // 相对图片的比例 → 原图像素
   const px=(frLeft-imgLeft)/imgW*crop.natW,py=(frTop-imgTop)/imgH*crop.natH;
   const pw=crop.fw/imgW*crop.natW,ph=crop.fh/imgH*crop.natH;
   const c=document.createElement('canvas');
@@ -2022,7 +2344,7 @@ function hlText(s, words){
  let out=esc(s);
  const list=[...(new Set(words.map(w=>String(w).toLowerCase()).filter(w=>w&&w.length>=2)))].sort((a,b)=>b.length-a.length);
  for(const w of list){
-  const re=new RegExp(w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi');
+  const re=new RegExp(w.replace(/[.*+?^${}()|[\]\\\\]/g,'\\\\$&'),'gi');
   out=out.replace(re,m=>'<mark>'+m+'</mark>');
  }
  return out;
@@ -2079,14 +2401,12 @@ function hlText(s, words){
  const _it=document.getElementById('import-tip');
  if(DATASRC==='demo'){
   if(_db)_db.style.display='block';
-  if(_it)_it.style.display='block'; // 显示首次导入提示
+  if(_it)_it.style.display='block';
   if(!location.hash){ go(); }
  }else if(_db){
   _db.style.display='none';
-  // user/no-data 模式也显示导入提示 (仅首次)
   if(_it && !localStorage.getItem('pfs_imported')){
    _it.style.display='block';
-   // 5秒后淡出
    setTimeout(()=>{ if(_it)_it.style.display='none'; }, 8000);
   }
  }
@@ -2182,7 +2502,7 @@ function langApply(){
    const tg=c.querySelector('.tg'); if(tg) tg.textContent='🏷 '+(zh?'示例标签':'Sample tag');
    const im=c.querySelector('img'); if(im&&im.src.indexOf('/thumb/')>=0){
     const base=im.src.split('/thumb/')[1].split('?')[0];
-    im.src='/thumb/'+base+'?lang='+LANG; // 不同 lang 不同 URL, 浏览器缓存天然不串
+    im.src='/thumb/'+base+'?lang='+LANG;
    }
   });
  }
@@ -2200,7 +2520,7 @@ function toggleLang(){ LANG=LANG==='zh'?'en':'zh'; langApply(); }
    el.onclick=()=>location.href=d.url||'https://github.com/Hzm66647/PixivFavSearch/releases/latest';
    document.body.appendChild(el);
   }
- }catch(e){}
+}catch(e){}
 })();
 
 // === 核心搜索(开源版修复: 补回丢失的 go/undo) ===
@@ -2217,12 +2537,11 @@ async function go(){
  const tag=document.getElementById('tag').value;
  const colt=document.getElementById('coltag').value;
  const g=document.getElementById('grid');const m=document.getElementById('meta');
- // 搜索前先存档(仅当和栈顶不同才存,避免重复搜索塞满栈)
  const cur=snapshot();
  const top=undoStack[undoStack.length-1];
  if(!top||top.q!==cur.q||top.tag!==cur.tag||top.colt!==cur.colt||top.mode!==cur.mode){
   undoStack.push(cur);if(undoStack.length>50)undoStack.shift();
-  markHistory(); // 多压一个历史项,让 Alt+←/鼠标后退 能先触发 popstate 事件
+  markHistory();
  }
  g.innerHTML='<div class=empty>搜索中…</div>';
  const r=await fetch('/api/search?mode='+MODE+'&q='+encodeURIComponent(q)+'&tag='+encodeURIComponent(tag)+'&coltag='+encodeURIComponent(colt));
@@ -2233,7 +2552,6 @@ async function go(){
  if(!d.items.length){g.innerHTML='<div class=empty>'+(LANG==='zh'?'没有匹配的作品':'No matching works')+'</div>';return;}
  g.innerHTML=d.items.map(it=>{
   if(DATASRC==='demo'){
-   // demo 模式: 纯展示占位卡片 — 无链接、无打开按钮、标题/作者/标签用占位文案
    return `<div class=card>
    <img loading=lazy decoding=async src="/thumb/${it.id}?lang=${LANG}" onerror="this.onerror=null;this.style.visibility='hidden'">
    <div class=tt>${LANG==='zh'?'标题':'Title'}</div>
@@ -2248,11 +2566,12 @@ async function go(){
      <div class=au>${esc(it.userName)}</div>
    </a>
    <div class=tg>🏷 ${esc(tagsOf(it))}</div>
+   <button class="fav-btn" data-work-id="${it.id}" onclick="event.stopPropagation();openFavPicker('${it.id}')">${LANG==='zh'?'⭐ 加入收藏夹':'⭐ Add to Fav'}</button>
    <a class=go href="https://www.pixiv.net/artworks/${it.id}">🔗 ${LANG==='zh'?'打开 Pixiv':'Open Pixiv'}</a>
  </div>`;
  }).join('');
- // 把搜索条件写进 URL(#参数),从外部页面按后退键回来时能自动恢复结果
  history.replaceState(history.state,'','#'+new URLSearchParams({mode:MODE,q:q,tag:tag,colt:colt}).toString());
+ updateFavBtnStates();
 }
 // Ctrl+Z 撤销(捕获阶段,拦截输入框原生撤销)
 document.addEventListener('keydown',function(e){
@@ -2262,14 +2581,13 @@ document.addEventListener('keydown',function(e){
 async function doImport(){
  const btn=document.getElementById('btn-import');
  const hint=document.getElementById('hint');
- if(btn.classList.contains('loading'))return; // 已在导入中
+ if(btn.classList.contains('loading'))return;
  btn.classList.add('loading');btn.textContent=LANG==='zh'?'⏳ 导入中…':'⏳ Importing…';
  hint.textContent=LANG==='zh'?'正在连接浏览器抓取最新收藏, 请稍候…':'Connecting to browser to fetch latest bookmarks…';
  try{
   const r=await fetch('/api/import',{method:'POST'});
   const j=await r.json();
   if(!j.started){ hint.textContent=LANG==='zh'?'已有导入任务在运行, 请稍候…':'Import already running…'; btn.classList.remove('loading');btn.textContent=(LANG==='zh'?'📥 导入/更新收藏':'📥 Import / Update'); return; }
-  // 轮询状态直到完成(最多 180s)
   for(let i=0;i<90;i++){
    await new Promise(res=>setTimeout(res,2000));
    const sr=await fetch('/api/import-status');
@@ -2278,7 +2596,7 @@ async function doImport(){
     hint.style.color=s.code===0?'#34C759':'#FF453A';
     hint.textContent=s.msg||(LANG==='zh'?'导入完成':'Done');
     btn.classList.remove('loading');btn.textContent=(LANG==='zh'?'📥 导入/更新收藏':'📥 Import / Update');
-    if(s.code===0){ localStorage.setItem('pfs_imported','1'); await go(); } // 刷新搜索结果 + 标记已导入
+    if(s.code===0){ localStorage.setItem('pfs_imported','1'); await go(); }
     setTimeout(()=>{hint.style.color='';},6000);
     return;
    }
@@ -2298,6 +2616,245 @@ window.addEventListener('popstate',function(){
   markHistory();
  }
 });
+
+// ============================================================
+// 收藏夹页逻辑
+// ============================================================
+let favTags=[]; // [{tag, count}]
+let currentFavTag=null;
+
+async function loadFavTags(){
+ try{
+  const r=await fetch('/api/coltags');
+  const d=await r.json();
+  favTags=d.tags||[];
+  renderFavGrid();
+ }catch(e){}
+}
+
+function renderFavGrid(){
+ const grid=document.getElementById('fav-grid');
+ if(!favTags.length){
+  grid.innerHTML='<div class=empty data-l data-zh="还没有收藏标签，点击上方「新建标签」创建" data-en="No tags yet, click New Tag above">还没有收藏标签，点击上方「新建标签」创建</div>';
+  return;
+ }
+ grid.innerHTML=favTags.map(t=>`<div class=fav-card onclick="openFavTag('${esc(t.tag)}')">
+  <button class=del-btn onclick="event.stopPropagation();deleteTag('${esc(t.tag)}')" title="删除">✕</button>
+  <div class=tag-name>${esc(t.tag)}</div>
+  <div class=tag-count>${t.count} ${LANG==='zh'?'幅作品':'works'}</div>
+ </div>`).join('');
+}
+
+async function openFavTag(tag){
+ currentFavTag=tag;
+ document.getElementById('fav-list-header').style.display='none';
+ document.getElementById('fav-detail-header').style.display='flex';
+ document.getElementById('fav-detail-title').textContent=tag;
+ document.getElementById('fav-grid').style.display='none';
+ document.getElementById('fav-works').style.display='block';
+ try{
+  const r=await fetch('/api/coltags/'+encodeURIComponent(tag)+'/works');
+  const d=await r.json();
+  const grid=document.getElementById('fav-works-grid');
+  if(!d.items||!d.items.length){
+   grid.innerHTML='<div class=empty data-l data-zh="该标签下暂无作品" data-en="No works in this tag">该标签下暂无作品</div>';
+   return;
+  }
+  grid.innerHTML=d.items.map(it=>`<div class=card>
+   <a href="https://www.pixiv.net/artworks/${it.id}">
+     <img loading=lazy decoding=async src="/thumb/${it.id}" onerror="this.onerror=null;this.style.visibility='hidden'">
+     <div class=tt>${hlText(it.title, it.hl)}</div>
+     <div class=au>${esc(it.userName)}</div>
+   </a>
+   <div class=tg>🏷 ${esc(tagsOf(it))}</div>
+   <button class="fav-btn in-fav" data-work-id="${it.id}" onclick="event.stopPropagation();toggleFavTag('${it.id}','${esc(tag)}')">${LANG==='zh'?'✓ 已收藏':'✓ In Fav'}</button>
+   <a class=go href="https://www.pixiv.net/artworks/${it.id}">🔗 ${LANG==='zh'?'打开 Pixiv':'Open Pixiv'}</a>
+  </div>`).join('');
+ }catch(e){}
+}
+
+function showFavList(){
+ currentFavTag=null;
+ document.getElementById('fav-list-header').style.display='flex';
+ document.getElementById('fav-detail-header').style.display='none';
+ document.getElementById('fav-grid').style.display='grid';
+ document.getElementById('fav-works').style.display='none';
+ loadFavTags();
+}
+
+async function deleteTag(tag){
+ if(!confirm((LANG==='zh'?'确定删除标签「':'Delete tag "')+tag+(LANG==='zh'?'」？?':'"?')))return;
+ try{
+  const r=await fetch('/api/coltags/'+encodeURIComponent(tag),{method:'DELETE'});
+  const d=await r.json();
+  if(d.ok){ loadFavTags(); }
+  else{ alert(d.error||(LANG==='zh'?'删除失败':'Delete failed')); }
+ }catch(e){ alert(LANG==='zh'?'删除失败':'Delete failed'); }
+}
+
+function showCreateTagModal(){
+ document.getElementById('create-tag-modal').classList.add('show');
+ document.getElementById('new-tag-name').value='';
+ document.getElementById('new-tag-name').focus();
+}
+function closeCreateTagModal(){
+ document.getElementById('create-tag-modal').classList.remove('show');
+}
+async function createTag(){
+ const name=document.getElementById('new-tag-name').value.trim();
+ if(!name)return;
+ try{
+  const r=await fetch('/api/coltags',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+  const d=await r.json();
+  if(d.ok){ closeCreateTagModal(); loadFavTags(); }
+  else{ alert(d.error||(LANG==='zh'?'创建失败':'Create failed')); }
+ }catch(e){ alert(LANG==='zh'?'创建失败':'Create failed'); }
+}
+
+// 加入收藏夹弹窗
+let favPickerWorkId=null;
+async function openFavPicker(workId){
+ favPickerWorkId=workId;
+ if(!favTags.length){ alert(LANG==='zh'?'请先创建收藏标签':'Create a tag first'); return; }
+ renderFavPickerTags();
+ document.getElementById('fav-picker-modal').classList.add('show');
+}
+function closeFavPicker(){
+ document.getElementById('fav-picker-modal').classList.remove('show');
+ favPickerWorkId=null;
+}
+function renderFavPickerTags(){
+ const picker=document.getElementById('fav-picker-tags');
+ picker.innerHTML=favTags.map(t=>`<span class=tag-chip data-tag="${esc(t.tag)}" onclick="toggleFavTag(favPickerWorkId,'${esc(t.tag)}')">${esc(t.tag)} (${t.count})</span>`).join('');
+ updateFavPickerStates();
+}
+async function toggleFavTag(workId,tag){
+ try{
+  const r=await fetch('/api/coltags/'+encodeURIComponent(tag)+'/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({work_id:workId})});
+  const d=await r.json();
+  if(d.ok){
+   // 更新本地 favTags 数量
+   const ft=favTags.find(f=>f.tag===tag);
+   if(ft)ft.count=d.count;
+   renderFavPickerTags();
+   // 如果当前在收藏夹详情页，刷新
+   if(currentFavTag===tag){ openFavTag(tag); }
+   // 如果当前在搜索页，更新按钮状态
+   if(currentPage==='search')updateFavBtnState(workId);
+  }
+ }catch(e){}
+}
+function updateFavBtnStates(){
+ if(!favTags.length)return;
+ document.querySelectorAll('.fav-btn[data-work-id]').forEach(btn=>{
+  const wid=btn.dataset.workId;
+  updateFavBtnState(wid);
+ });
+}
+function updateFavBtnState(workId){
+ const inAny=favTags.some(t=>t._workIds&&t._workIds.has(workId));
+ const btn=document.querySelector('.fav-btn[data-work-id="'+workId+'"]');
+ if(!btn)return;
+ if(inAny){ btn.classList.add('in-fav'); btn.textContent=LANG==='zh'?'✓ 已收藏':'✓ In Fav'; }
+ else{ btn.classList.remove('in-fav'); btn.textContent=LANG==='zh'?'⭐ 加入收藏夹':'⭐ Add to Fav'; }
+}
+function updateFavPickerTags(){
+ // 异步加载每个标签的作品id,用于判断按钮状态(仅在弹窗打开时调用)
+ if(!favTags.length)return;
+ favTags.forEach(async t=>{
+  try{
+   const r=await fetch('/api/coltags/'+encodeURIComponent(t.tag)+'/works');
+   const d=await r.json();
+   t._workIds=new Set(d.items.map(i=>i.id));
+  }catch(e){}
+ });
+}
+
+// ============================================================
+// 设置页逻辑
+// ============================================================
+async function loadSettings(){
+ // 加载代理配置
+ try{
+  const r=await fetch('/api/settings');
+  const d=await r.json();
+  document.getElementById('proxy-input').value=d.proxy||'';
+ }catch(e){}
+ // 加载 cookie 状态
+ try{
+  const r=await fetch('/api/first-run/status');
+  const d=await r.json();
+  const el=document.getElementById('cookie-status');
+  if(d.cookies_exist){
+   el.textContent=(LANG==='zh'?'已登录 uid=':'Logged in uid=')+d.uid+(LANG==='zh'?' , ':' , ')+d.cookie_count+(LANG==='zh'?' 个 cookie':' cookies');
+  }else{
+   el.textContent=LANG==='zh'?'未登录':'Not logged in';
+  }
+ }catch(e){}
+ // 加载数据状态
+ try{
+  const r=await fetch('/api/tags');
+  const d=await r.json();
+  document.getElementById('data-status').textContent=(LANG==='zh'?'共 ':'')+d.total+(LANG==='zh'?' 个作品标签':' work tags');
+ }catch(e){}
+ // 关于
+ try{
+  const r=await fetch('/api/about');
+  const d=await r.json();
+  document.getElementById('about-version').textContent=d.version;
+  document.getElementById('about-link').href=d.github||'https://github.com/Hzm66647/PixivFavSearch';
+ }catch(e){}
+}
+
+async function saveProxy(){
+ const proxy=document.getElementById('proxy-input').value.trim();
+ const status=document.getElementById('proxy-status');
+ try{
+  const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({proxy})});
+  const d=await r.json();
+  if(d.ok){ status.textContent='✓ '+(LANG==='zh'?'已保存':'Saved'); status.className='status'; }
+  else{ status.textContent='✗ '+(d.error||(LANG==='zh'?'保存失败':'Failed')); status.className='status error'; }
+ }catch(e){ status.textContent='✗ Error'; status.className='status error'; }
+ setTimeout(()=>{status.textContent='';},3000);
+}
+
+async function clearCookies(){
+ if(!confirm(LANG==='zh'?'确定清除 cookie 吗？清除后需要重新登录。':'Clear cookies? You will need to re-login.'))return;
+ try{
+  const r=await fetch('/api/settings/clear-cookies',{method:'POST'});
+  const d=await r.json();
+  if(d.ok){ alert(LANG==='zh'?'Cookie 已清除':'Cookies cleared'); loadSettings(); }
+  else{ alert(d.error||(LANG==='zh'?'清除失败':'Failed')); }
+ }catch(e){ alert(LANG==='zh'?'请求失败':'Request failed'); }
+}
+
+async function clearAllData(){
+ if(!confirm(LANG==='zh'?'确定清空所有收藏数据吗？此操作不可恢复！':'Clear all bookmark data? This cannot be undone!'))return;
+ try{
+  const r=await fetch('/api/settings/clear-data',{method:'POST'});
+  const d=await r.json();
+  if(d.ok){ alert(LANG==='zh'?'数据已清空':'Data cleared'); loadSettings(); }
+  else{ alert(d.error||(LANG==='zh'?'操作失败':'Failed')); }
+ }catch(e){ alert(LANG==='zh'?'请求失败':'Request failed'); }
+}
+
+async function checkUpdate(){
+ const status=document.getElementById('update-status');
+ status.textContent=LANG==='zh'?'检查中...':'Checking...';
+ try{
+  const r=await fetch('/api/about');
+  const d=await r.json();
+  if(d.update){
+   status.textContent='✨ v'+d.latest+(LANG==='zh'?' 可用!':' available!');
+   if(confirm((LANG==='zh'?'新版本 v'+d.latest+' 可用，是否前往下载？':'v'+d.latest+' available, open download page?'))){
+    window.open(d.url||'https://github.com/Hzm66647/PixivFavSearch/releases/latest','_blank');
+   }
+  }else{
+   status.textContent=LANG==='zh'?'已是最新版本 ✓':'Up to date ✓';
+  }
+ }catch(e){ status.textContent='✗ Error'; }
+ setTimeout(()=>{status.textContent='';},5000);
+}
 </script>
 """
 

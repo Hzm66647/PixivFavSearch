@@ -12,7 +12,17 @@ APP_DATA = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
 OUT = os.path.join(APP_DATA, "data")
 DATA = os.path.join(OUT, "bookmarks.json")
 COOKIE_FILE = os.path.join(OUT, "cookies.json")
+CONFIG_FILE = os.path.join(APP_DATA, "config.json")
 os.makedirs(OUT, exist_ok=True)
+
+def get_proxy():
+    """从 config.json 读取代理地址, 默认 http://127.0.0.1:10808"""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            config = json.load(open(CONFIG_FILE, "r", encoding="utf-8"))
+            return config.get("proxy", "http://127.0.0.1:10808")
+        except: pass
+    return "http://127.0.0.1:10808"
 
 def _log(tag, msg):
     print(f"[{tag}] {msg}", flush=True)
@@ -191,9 +201,10 @@ def main():
     _log("main", f"Fetching bookmarks for uid {uid}...")
     all_items = []
     
+    proxy_url = get_proxy()
     proxy = urllib.request.ProxyHandler({
-        'http': 'http://127.0.0.1:10808',
-        'https': 'http://127.0.0.1:10808'
+        'http': proxy_url,
+        'https': proxy_url
     })
     opener = urllib.request.build_opener(proxy)
     
