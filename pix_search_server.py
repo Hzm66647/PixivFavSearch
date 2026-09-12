@@ -1256,19 +1256,47 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(500, {"ok": False, "error": "保存 cookie 失败"})
 
         if u.path == "/api/first-run/launch-login":
-            """启动 WebView2 登录窗口"""
+            """导航 WebView2 到登录页（通过 CDP 9223）"""
             try:
-                import subprocess
-                import sys
-                import gui_worker as _gw
-                proc = _gw.launch_login_window()
-                if proc:
-                    log_info(f"首次引导: 已启动 WebView2 登录窗口 PID={proc.pid}")
-                    return self.send_json(200, {"ok": True, "pid": proc.pid})
-                else:
-                    return self.send_json(500, {"ok": False, "error": "启动失败"})
+                import json
+                import http.client
+                import websocket
+                import random
+                
+                # 连接 CDP
+                conn = http.client.HTTPConnection("127.0.0.1", 9223, timeout=3)
+                conn.request("GET", "/json")
+                resp = conn.getresponse()
+                targets = json.loads(resp.read())
+                conn.close()
+                
+                page = next((t for t in targets if t.get("type") == "page"), None)
+                if not page:
+                    return self.send_json(500, {"ok": False, "error": "WebView2 未启动"})
+                
+                ws_url = page.get("webSocketDebuggerUrl")
+                if not ws_url:
+                    return self.send_json(500, {"ok": False, "error": "无法获取 WebView2 WebSocket URL"})
+                
+                ws = websocket.create_connection(ws_url, timeout=10,
+                    http_proxy_host=None, http_proxy_port=None, http_no_proxy=["*"])
+                
+                # 导航到登录页
+                mid = random.randint(1, 999999)
+                ws.send(json.dumps({"id": mid, "method": "Page.navigate", "params": {"url": "https://www.pixiv.net/login.php"}}))
+                
+                # 等待响应
+                while True:
+                    r = json.loads(ws.recv())
+                    if r.get("id") == mid:
+                        break
+                
+                ws.close()
+                log_info("首次引导: 已导航 WebView2 到登录页")
+                return self.send_json(200, {"ok": True})
+                
             except Exception as e:
-                log_error(f"首次引导: 启动登录窗口失败: {e}")
+                log_error(f"首次引导: 导航 WebView2 失败: {e}")
                 return self.send_json(500, {"ok": False, "error": str(e)})
 
         if u.path == "/api/first-run/check":

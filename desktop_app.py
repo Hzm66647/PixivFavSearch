@@ -74,16 +74,6 @@ def _start_webview(url=None):
     _webview_proc.start()
 
 
-def _start_login_window():
-    """启动独立的 WebView2 登录窗口（用于首次引导方式 B）"""
-    try:
-        proc = gui_worker.launch_login_window()
-        return proc
-    except Exception as e:
-        print(f"启动登录窗口失败: {e}")
-        return None
-
-
 # ----------------------------------------------------------------------
 # 托盘回调
 # ----------------------------------------------------------------------
