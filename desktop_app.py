@@ -164,6 +164,7 @@ def main():
     port = server.PORT
     print(f"[OK] 服务已启动: http://127.0.0.1:{port}/  数据目录: {server.OUT}", flush=True)
     print(f"[INFO] 首次使用: {_is_first_run()}")
+    print("[INFO] 正在检查更新（WebView 中 JS 自动检查）...", flush=True)
 
     # 托盘图标
     menu = Menu(
