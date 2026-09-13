@@ -39,7 +39,7 @@ function wallHTML(list){
 
 async function renderWall(){
  try{
-  const p=new URLSearchParams({mode:'pixiv',q:searchQuery});
+  const p=new URLSearchParams({mode:'pixiv',q:searchQuery,tag:tagFilter,coltag:coltagFilter});
   const r=await fetch('/api/search?'+p);
   const d=await r.json();
   works=d.items||[];
@@ -98,7 +98,9 @@ async function openFav(idx){
 
 function togSearch(){
  const p=document.getElementById('search-p');
+ const tb=document.getElementById('tag-bar');
  p.classList.toggle('open');
+ tb.classList.toggle('open');
  if(p.classList.contains('open'))p.querySelector('input').focus();
 }
 
@@ -117,9 +119,50 @@ document.addEventListener('DOMContentLoaded',function(){
 
 async function doImport(){
  const b=document.getElementById('prog');
- b.classList.remove('active');
- b.style.width='0%';
- requestAnimationFrame(()=>{b.classList.add('active')});
+ const islandTxt=document.querySelector('.island-txt');
+ b.classList.add('active');
+ b.textContent='⏳ 正在连接…';
+ if(islandTxt)islandTxt.innerHTML='<b>导入中…</b>';
+ try{
+  const r=await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'pixiv'})});
+  const d=await r.json();
+  if(d.ok && d.started){
+   b.textContent='📥 导入中…';
+   let secs=0;
+   const poll=setInterval(async()=>{
+    secs++;
+    try{
+     const sr=await fetch('/api/import-status');
+     const sd=await sr.json();
+     if(!sd.running){
+      clearInterval(poll);
+      b.classList.remove('active');
+      if(sd.code===0){
+       b.textContent='✅ 共 '+sd.count+' 幅';
+       if(islandTxt)islandTxt.innerHTML='<b>PixivFavSearch</b> · '+sd.count+' 幅';
+       setTimeout(()=>{b.style.width='0%';b.textContent=''},3000);
+       await fetchWorks();renderWall();await fetchFavs();renderFavs();
+      }else{
+       b.textContent='❌ '+(sd.msg||'失败');
+       if(islandTxt)islandTxt.innerHTML='<b>PixivFavSearch</b>';
+       setTimeout(()=>{b.style.width='0%';b.textContent=''},8000);
+      }
+     }else{
+      if(islandTxt)islandTxt.innerHTML='<b>导入中…</b> '+secs+'秒';
+     }
+    }catch(e){clearInterval(poll);b.textContent='❌ 网络错误';}
+   },1000);
+  }else{
+   b.classList.remove('active');
+   b.textContent='❌ '+(d.error||'启动失败');
+   setTimeout(()=>{b.style.width='0%';b.textContent=''},5000);
+  }
+ }catch(e){
+  b.classList.remove('active');
+  b.textContent='❌ 网络错误';
+  setTimeout(()=>{b.style.width='0%';b.textContent=''},5000);
+ }
+});
  try{
   const r=await fetch('/api/import',{method:'POST',body:'{}'});
   const d=await r.json();
@@ -331,3 +374,52 @@ breathingLoop();
 
 renderWall();renderFavs();renderPresets();updateSliders();
 </script>
+let tagFilter='';
+let coltagFilter='';
+async function loadTagFilters(){
+ try{
+  const r=await fetch('/api/tags');
+  const d=await r.json();
+  const bar=document.querySelector('.tag-bar-scroll');
+  if(!bar)return;
+  bar.innerHTML='<span class="tag-pill active" onclick="setTagFilter(\'\',this)">全部</span>';
+  (d.tags||[]).slice(0,20).forEach(t=>{
+   const span=document.createElement('span');
+   span.className='tag-pill';
+   span.textContent=t.tag+' ('+t.count+')';
+   span.onclick=()=>setTagFilter(t.tag,span);
+   bar.appendChild(span);
+  });
+ }catch(e){console.log(e)}
+}
+function setTagFilter(tag,el){
+ tagFilter=tag;
+ document.querySelectorAll('.tag-pill').forEach(p=>p.classList.remove('active'));
+ if(el)el.classList.add('active');
+ renderWall();
+}
+function setColtagFilter(val){
+ coltagFilter=val;
+ renderWall();
+}
+async function loadColtagOptions(){
+ try{
+  const r=await fetch('/api/coltags');
+  const d=await r.json();
+  const sel=document.getElementById('coltag-select');
+  if(!sel)return;
+  sel.innerHTML='<option value="">全部收藏夹</option>';
+  (d.tags||d.data||[]).forEach(t=>{
+   const opt=document.createElement('option');
+   opt.value=t.tag;
+   opt.textContent=t.tag+' ('+t.count+')';
+   sel.appendChild(opt);
+  });
+ }catch(e){console.log(e)}
+}
+function changeBgBrightness(v){
+ document.getElementById('bg-br-val').textContent=v+'%';
+ document.querySelector('.brightness-overlay').style.opacity=(100-v)/100;
+}
+loadTagFilters();loadColtagOptions();
+changeBgBrightness(100);

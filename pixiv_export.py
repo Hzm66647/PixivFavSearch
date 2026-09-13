@@ -253,9 +253,14 @@ def main():
             except urllib.error.HTTPError as e:
                 if e.code == 403:
                     _log("main", f"[{rest}] 403 (private)")
+                    break
+                elif e.code == 409:
+                    _log("main", f"[{rest}] 409 conflict, retrying in 2s...")
+                    time.sleep(2)
+                    continue
                 else:
                     _log("main", f"[{rest}] HTTP {e.code}")
-                break
+                    break
             except Exception as e:
                 _log("main", f"[{rest}] Error: {e}")
                 break

@@ -97,6 +97,34 @@ COLTAGS = os.path.join(OUT, "coltags.json")
 CONFIG_FILE = os.path.join(APP_DATA, "config.json")
 os.makedirs(THUMB, exist_ok=True)
 
+
+# 草稿设置
+_draft_file = os.path.join(APP_DATA, "draft.json")
+def _get_draft_settings():
+    """获取草稿设置"""
+    if os.path.exists(_draft_file):
+        try:
+            with open(_draft_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+def _save_draft_settings(data):
+    """保存草稿设置"""
+    try:
+        os.makedirs(APP_DATA, exist_ok=True)
+        with open(_draft_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"草稿保存失败: {e}")
+def _clear_draft_settings():
+    """清除草稿设置"""
+    try:
+        if os.path.exists(_draft_file):
+            os.remove(_draft_file)
+    except:
+        pass
+
 # --- 配置持久化(config.json) ---
 def load_config():
     """加载配置文件,不存在则返回默认值"""
@@ -350,6 +378,19 @@ def _pub(it, hl=None):
     """输出给前端前清洗内部 _ 索引字段, 附加高亮词列表。"""
     o = {k: v for k, v in it.items() if not k.startswith("_")}
     o["hl"] = hl or []
+    # Pixiv 官方 R18 判断: xRestrict(0=安全,1=R18,2=R18G) + sl(敏感度 0-6)
+    is_r18_xrestrict = it.get("xRestrict", 0) > 0
+    is_r18_sl = it.get("sl", 0) >= 6
+    r18_tags = {"r-18", "r-18g", "r18", "r18g"}
+    tags = [t.strip().lower() if isinstance(t, str) else str(t).strip().lower() for t in it.get("tags") or []]
+    is_r18_tag = any(t in r18_tags for t in tags)
+    o["isR18"] = is_r18_xrestrict or is_r18_sl or is_r18_tag
+    # isMasked: 作品被隐藏/删除
+    img_url = it.get("url", "")
+    is_masked_url = "limit_" in img_url or "common/images/" in img_url or not img_url
+    o["isMasked"] = it.get("isMasked", False) or is_masked_url
+    # 作品链接
+    o["url"] = f"https://www.pixiv.net/artworks/{o['id']}"
     return o
 
 def _seg_query(q_lower):
@@ -816,6 +857,8 @@ def thumb_for(item, lang="zh"):
         url = _fetch_thumb_url_from_api(pid)
         if not url:
             return None
+    # 提升缩略图分辨率 (250x250 → 480x480)
+    url = url.replace("c/250x250_80_a2", "c/480x480_80_a2").replace("custom-thumb", "custom1200x1200")
     # 并发限制: 同时最多 3 个下载, 防止 200 张卡片请求占满服务线程
     with THUMB_SEM:
         # 二次检查(可能在排队期间已下载)
@@ -868,9 +911,14 @@ def _fetch_thumb_url_from_api(pid):
         with opener.open(req, timeout=10) as resp:
             data = json.loads(resp.read())
         body = data.get("body", {})
-        url = (body.get("urls", {}).get("thumb") or 
-               body.get("urls", {}).get("small") or 
-               body.get("urls", {}).get("mini") or "")
+        # 优先使用高清图 (regular > small > thumb)
+        urls = body.get("urls", {})
+        url = (urls.get("regular") or 
+               urls.get("small") or 
+               urls.get("thumb") or 
+               urls.get("mini") or "")
+        # 提升缩略图分辨率
+        url = url.replace("250x250_80_a2", "480x480_80_a2")
         if url and "i.pximg.net" in url:
             _thumb_url_cache[pid] = url
             return url
@@ -1125,6 +1173,11 @@ class H(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(u.query).get("q", [""])[0].strip()
             tagf = urllib.parse.parse_qs(u.query).get("tag", [""])[0].strip().lower()
             colt = urllib.parse.parse_qs(u.query).get("coltag", [""])[0].strip()
+            # 确保中文标签正确解码
+            try:
+                tagf = tagf.encode('latin-1').decode('utf-8') if tagf else ""
+            except:
+                pass
             q_lower = q.lower()
             # 搜索词脱敏: 只记长度不记内容(防隐私泄露到日志)
             log_debug(f"搜索: 关键词长度={len(q)}, 标签={tagf or '-'}, 收藏标签={colt or '-'} | Search: q_len={len(q)}, tag={tagf or '-'}, coltag={colt or '-'}")
@@ -1161,7 +1214,20 @@ class H(BaseHTTPRequestHandler):
             # 按相关度排序(同分保持收藏顺序稳定)
             scored.sort(key=lambda x: (-x[0], x[2].get("id", "")))
             merged += [_pub(it, hl) for _, _, it, hl in scored]
-            self.send_json(200, {"total": len(merged), "items": merged[:200]})
+            # 过滤失效作品（始终过滤）
+            merged = [m for m in merged if not m.get("isMasked")]
+            # 安全模式过滤 R-18（在分页前）
+            safe_param = urllib.parse.parse_qs(u.query).get("safe", ["0"])[0]
+            safe_mode = safe_param in ("1", "true", "on")
+            if safe_mode:
+                merged = [m for m in merged if not m.get("isR18")]
+            log_debug(f"安全模式: {safe_mode}, 过滤后: {len(merged)}")
+            # 分页支持
+            offset = int(urllib.parse.parse_qs(u.query).get("offset", [0])[0])
+            limit = int(urllib.parse.parse_qs(u.query).get("limit", [200])[0])
+            total = len(merged)
+            items = merged[offset:offset+limit]
+            self.send_json(200, {"total": total, "items": items, "offset": offset, "limit": limit})
         elif u.path == "/api/version":
             # 返回当前版本 + 是否有新版本(启动时后台查过 GitHub)
             v = LATEST_VER
@@ -1181,6 +1247,10 @@ class H(BaseHTTPRequestHandler):
             # 返回当前配置(proxy 等)
             cfg = load_config()
             self.send_json(200, {"proxy": cfg.get("proxy", "http://127.0.0.1:10808")})
+        elif u.path == "/api/settings/draft":
+            # 返回草稿设置
+            draft = _get_draft_settings()
+            self.send_json(200, draft)
         elif u.path == "/api/about":
             # 返回版本信息
             v = LATEST_VER
@@ -1566,6 +1636,39 @@ class H(BaseHTTPRequestHandler):
             if save_config(cfg):
                 return self.send_json(200, {"ok": True})
             return self.send_json(500, {"error": "保存配置失败"})
+        if u.path == "/api/settings/draft" and self.command == "GET":
+            # 返回草稿设置
+            draft = _get_draft_settings()
+            return self.send_json(200, draft)
+        if u.path == "/api/settings/draft" and self.command == "POST":
+            # 保存草稿设置 (不立即应用)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                data = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                return self.send_json(400, {"error": "JSON 解析失败"})
+            _save_draft_settings(data)
+            return self.send_json(200, {"ok": True})
+        if u.path == "/api/settings/draft/apply" and self.command == "POST":
+            # 应用草稿设置
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                data = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                return self.send_json(400, {"error": "JSON 解析失败"})
+            cfg = load_config()
+            allowed = {"proxy"}
+            for k in allowed:
+                if k in data:
+                    cfg[k] = data[k]
+            if save_config(cfg):
+                _clear_draft_settings()
+                return self.send_json(200, {"ok": True})
+            return self.send_json(500, {"error": "应用失败"})
+        if u.path == "/api/settings/draft/cancel" and self.command == "POST":
+            # 取消草稿 (不保存)
+            _clear_draft_settings()
+            return self.send_json(200, {"ok": True})
 
         if u.path == "/api/settings/clear-cookies" and self.command == "POST":
             # 清除 cookie
@@ -1854,6 +1957,12 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.06);border-radius:2px}
 ::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.12)}
 
+
+.draft-tip{position:fixed;top:60px;left:50%;transform:translateX(-50%) translateY(-10px);background:var(--accent);color:#fff;padding:8px 16px;border-radius:12px;font-size:12px;font-weight:600;opacity:0;pointer-events:none;transition:all .3s;z-index:99999}
+.draft-tip.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.set-actions{display:flex;gap:8px;justify-content:flex-end}
+.btn-ghost{padding:8px 16px;border-radius:10px;background:rgba(255,255,255,.05);border:1px solid var(--glass-bd);color:var(--txt);font-size:13px;font-weight:600;cursor:pointer;transition:all .3s}
+.btn-ghost:hover{background:rgba(255,255,255,.1)}
 </style>
 </head>
 <body>
@@ -2112,8 +2221,10 @@ setTimeout(function(){checkForUpdates();renderPresets()},1500);
 </body>
 </html>"""
 
-INDEX = r"""<meta charset="UTF-8"><title>PixivFavSearch — 整合版</title>
+INDEX = r"""<meta charset=utf-8>
+<title>PixivFavSearch</title>
 <style>
+
 :root{--bg:#000;--glass:rgba(255,255,255,.07);--glass-bd:rgba(255,255,255,.12);--accent:#c77dff;--accent-g:rgba(199,125,255,.5);--txt:#fff;--sub:rgba(255,255,255,.55);--green:#34c759;--ease-power:cubic-bezier(.16,1,.3,1);--ease-punch:cubic-bezier(.22,1.4,.36,1);--ease-snap:cubic-bezier(.34,1.56,.64,1)}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','PingFang SC',sans-serif;background:var(--bg);color:var(--txt);height:100vh;overflow:hidden;-webkit-font-smoothing:antialiased;transition:background .4s}
@@ -2161,8 +2272,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .progress.active{width:100%;transition:width 8s ease-out}
 
 /* 卡片 */
-.masonry{columns:5;column-gap:16px;padding-top:64px}
-@media(max-width:1400px){.masonry{columns:4}}
+.masonry{columns:4;column-gap:14px;padding-top:64px;max-width:1400px;margin:0 auto}
+@media(max-width:1400px){.masonry{columns:3}}
 @media(max-width:1100px){.masonry{columns:3}}
 @media(max-width:800px){.masonry{columns:2}}
 
@@ -2172,7 +2283,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 
 .card:hover{transform:translateY(-8px) scale(1.04);box-shadow:0 20px 48px rgba(0,0,0,.5),0 0 40px color-mix(in srgb,var(--accent) 15%,transparent),inset 0 1px 0 rgba(255,255,255,.2);border-color:rgba(255,255,255,.25)}
 .card:active{transform:scale(.95);transition-duration:.15s}
-.card-img{width:100%;display:block;transition:transform .45s var(--ease-snap)}
+.card-img{width:100%;display:block;transition:transform .45s var(--ease-snap);object-fit:cover;max-height:280px}
 .card:hover .card-img{transform:scale(1.06)}
 .card-ov{position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,.9) 0%,transparent 50%);opacity:0;transition:opacity .3s;display:flex;flex-direction:column;justify-content:flex-end;padding:16px}
 .card:hover .card-ov{opacity:1}
@@ -2305,6 +2416,30 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 ::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.06);border-radius:2px}
 ::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.12)}
+
+.pagination{display:flex;justify-content:center;align-items:center;gap:8px;padding:16px;margin-top:40px;flex-wrap:wrap}
+.page-btn{padding:8px 16px;border-radius:10px;background:var(--glass);backdrop-filter:blur(20px);border:1px solid var(--glass-bd);color:var(--txt);font-size:13px;font-weight:600;cursor:pointer;transition:all .3s var(--ease-snap)}
+.page-btn:hover{transform:scale(1.08);border-color:var(--accent)}
+.page-btn:active{transform:scale(.92)}
+.page-btn:disabled{opacity:.35;cursor:not-allowed;transform:none}
+.page-info{font-size:13px;color:var(--sub);min-width:80px;text-align:center}
+.page-info b{color:var(--accent)}
+.page-input{width:50px;padding:4px 8px;border-radius:8px;background:rgba(255,255,255,.04);border:1px solid var(--glass-bd);color:var(--txt);font-size:13px;text-align:center;outline:none}
+.page-input:focus{border-color:var(--accent)}
+.bg-br-row{padding:8px 0}
+.bg-br-bar{-webkit-appearance:none;width:100%;height:5px;border-radius:3px;background:rgba(255,255,255,.08);outline:none}
+.bg-br-bar::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+.brightness-overlay{position:fixed;inset:0;background:#000;pointer-events:none;z-index:1;opacity:0;transition:opacity .3s}
+.tag-bar{position:fixed;top:140px;left:50%;transform:translateX(-50%);width:min(600px,92vw);display:flex;align-items:center;gap:10px;z-index:185;opacity:0;pointer-events:none;transition:all .4s var(--ease-power)}
+.tag-bar.open{opacity:1;pointer-events:all}
+.tag-bar-scroll{flex:1;display:flex;gap:8px;overflow-x:auto;padding:8px 0;scrollbar-width:none}
+.tag-bar-scroll::-webkit-scrollbar{display:none}
+.tag-pill{padding:6px 14px;border-radius:16px;background:var(--glass);backdrop-filter:blur(20px);border:1px solid var(--glass-bd);font-size:12px;color:var(--sub);cursor:pointer;white-space:nowrap;transition:all .3s var(--ease-snap)}
+.tag-pill:hover{border-color:var(--accent);color:var(--txt);transform:scale(1.05)}
+.tag-pill.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.tag-bar-select select{padding:6px 12px;border-radius:12px;background:var(--glass);backdrop-filter:blur(20px);border:1px solid var(--glass-bd);color:var(--txt);font-size:12px;outline:none;cursor:pointer}
+.tag-bar-select select option{background:#1a1a2e;color:var(--txt)}
+
 </style>
 <div class="safe-dot" id="safe-dot"><span class="dot"></span>安全模式</div>
 <div class="progress" id="prog"></div>
@@ -2325,7 +2460,17 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 </nav>
 
 <main class="main">
-  <div class="page active" id="pg-search"><div class="masonry" id="wall"></div></div>
+  <div class="page active" id="pg-search"><div class="masonry" id="wall"></div>
+<!-- 分页 -->
+<div class="pagination" id="pagination">
+  <button class="page-btn" id="page-first" onclick="goPage(0)">⏮</button>
+  <button class="page-btn" id="page-prev" onclick="goPage(currentPage-1)">◀</button>
+  <input type="number" class="page-input" id="page-input" value="1" min="1" onchange="goPage(parseInt(this.value)-1)">
+  <span class="page-info">/ <b id="page-total">1</b> 页</span>
+  <button class="page-btn" id="page-next" onclick="goPage(currentPage+1)">▶</button>
+  <button class="page-btn" id="page-last" onclick="goPage(totalPages-1)">⏭</button>
+</div>
+</div>
   <div class="page" id="pg-fav">
     <div class="fav-top"><h2>⭐ 收藏夹</h2><button class="fav-add" onclick="newFolder()">+ 新建</button></div>
     <div class="fav-grid" id="fav-grid"></div>
@@ -2376,6 +2521,20 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 
 <!-- 搜索面板 -->
 <div class="search-float" id="search-p"><span style="font-size:18px">🔍</span><input placeholder="搜索标题、作者、标签..."></div>
+<!-- 标签过滤栏 -->
+<div class="tag-bar" id="tag-bar">
+  <div class="tag-bar-scroll">
+    <span class="tag-pill active" onclick="setTagFilter('',this)">全部</span>
+  </div>
+  <div class="tag-bar-select">
+    <select id="coltag-select" onchange="setColtagFilter(this.value)">
+      <option value="">全部收藏夹</option>
+    </select>
+  </div>
+</div>
+<!-- 亮度遮罩 -->
+<div class="brightness-overlay" id="brightness-overlay"></div>
+
 
 <!-- 标签弹窗 -->
 <div class="modal-bg" id="tag-modal">
@@ -2399,6 +2558,8 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
     <div style="margin-top:12px"><div class="custom-row"><div class="color-picker"><input type="color" id="pick-accent" value="#c77dff" onchange="applyAccent(this.value)"></div><input class="set-input" id="txt-accent" value="#c77dff" onchange="applyAccent(this.value)" style="flex:1"></div></div>
     <div style="margin-top:8px"><div class="custom-row"><div class="color-picker"><input type="color" id="pick-bg" value="#000000" onchange="applyBg(this.value)"></div><input class="set-input" id="txt-bg" value="#000000" onchange="applyBg(this.value)" style="flex:1"></div></div>
     <div class="bg-preview" id="bg-preview" onclick="document.getElementById('bg-file').click()"><span class="bg-txt">📷 点击导入图片</span><button class="bg-rm" onclick="event.stopPropagation();rmBg()">✕</button></div>
+   <div class="theme-sec"><h4>🔆 屏幕亮度 <span class="val-tag" id="bg-br-val">100%</span></h4><div class="slider-row"><input type="range" min="20" max="100" value="100" class="bg-br-bar" id="bg-br-slider" oninput="changeBgBrightness(this.value)"></div></div>
+
     <input type="file" id="bg-file" accept="image/*" style="display:none" onchange="handleBg(this)">
   </div>
 
@@ -2453,48 +2614,130 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 
   <div style="display:flex;gap:10px;margin-top:14px">
     <button class="btn" style="flex:1" onclick="resetAll()">恢复默认</button>
-    <button class="btn btn-primary" style="flex:1" onclick="saveAll()">保存</button>
+    <div id="draft-tip" class="draft-tip">草稿已保存</div>
+  <div class="set-actions">
+   <button class="btn btn-ghost" onclick="cancelDraft()">取消</button>
+   <button class="btn btn-primary" onclick="applyDraft()">应用</button>
+  </div>
   </div>
 </div>
 
+
+<style>
+@keyframes rippleExpand{from{transform:scale(0);opacity:1}to{transform:scale(3);opacity:0}}
+@keyframes breathe{0%,100%{box-shadow:0 0 0 rgba(199,125,255,0)}50%{box-shadow:0 0 25px rgba(199,125,255,.5)}}
+</style>
 <script>
-let W=[];let F=[];
-async function fetchWorks(){
-  try{
-    const r=await fetch('/api/search?mode=pixiv&q='+encodeURIComponent(searchQuery||'')+'&tag='+encodeURIComponent(tagFilter)+'&coltag='+encodeURIComponent(coltagFilter));
-    const d=await r.json();
-    W=d.results||[];
-  }catch(e){console.log('fetchWorks error',e)}
-}
-
-async function fetchFavs(){
-  try{
-    const r=await fetch('/api/coltags');
-    const d=await r.json();
-    F=d.data||d||[];
-  }catch(e){console.log('fetchFavs error',e)}
-}
-
-
+let works=[];
+let folders=[];
 let safe=true;
+let searchQuery='';
+let tagFilter='';
+let coltagFilter='';
+let currentPage=0;
+let pageSize=200;
+let totalPages=0;
+let totalItems=0;
 
 const fxState={lightTrail:true,magnetic:true,tilt3d:true,ripple:true,breathing:true,particles:true,aurora:true,waves:true,grid:false,nebula:false,contour:false};
 const fxIntensity={lightTrail:60,magnetic:50,tilt3d:70,ripple:80,breathing:50,particles:60,aurora:50,waves:40};
 
-// 冲突规则
 const conflicts=[
- {effects:['tilt3d','magnetic'],msg:'3D倾斜与磁吸按钮冲突：按钮位置会被倾斜覆盖，导致磁吸失效'},
- {effects:['tilt3d','ripple'],msg:'3D倾斜与波纹点击冲突：点击坐标计算偏移，波纹位置不准确'},
- {effects:['particles','nebula'],msg:'粒子场与星云雾冲突：大量透明层叠加可能导致卡顿'},
- {effects:['aurora','waves'],msg:'极光流体与波浪层冲突：波形叠加可能导致视觉混乱'},
+ {effects:['tilt3d','magnetic'],msg:'3D倾斜与磁吸按钮冲突'},
+ {effects:['tilt3d','ripple'],msg:'3D倾斜与波纹点击冲突'},
+ {effects:['particles','nebula'],msg:'粒子场与星云雾冲突'},
+ {effects:['aurora','waves'],msg:'极光流体与波浪层冲突'}
 ];
 
-function wallHTML(list){return list.map(w=>`<div class="card" data-id="${w.id}" onclick="openWork(${w.id})"><div class="card-img" style="height:${w.h}px;background:linear-gradient(135deg,${w.color},${w.color}dd)"></div><div class="card-ov"><div class="card-tt">${w.title}</div><div class="card-au">${w.author}</div><div class="card-act"><button class="card-btn" onclick="event.stopPropagation();showTags(${w.id})">⭐</button><button class="card-btn" onclick="event.stopPropagation();this.classList.toggle('liked')">❤️</button><button class="card-btn" onclick="event.stopPropagation()">🔗</button></div></div></div>`).join('')}
+function colorHash(id){
+ let h=0;const s=String(id);
+ for(let i=0;i<s.length;i++){h=s.charCodeAt(i)+((h<<5)-h);}
+ return 'hsl('+(Math.abs(h)%360)+', 60%, 50%)';
+}
 
-async function renderWall(){await fetchWorks();
-async function renderFavs(){await fetchFavs();
+function openWork(id){
+ window.open('https://www.pixiv.net/artworks/'+id,'_blank');
+}
 
-// 丝滑页面切换
+function workCard(w){
+ const c=colorHash(w.id);
+ const thumbUrl='/thumb/'+w.id;
+ const author=w.userName||'Unknown';
+ const title=w.title||'Untitled';
+ return '<div class="card" data-id="'+w.id+'" onclick="openWork(\''+w.id+'\')">'+
+ '<img class="card-img" src="'+thumbUrl+'" loading="lazy" style="width:100%;max-height:280px;object-fit:cover;background:'+c+';min-height:80px" onerror="this.onerror=null;this.style.background=\'linear-gradient(135deg,'+c+','+c+'dd)\';this.parentElement.style.minHeight=\'80px\'">'+
+ '<div class="card-ov"><div class="card-tt">'+title+'</div><div class="card-au">'+author+'</div>'+
+ '<div class="card-act"><button class="card-btn" onclick="event.stopPropagation();showTags(\''+w.id+'\')">⭐</button>'+
+ '<button class="card-btn" onclick="event.stopPropagation();this.classList.toggle(\'liked\')">❤️</button>'+
+ '<button class="card-btn" onclick="event.stopPropagation();openWork(\''+w.id+'\')">🔗</button></div></div></div>';
+}
+
+function wallHTML(list){
+ let filtered = list.filter(w=>!w.isMasked);
+ if(safe) filtered = filtered.filter(w=>!w.isR18);
+ return filtered.map(w=>workCard(w)).join('');
+}
+
+async function fetchWorks(){
+ try{
+  const p=new URLSearchParams({mode:'pixiv',q:searchQuery,tag:tagFilter,coltag:coltagFilter,offset:currentPage*pageSize,limit:pageSize,safe: safe ? '1' : '0'});
+  const r=await fetch('/api/search?'+p);
+  const d=await r.json();
+  works=d.items||[];
+  totalItems=d.total||0;
+  totalPages=Math.max(1,Math.ceil(totalItems/pageSize));
+  updatePagination();
+ }catch(e){console.log('fetchWorks error',e)}
+}
+
+async function fetchFavs(){
+ try{
+  const r=await fetch('/api/coltags');
+  const d=await r.json();
+  folders=(d.tags||d.data||[]).map(t=>({name:t.tag,count:t.count,color:colorHash(t.tag)}));
+ }catch(e){console.log('fetchFavs error',e)}
+}
+
+function updatePagination(){
+ const totalEl=document.getElementById('page-total');
+ const inputEl=document.getElementById('page-input');
+ const firstBtn=document.getElementById('page-first');
+ const prevBtn=document.getElementById('page-prev');
+ const nextBtn=document.getElementById('page-next');
+ const lastBtn=document.getElementById('page-last');
+ if(totalEl)totalEl.textContent=totalPages;
+ if(inputEl)inputEl.value=currentPage+1;
+ if(firstBtn)firstBtn.disabled=currentPage<=0;
+ if(prevBtn)prevBtn.disabled=currentPage<=0;
+ if(nextBtn)nextBtn.disabled=currentPage>=totalPages-1;
+ if(lastBtn)lastBtn.disabled=currentPage>=totalPages-1;
+}
+
+function goPage(page){
+ if(page<0)page=0;
+ if(page>=totalPages)page=totalPages-1;
+ currentPage=page;
+ renderWall();
+}
+
+async function renderWall(){
+ try{
+  await fetchWorks();
+  document.getElementById('wall').innerHTML=wallHTML(works);
+ }catch(e){
+  document.getElementById('wall').innerHTML='<div style="padding:40px;color:var(--sub)">加载失败</div>';
+ }
+}
+
+async function renderFavs(){
+ try{
+  await fetchFavs();
+  document.getElementById('fav-grid').innerHTML=folders.map((f,i)=>'<div class="fav-card" onclick="openFav('+i+')"><div class="fav-card-bg" style="background:linear-gradient(135deg,'+f.color+','+f.color+'88)"></div><div class="fav-card-info"><div class="fav-card-name">'+f.name+'</div><div class="fav-card-count">'+f.count+' 幅</div></div></div>').join('');
+ }catch(e){
+  document.getElementById('fav-grid').innerHTML='<div style="padding:40px;color:var(--sub)">加载失败</div>';
+ }
+}
+
 let pageTransitioning=false;
 function go(targetPage){
  if(pageTransitioning)return;
@@ -2505,123 +2748,383 @@ function go(targetPage){
  cur.classList.remove('active');
  cur.classList.add('exit');
  next.classList.add('active');
- // 更新侧边栏选中状态
  document.querySelectorAll('.sb-item').forEach((s,i)=>{
   const isActive=(targetPage==='search'&&i===0)||((targetPage==='fav'||targetPage==='inner')&&i===1)||(targetPage==='settings'&&i===2);
-  s.classList.toggle('active',isActive);
+  if(s.classList.contains('active')!==isActive){
+   s.classList.toggle('active');
+   if(isActive){
+    s.style.animation='none';
+    void s.offsetWidth;
+    s.style.animation='sbPop .5s var(--ease-punch)';
+   }
+  }
  });
  setTimeout(()=>{cur.classList.remove('exit');pageTransitioning=false},400);
- // 渲染内容
- if(targetPage==='search')await fetchWorks();renderWall();
+ if(targetPage==='search'){currentPage=0;renderWall();}
  else if(targetPage==='fav')renderFavs();
- else if(targetPage==='inner'){
-  const fi=window.currentFavIdx;
-  const f=F[fi];document.getElementById('inner-title').textContent=f.name;
-  document.getElementById('inner-wall').innerHTML=wallHTML(f.works.map(i=>W[i]));
+ else if(targetPage==='inner')openFav(window.currentFavIdx);
+}
+
+async function openFav(idx){
+ window.currentFavIdx=idx;
+ const f=folders[idx];
+ if(!f)return;
+ document.getElementById('inner-title').textContent=f.name;
+ try{
+  const r=await fetch('/api/coltags/'+encodeURIComponent(f.name)+'/works');
+  const d=await r.json();
+  const items=d.items||[];
+  document.getElementById('inner-wall').innerHTML=wallHTML(items);
+ }catch(e){
+  document.getElementById('inner-wall').innerHTML='<div style="padding:40px;color:var(--sub)">加载失败</div>';
+ }
+ go('inner');
+}
+
+function togSearch(){
+ const p=document.getElementById('search-p');
+ const tb=document.getElementById('tag-bar');
+ p.classList.toggle('open');
+ tb.classList.toggle('open');
+ if(p.classList.contains('open'))p.querySelector('input').focus();
+}
+
+document.addEventListener('DOMContentLoaded',function(){
+ const input=document.querySelector('.search-float input');
+ if(input){
+  input.addEventListener('input',function(){
+   searchQuery=this.value.trim();
+   renderWall();
+  });
+  input.addEventListener('keydown',function(e){
+   if(e.key==='Enter'){searchQuery=this.value.trim();renderWall();}
+  });
+ }
+});
+
+document.addEventListener('mouseup',e=>{
+ if(e.button===3||e.button===4){
+  goBack();
+ }
+});
+
+let mouseGestureStart=null;
+document.addEventListener('mousedown',e=>{
+ if(e.button===2)mouseGestureStart={x:e.clientX,y:e.clientY};
+});
+
+document.addEventListener('mousemove',e=>{
+ if(!mouseGestureStart)return;
+ const dx=e.clientX-mouseGestureStart.x;
+ const dy=e.clientY-mouseGestureStart.y;
+ if(Math.sqrt(dx*dx+dy*dy)>80){
+  goBack();
+  mouseGestureStart=null;
+ }
+});
+
+document.addEventListener('mouseup',e=>{
+ if(e.button===2)mouseGestureStart=null;
+});
+
+document.addEventListener('contextmenu',e=>e.preventDefault());
+
+document.addEventListener('keydown',e=>{
+ if(e.key==='Escape')goBack();
+});
+
+function goBack(){
+ const cur=document.querySelector('.page.active');
+ if(cur&&cur.id==='pg-fav-inner'){go('fav');return;}
+ if(cur&&(cur.id==='pg-fav'||cur.id==='pg-settings')){go('search');return;}
+ if(cur&&cur.id==='pg-search'&&currentPage>0){goPage(0);return;}
+ const searchP=document.getElementById('search-p');
+ if(searchP&&searchP.classList.contains('open')){togSearch();}
+}
+
+async function doImport(){
+ const b=document.getElementById('prog');
+ const islandTxt=document.querySelector('.island-txt');
+ b.classList.add('active');
+ b.textContent='⏳ 正在连接…';
+ if(islandTxt)islandTxt.innerHTML='<b>导入中…</b>';
+ try{
+  const r=await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'pixiv'})});
+  const d=await r.json();
+  if(d.ok && d.started){
+   b.textContent='📥 导入中…';
+   let secs=0;
+   const poll=setInterval(async()=>{
+    secs++;
+    try{
+     const sr=await fetch('/api/import-status');
+     const sd=await sr.json();
+     if(!sd.running){
+      clearInterval(poll);
+      b.classList.remove('active');
+      if(sd.code===0){
+       b.textContent='✅ 共 '+sd.count+' 幅';
+       if(islandTxt)islandTxt.innerHTML='<b>PixivFavSearch</b> · '+sd.count+' 幅';
+       setTimeout(()=>{b.style.width='0%';b.textContent=''},3000);
+       await fetchWorks();renderWall();await fetchFavs();renderFavs();
+      }else{
+       b.textContent='❌ '+(sd.msg||'失败');
+       if(islandTxt)islandTxt.innerHTML='<b>PixivFavSearch</b>';
+       setTimeout(()=>{b.style.width='0%';b.textContent=''},8000);
+      }
+     }else{
+      if(islandTxt)islandTxt.innerHTML='<b>导入中…</b> '+secs+'秒';
+     }
+    }catch(e){clearInterval(poll);b.textContent='❌ 网络错误';}
+   },1000);
+  }else{
+   b.classList.remove('active');
+   b.textContent='❌ '+(d.error||'启动失败');
+   setTimeout(()=>{b.style.width='0%';b.textContent=''},5000);
+  }
+ }catch(e){
+  b.classList.remove('active');
+  b.textContent='❌ 网络错误';
+  setTimeout(()=>{b.style.width='0%';b.textContent=''},5000);
  }
 }
-async function openFav(idx){
-  const f=F[idx];
-  if(!f)return;
-  go('inner');
-  try{
-    const r=await fetch('/api/coltags/'+encodeURIComponent(f.name)+'/works');
-    const d=await r.json();
-    W=d.results||[];
-    renderWall();
-  }catch(e){console.log('openFav error',e)}
+
+function showTags(id){document.getElementById('tag-modal').classList.add('open');}
+document.getElementById('tag-modal').addEventListener('click',function(e){if(e.target===this)this.classList.remove('open')});
+
+function togSafe(){
+ safe=!safe;
+ document.getElementById('safe-tog').classList.toggle('on',safe);
+ document.getElementById('safe-dot').classList.toggle('on',safe);
+ currentPage=0;
+ renderWall();
 }
 
-function togSearch(){const p=document.getElementById('search-p');p.classList.toggle('open');if(p.classList.toggle('open'))p.querySelector('input').focus()}
-async function doImport(){
-  const b=document.getElementById('prog');
-  b.classList.add('active');
-  b.textContent='导入中…';
-  try{
-    const r=await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'pixiv'})});
-    const d=await r.json();
-    if(d.ok){
-      const interval=setInterval(async()=>{
-        const sr=await fetch('/api/import-status');
-        const sd=await sr.json();
-        if(sd.phase==='done'||sd.phase==='error'||!sd.active){
-          clearInterval(interval);
-          b.classList.remove('active');
-          b.textContent=d.started?'导入已启动':'导入失败';
-          if(d.started){setTimeout(()=>{b.style.width='0%';b.textContent=''},3000);}
-          await fetchWorks();
-          renderWall();
-        }
-      },1000);
-    }else{
-      b.classList.remove('active');
-      b.textContent='导入失败：'+(d.error||'未知错误');
-    }
-  }catch(e){
-    b.classList.remove('active');
-    b.textContent='网络错误';
-  }
+function newFolder(){
+ const n=prompt('收藏夹名称：');
+ if(n){folders.push({name:n,count:0,color:colorHash(n)});renderFavs();}
 }
-function showTags(){document.getElementById('tag-modal').classList.add('open')}
-document.getElementById('tag-modal').addEventListener('click',function(e){if(e.target===this)this.classList.remove('open')})
-function togSafe(){safe=!safe;document.getElementById('safe-tog').classList.toggle('on',safe);document.getElementById('safe-dot').classList.toggle('on',safe);renderWall()}
-function newFolder(){const n=prompt('收藏夹名称：');if(n)F.push({name:n,count:0,color:'#'+Math.floor(Math.random()*16777215).toString(16).padStart(6,'0'),works:[]});renderFavs()}
-function togTheme(){document.getElementById('theme-panel').classList.toggle('open')}
 
-// 主题
-function renderPresets(){document.getElementById('preset-themes').innerHTML=[{n:'紫梦',a:'#c77dff',b:'#000'},{n:'深海',a:'#4a90d9',b:'#000814'},{n:'森林',a:'#27ae60',b:'#0a1a10'},{n:'樱粉',a:'#e91e63',b:'#1a0810'},{n:'暖橙',a:'#f39c12',b:'#1a1008'},{n:'烈焰',a:'#e74c3c',b:'#1a0808'},{n:'青色',a:'#1abc9c',b:'#081a18'},{n:'靛蓝',a:'#3f51b5',b:'#0a0e28'},{n:'玫瑰',a:'#ff6b6b',b:'#1a0a0a'},{n:'薄荷',a:'#10b981',b:'#061a14'},{n:'葡萄',a:'#8b5cf6',b:'#0e0820'},{n:'柠檬',a:'#eab308',b:'#1a1606'}].map(t=>`<div class="color-swatch" style="background:${t.a}" onclick="applyTheme('${t.a}','${t.b}')" title="${t.n}"></div>`).join('')}
-function applyTheme(a,b){document.documentElement.style.setProperty('--accent',a);document.documentElement.style.setProperty('--accent-g',a+'80');document.documentElement.style.setProperty('--bg',b);document.getElementById('pick-accent').value=a;document.getElementById('txt-accent').value=a;document.getElementById('pick-bg').value=b;document.getElementById('txt-bg').value=b;document.body.style.backgroundColor=b}
-function applyAccent(v){if(/^#[0-9a-fA-F]{6}$/.test(v)){document.documentElement.style.setProperty('--accent',v);document.documentElement.style.setProperty('--accent-g',v+'80');document.getElementById('pick-accent').value=v}}
-function applyBg(v){if(/^#[0-9a-fA-F]{6}$/.test(v)){document.documentElement.style.setProperty('--bg',v);document.body.style.backgroundColor=v;document.getElementById('pick-bg').value=v}}
-function handleBg(input){if(input.files&&input.files[0]){const r=new FileReader();r.onload=function(e){const p=document.getElementById('bg-preview');p.classList.add('has-img');p.innerHTML=`<img src="${e.target.result}"><button class="bg-rm" onclick="event.stopPropagation();rmBg()">✕</button>`;document.body.style.backgroundImage=`url(${e.target.result})`;document.body.style.backgroundSize='cover'};r.readAsDataURL(input.files[0])}}
-function rmBg(){const p=document.getElementById('bg-preview');p.classList.remove('has-img');p.innerHTML=`<span class="bg-txt">📷 点击导入图片</span><button class="bg-rm" onclick="event.stopPropagation();rmBg()">✕</button>`;document.body.style.backgroundImage=''}
+function togTheme(){document.getElementById('theme-panel').classList.toggle('open');}
 
-// 弹动力度
-function changeBounce(v){document.getElementById('bounce-val').textContent=v+'%';const y2=(1+v/100*0.8).toFixed(2);document.documentElement.style.setProperty('--ease-bounce',`cubic-bezier(.22,${y2},.36,1)`)}
+function renderPresets(){
+ const presets=[
+  {n:'紫梦',a:'#c77dff',b:'#000'},{n:'深海',a:'#4a90d9',b:'#000814'},
+  {n:'森林',a:'#27ae60',b:'#0a1a10'},{n:'樱粉',a:'#e91e63',b:'#1a0810'},
+  {n:'暖橙',a:'#f39c12',b:'#1a1008'},{n:'烈焰',a:'#e74c3c',b:'#1a0808'},
+  {n:'青色',a:'#1abc9c',b:'#081a18'},{n:'靛蓝',a:'#3f51b5',b:'#0a0e28'},
+  {n:'玫瑰',a:'#ff6b6b',b:'#1a0a0a'},{n:'薄荷',a:'#10b981',b:'#061a14'},
+  {n:'葡萄',a:'#8b5cf6',b:'#0e0820'},{n:'柠檬',a:'#eab308',b:'#1a1606'}
+ ];
+ document.getElementById('preset-themes').innerHTML=presets.map(t=>'<div class="color-swatch" style="background:'+t.a+'" onclick="applyTheme(\''+t.a+'\',\''+t.b+'\')" title="'+t.n+'"></div>').join('');
+}
 
-// 效果开关
-function toggleFx(el){el.classList.toggle('on');fxState[el.dataset.fx]=el.classList.contains('on');checkConflicts();updateSliders()}
+function applyTheme(a,b){
+ document.documentElement.style.setProperty('--accent',a);
+ document.documentElement.style.setProperty('--accent-g',a+'80');
+ document.documentElement.style.setProperty('--bg',b);
+ document.getElementById('pick-accent').value=a;
+ document.getElementById('txt-accent').value=a;
+ document.getElementById('pick-bg').value=b;
+ document.getElementById('txt-bg').value=b;
+ document.body.style.backgroundColor=b;
+}
+
+function applyAccent(v){if(/^#[0-9a-fA-F]{6}$/.test(v)){document.documentElement.style.setProperty('--accent',v);document.documentElement.style.setProperty('--accent-g',v+'80');document.getElementById('pick-accent').value=v;}}
+function applyBg(v){if(/^#[0-9a-fA-F]{6}$/.test(v)){document.documentElement.style.setProperty('--bg',v);document.body.style.backgroundColor=v;document.getElementById('pick-bg').value=v;}}
+
+function handleBg(input){
+ if(input.files&&input.files[0]){
+  const r=new FileReader();
+  r.onload=function(e){
+   const p=document.getElementById('bg-preview');
+   p.classList.add('has-img');
+   p.innerHTML='<img src="'+e.target.result+'"><button class="bg-rm" onclick="event.stopPropagation();rmBg()">✕</button>';
+   document.body.style.backgroundImage='url('+e.target.result+')';
+   document.body.style.backgroundSize='cover';
+  };
+  r.readAsDataURL(input.files[0]);
+ }
+}
+
+function rmBg(){
+ const p=document.getElementById('bg-preview');
+ p.classList.remove('has-img');
+ p.innerHTML='<span class="bg-txt">📷 点击导入图片</span><button class="bg-rm" onclick="event.stopPropagation();rmBg()">✕</button>';
+ document.body.style.backgroundImage='';
+}
+
+function changeBounce(v){
+ document.getElementById('bounce-val').textContent=v+'%';
+ const y2=(1+v/100*0.8).toFixed(2);
+ document.documentElement.style.setProperty('--ease-bounce','cubic-bezier(.22,'+y2+',.36,1)');
+}
+
+function toggleFx(el){
+ el.classList.toggle('on');
+ fxState[el.dataset.fx]=el.classList.contains('on');
+ checkConflicts();
+ updateSliders();
+}
+
 function updateSliders(){
  ['lightTrail','magnetic','tilt3d','ripple','breathing','particles','aurora','waves'].forEach(fx=>{
   const slider=document.getElementById(fx+'-slider');
   const val=document.getElementById(fx+'-val');
-  if(slider&&val){slider.disabled=!fxState[fx];slider.parentElement.style.opacity=fxState[fx]?'1':'.4';val.textContent=slider.value+'%';
-   slider.oninput=()=>{val.textContent=slider.value+'%';fxIntensity[fx]=parseInt(slider.value)}}
- })
+  if(slider&&val){
+   slider.disabled=!fxState[fx];
+   slider.parentElement.style.opacity=fxState[fx]?'1':'.4';
+   val.textContent=slider.value+'%';
+   slider.oninput=()=>{val.textContent=slider.value+'%';fxIntensity[fx]=parseInt(slider.value);};
+  }
+ });
 }
-function checkConflicts(){
- const warn=document.getElementById('conflict-warn');const txt=document.getElementById('conflict-text');
- for(const c of conflicts){
-  if(c.effects.every(e=>fxState[e])){warn.classList.add('show');txt.textContent=c.msg;return}
- }
- warn.classList.remove('show')}
-function resetAll(){applyTheme('#c77dff','#000');rmBg();document.getElementById('bounce-slider').value=100;changeBounce(100);document.querySelectorAll('.fx-tog').forEach(t=>{t.classList.add('on');fxState[t.dataset.fx]=true});checkConflicts();updateSliders();document.getElementById('lightTrail-slider').value=60;document.getElementById('magnetic-slider').value=50;document.getElementById('tilt3d-slider').value=70;document.getElementById('ripple-slider').value=80;document.getElementById('breathing-slider').value=50;document.getElementById('particles-slider').value=60;document.getElementById('aurora-slider').value=50;document.getElementById('waves-slider').value=40;updateSliders()}
-function saveAll(){const b=event.target;b.textContent='已保存 ✓';b.style.background='#27ae60';setTimeout(()=>{b.textContent='保存';b.style.background=''},1500)}
 
-// 光影追踪
+function checkConflicts(){
+ const warn=document.getElementById('conflict-warn');
+ const txt=document.getElementById('conflict-text');
+ for(const c of conflicts){
+  if(c.effects.every(e=>fxState[e])){warn.classList.add('show');txt.textContent=c.msg;return;}
+ }
+ warn.classList.remove('show');
+}
+
+function resetAll(){
+ applyTheme('#c77dff','#000');
+ rmBg();
+ document.getElementById('bounce-slider').value=100;
+ changeBounce(100);
+ document.querySelectorAll('.fx-tog').forEach(t=>{t.classList.add('on');fxState[t.dataset.fx]=true;});
+ checkConflicts();
+ updateSliders();
+}
+
+function saveAll(){
+ const b=event.target;
+ b.textContent='已保存 ✓';
+ b.style.background='#27ae60';
+ setTimeout(()=>{b.textContent='保存';b.style.background='';},1500);
+}
+
+// 草稿设置系统
+let draftSettings={};
+async function loadDraft(){
+ try{
+  const r=await fetch('/api/settings/draft');
+  draftSettings=await r.json();
+  if(draftSettings.proxy)document.getElementById('set-proxy').value=draftSettings.proxy;
+ }catch(e){console.log('loadDraft error',e)}
+}
+function onProxyChange(v){
+ draftSettings.proxy=v;
+ // 自动保存草稿
+ fetch('/api/settings/draft',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(draftSettings)});
+ showDraftTip('草稿已保存');
+}
+let draftTipTimer;
+function showDraftTip(text){
+ const tip=document.getElementById('draft-tip');
+ if(!tip)return;
+ tip.textContent=text;
+ tip.classList.add('show');
+ clearTimeout(draftTipTimer);
+ draftTipTimer=setTimeout(()=>tip.classList.remove('show'),2000);
+}
+async function applyDraft(){
+ try{
+  await fetch('/api/settings/draft/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(draftSettings)});
+  showDraftTip('设置已应用');
+ }catch(e){showDraftTip('应用失败');}
+}
+async function cancelDraft(){
+ try{
+  await fetch('/api/settings/draft/cancel',{method:'POST'});
+  loadDraft();
+  showDraftTip('已取消');
+ }catch(e){showDraftTip('取消失败');}
+}
+
+function loadTagFilters(){
+ try{
+  fetch('/api/tags').then(r=>r.json()).then(d=>{
+   const bar=document.querySelector('.tag-bar-scroll');
+   if(!bar)return;
+   bar.innerHTML='<span class="tag-pill active" onclick="setTagFilter(\'\',this)">全部</span>';
+   (d.tags||[]).slice(0,20).forEach(t=>{
+    const span=document.createElement('span');
+    span.className='tag-pill';
+    span.textContent=t.tag+' ('+t.count+')';
+    span.onclick=()=>setTagFilter(t.tag,span);
+    bar.appendChild(span);
+   });
+  });
+ }catch(e){console.log(e)}
+}
+
+function setTagFilter(tag,el){
+ tagFilter=tag;
+ document.querySelectorAll('.tag-pill').forEach(p=>p.classList.remove('active'));
+ if(el)el.classList.add('active');
+ currentPage=0;
+ renderWall();
+}
+
+function setColtagFilter(val){
+ coltagFilter=val;
+ currentPage=0;
+ renderWall();
+}
+
+function loadColtagOptions(){
+ try{
+  fetch('/api/coltags').then(r=>r.json()).then(d=>{
+   const sel=document.getElementById('coltag-select');
+   if(!sel)return;
+   sel.innerHTML='<option value="">全部收藏夹</option>';
+   (d.tags||d.data||[]).forEach(t=>{
+    const opt=document.createElement('option');
+    opt.value=t.tag;
+    opt.textContent=t.tag+' ('+t.count+')';
+    sel.appendChild(opt);
+   });
+  });
+ }catch(e){console.log(e)}
+}
+
+function changeBgBrightness(v){
+ document.getElementById('bg-br-val').textContent=v+'%';
+ document.querySelector('.brightness-overlay').style.opacity=(100-v)/100;
+}
+
 document.addEventListener('mousemove',e=>{
  if(!fxState.lightTrail)return;
  const intensity=fxIntensity.lightTrail/100;
  document.querySelectorAll('.card').forEach(card=>{
-  const r=card.getBoundingClientRect();const cx=r.left+r.width/2;const cy=r.top+r.height/2;
+  const r=card.getBoundingClientRect();
+  const cx=r.left+r.width/2;const cy=r.top+r.height/2;
   const dx=e.clientX-cx;const dy=e.clientY-cy;const dist=Math.sqrt(dx*dx+dy*dy);
-  if(dist<200){card.style.boxShadow=`0 ${-dy*0.05}px ${30-dist*0.1}px rgba(199,125,255,${0.3*(1-dist/200)*intensity})`}
-  else{card.style.boxShadow=''}
+  if(dist<200){card.style.boxShadow='0 '+(-dy*0.05)+'px '+(30-dist*0.1)+'px rgba(199,125,255,'+(0.3*(1-dist/200)*intensity)+')';}
+  else{card.style.boxShadow='';}
  });
 });
 
-// 磁吸按钮
 document.addEventListener('mousemove',e=>{
  if(!fxState.magnetic)return;
  const strength=fxIntensity.magnetic/100;
  document.querySelectorAll('.card').forEach(card=>{
-  const r=card.getBoundingClientRect();const cx=r.left+r.width/2;const cy=r.top+r.height/2;
+  const r=card.getBoundingClientRect();
+  const cx=r.left+r.width/2;const cy=r.top+r.height/2;
   const dx=e.clientX-cx;const dy=e.clientY-cy;const dist=Math.sqrt(dx*dx+dy*dy);
-  if(dist<120){const force=(120-dist)/120*8*strength;card.querySelectorAll('.card-btn').forEach((btn,i)=>{const angle=(i-1)*0.3;btn.style.transform=`translate(${Math.cos(angle)*force}px,${Math.sin(angle)*force+force*0.5}px)`})}
+  if(dist<120){
+   const force=(120-dist)/120*8*strength;
+   card.querySelectorAll('.card-btn').forEach((btn,i)=>{
+    const angle=(i-1)*0.3;
+    btn.style.transform='translate('+Math.cos(angle)*force+'px,'+(Math.sin(angle)*force+force*0.5)+'px)';
+   });
+  }
  });
 });
 
-// 3D 倾斜
 document.addEventListener('mousemove',e=>{
  if(!fxState.tilt3d)return;
  const maxAngle=fxIntensity.tilt3d/100*8;
@@ -2629,33 +3132,41 @@ document.addEventListener('mousemove',e=>{
   const r=card.getBoundingClientRect();
   if(e.clientX>r.left&&e.clientX<r.right&&e.clientY>r.top&&e.clientY<r.bottom){
    const px=(e.clientX-r.left)/r.width-0.5;const py=(e.clientY-r.top)/r.height-0.5;
-   card.style.transform=`perspective(800px) rotateY(${px*maxAngle}deg) rotateX(${-py*maxAngle}deg) translateY(-8px) scale(1.03)`;
+   card.style.transform='perspective(800px) rotateY('+(px*maxAngle)+'deg) rotateX('+(-py*maxAngle)+'deg) translateY(-8px) scale(1.03)';
   }
  });
 });
 
-// 波纹点击
 document.addEventListener('click',e=>{
  if(!fxState.ripple)return;
- const size=fxIntensity.ripple/100;
  const ripple=document.createElement('div');
- ripple.style.cssText=`position:fixed;left:${e.clientX-20}px;top:${e.clientY-20}px;width:40px;height:40px;border-radius:50%;background:radial-gradient(circle,rgba(199,125,255,.4),transparent);pointer-events:none;z-index:9999;animation:rippleExpand .6s ease-out forwards`;
- document.body.appendChild(ripple);setTimeout(()=>ripple.remove(),600);
+ ripple.style.cssText='position:fixed;left:'+(e.clientX-20)+'px;top:'+(e.clientY-20)+'px;width:40px;height:40px;border-radius:50%;background:radial-gradient(circle,rgba(199,125,255,.4),transparent);pointer-events:none;z-index:9999;animation:rippleExpand .6s ease-out forwards';
+ document.body.appendChild(ripple);
+ setTimeout(()=>ripple.remove(),600);
 });
 
-// 呼吸脉冲
 let lastMove=Date.now();
 document.addEventListener('mousemove',()=>lastMove=Date.now());
 function breathingLoop(){
- if(fxState.breathing&&Date.now()-lastMove>3000){const btn=document.querySelectorAll('.island-btn')[2];if(btn)btn.style.animation='breathe 2s ease-in-out infinite'}
- else{const btn=document.querySelectorAll('.island-btn')[2];if(btn)btn.style.animation=''}
- requestAnimationFrame(breathingLoop)}breathingLoop();
+ if(fxState.breathing&&Date.now()-lastMove>3000){
+  const btn=document.querySelectorAll('.island-btn')[2];if(btn)btn.style.animation='breathe 2s ease-in-out infinite';
+ }else{
+  const btn=document.querySelectorAll('.island-btn')[2];if(btn)btn.style.animation='';
+ }
+ requestAnimationFrame(breathingLoop);
+}
+breathingLoop();
 
-await fetchWorks();renderWall();await fetchFavs();renderFavs();renderPresets();updateSliders();
+renderWall();renderFavs();renderPresets();updateSliders();
+loadDraft();
+loadTagFilters();loadColtagOptions();
+changeBgBrightness(100);
+
 </script>
 <style>
 @keyframes rippleExpand{from{transform:scale(0);opacity:1}to{transform:scale(3);opacity:0}}
 @keyframes breathe{0%,100%{box-shadow:0 0 0 rgba(199,125,255,0)}50%{box-shadow:0 0 25px rgba(199,125,255,.5)}}
+
 </style>"""
 
 # --- 可复用的启动/停止函数(供 desktop_app 导入调用) ---

@@ -1,0 +1,102 @@
+print("=== 修复标签栏 z-index + 导入按钮 ===")
+
+with open('C:\\temp\\Hermes\\PixivFavSearch\\pix_search_server.py', 'r', encoding='utf-8') as f:
+    content = f.read()
+
+# 修复1: 标签栏 z-index 提到搜索框上面（180→190），并放到搜索框下方
+content = content.replace(
+    '.tag-bar{position:fixed;top:64px;left:50%;transform:translateX(-50%);width:min(600px,92vw);display:flex;align-items:center;gap:10px;z-index:170;',
+    '.tag-bar{position:fixed;top:140px;left:50%;transform:translateX(-50%);width:min(600px,92vw);display:flex;align-items:center;gap:10px;z-index:185;'
+)
+
+# 修复2: 替换整个 doImport 函数
+old_doImport = r'''async function doImport(){
+ const b=document.getElementById('prog');
+ b.classList.remove('active');
+ b.style.width='0%';
+ requestAnimationFrame(()=>{b.classList.add('active')});
+ try{
+  const r=await fetch('/api/import',{method:'POST',body:'{}'});
+  const d=await r.json();
+  if(d.ok){
+   const poll=setInterval(async()=>{
+    try{
+     const sr=await fetch('/api/import-status');
+     const sd=await sr.json();
+     if(!sd.running){
+      clearInterval(poll);
+      b.classList.remove('active');
+      b.style.width='0%';
+      if(sd.code===0){await fetchWorks();renderWall();await fetchFavs();renderFavs();}
+     }
+    }catch(e){clearInterval(poll);}
+   },2000);
+  }
+ }catch(e){
+  b.classList.remove('active');
+  b.style.width='0%';
+ }
+}'''
+
+new_doImport = '''async function doImport(){
+ const b=document.getElementById('prog');
+ const islandTxt=document.querySelector('.island-txt');
+ b.classList.add('active');
+ b.textContent='⏳ 正在连接…';
+ if(islandTxt)islandTxt.innerHTML='<b>导入中…</b>';
+ try{
+  const r=await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'pixiv'})});
+  const d=await r.json();
+  if(d.ok && d.started){
+   b.textContent='📥 导入中…';
+   let secs=0;
+   const poll=setInterval(async()=>{
+    secs++;
+    try{
+     const sr=await fetch('/api/import-status');
+     const sd=await sr.json();
+     if(!sd.running){
+      clearInterval(poll);
+      b.classList.remove('active');
+      if(sd.code===0){
+       b.textContent='✅ 共 '+sd.count+' 幅';
+       if(islandTxt)islandTxt.innerHTML='<b>PixivFavSearch</b> · '+sd.count+' 幅';
+       setTimeout(()=>{b.style.width='0%';b.textContent=''},3000);
+       await fetchWorks();renderWall();await fetchFavs();renderFavs();
+      }else{
+       b.textContent='❌ '+(sd.msg||'失败');
+       if(islandTxt)islandTxt.innerHTML='<b>PixivFavSearch</b>';
+       setTimeout(()=>{b.style.width='0%';b.textContent=''},8000);
+      }
+     }else{
+      if(islandTxt)islandTxt.innerHTML='<b>导入中…</b> '+secs+'秒';
+     }
+    }catch(e){clearInterval(poll);b.textContent='❌ 网络错误';}
+   },1000);
+  }else{
+   b.classList.remove('active');
+   b.textContent='❌ '+(d.error||'启动失败');
+   setTimeout(()=>{b.style.width='0%';b.textContent=''},5000);
+  }
+ }catch(e){
+  b.classList.remove('active');
+  b.textContent='❌ 网络错误';
+  setTimeout(()=>{b.style.width='0%';b.textContent=''},5000);
+ }
+}'''
+
+if old_doImport in content:
+    content = content.replace(old_doImport, new_doImport)
+    print("doImport 替换成功")
+else:
+    print("旧 doImport 未找到，尝试正则")
+    import re
+    old_re = re.search(r'async function doImport\(\)\{.*?^}', content, re.DOTALL | re.MULTILINE)
+    if old_re:
+        content = content[:old_re.start()] + new_doImport + content[old_re.end():]
+        print("doImport 正则替换成功")
+
+with open('C:\\temp\\Hermes\\PixivFavSearch\\pix_search_server.py', 'w', encoding='utf-8') as f:
+    f.write(content)
+
+print("✅ 修复完成")
