@@ -2370,7 +2370,7 @@ INDEX = r"""<!doctype html><html lang=zh><meta charset=utf-8><title>PixivFavSear
 </div>
 <div id=meta></div><div id=grid class=grid></div>
 <div id=demo-bar data-l data-zh="🎨 当前为效果预览，导入收藏后即可正常使用" data-en="🎨 Preview mode - import your bookmarks to use" style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:60;background:rgba(18,18,32,.78);backdrop-filter:blur(8px);color:#fff;font-size:13px;font-weight:600;padding:10px 20px;border-radius:22px;box-shadow:0 6px 18px rgba(0,0,0,.4);pointer-events:none;white-space:nowrap;max-width:92vw;text-align:center">🎨 当前为效果预览，导入收藏后即可正常使用</div>
-<div id=import-tip style="display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:59;background:rgba(40,40,80,.85);backdrop-filter:blur(8px);color:#fff;font-size:12px;padding:8px 16px;border-radius:18px;box-shadow:0 4px 12px rgba(0,0,0,.3);pointer-events:none;white-space:nowrap;max-width:92vw;text-align:center" data-l data-zh="💡 首次导入需在 WebView2 中登录一次 Pixiv，之后自动保存登录态" data-en="💡 First import requires logging into Pixiv in WebView2, login persists afterwards">💡 首次导入需在 WebView2 中登录一次 Pixiv，之后自动保存登录态</div>
+
 <button id=home-btn title="回到本站主页" data-l-t data-zh-t="回到本站主页" data-en-t="Back to homepage" onclick="location.href='/'"><svg viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'><path d='M3 10.5L12 3l9 7.5'/><path d='M5 9.5V21h14V9.5'/></svg><span class=ttip data-l data-zh="🏠 回到本站" data-en="🏠 Home">🏠 回到本站</span></button>
  </div><!-- /page-search -->
 
