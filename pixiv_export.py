@@ -261,6 +261,15 @@ def main():
                 else:
                     _log("main", f"[{rest}] HTTP {e.code}")
                     break
+            except urllib.error.URLError as e:
+                # SSL 错误处理（如 EOF occurred）
+                err_str = str(e)
+                if "UNEXPECTED_EOF_WHILE_READING" in err_str or "EOF occurred" in err_str:
+                    _log("main", f"[{rest}] SSL EOF error, retrying in 3s... ({err_str[:50]})")
+                    time.sleep(3)
+                    continue
+                _log("main", f"[{rest}] URLError: {e}")
+                break
             except Exception as e:
                 _log("main", f"[{rest}] Error: {e}")
                 break
@@ -272,7 +281,83 @@ def main():
     json.dump(all_items, open(DATA, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     _log("main", f"=== Done: {len(all_items)} bookmarks ===")
     print(f"OK: {len(all_items)} bookmarks imported")
+    
+    # 抓取收藏标签
+    try:
+        _fetch_bookmark_tags(uid, cookie_header, proxy, opener)
+    except Exception as e:
+        _log("main", f"抓取标签失败: {e}")
+    
     return 0
+
+def _fetch_bookmark_tags(uid, cookie_header, proxy, opener):
+    """抓取用户收藏标签并保存到 coltags.json"""
+    COLTAGS = os.path.join(OUT, "coltags.json")
+    
+    # 1. 获取标签列表
+    url = f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks/tags?lang=zh"
+    req = urllib.request.Request(url, headers={
+        "Cookie": cookie_header,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.pixiv.net/",
+        "Accept": "application/json",
+    })
+    with opener.open(req, timeout=30) as resp:
+        d = json.loads(resp.read())
+    
+    if d.get("error"):
+        _log("main", f"标签 API 错误: {d.get('message')}")
+        return
+    
+    tags = d.get("body", [])
+    if not tags:
+        _log("main", "无收藏标签")
+        return
+    
+    _log("main", f"发现 {len(tags)} 个收藏标签")
+    
+    # 2. 抓取每个标签下的作品 ID
+    result = {}
+    for tag_info in tags:
+        tag_name = tag_info.get("tag", "")
+        if not tag_name:
+            continue
+        
+        ids = set()
+        offset = 0
+        while True:
+            url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
+                   f"?tag={urllib.parse.quote(tag_name)}&offset={offset}&limit=48&rest=show&order=desc&mode=all&lang=zh")
+            req = urllib.request.Request(url, headers={
+                "Cookie": cookie_header,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://www.pixiv.net/",
+                "Accept": "application/json",
+            })
+            try:
+                with opener.open(req, timeout=30) as resp:
+                    d = json.loads(resp.read())
+                if d.get("error"):
+                    break
+                works = (d.get("body") or {}).get("works") or []
+                if not works:
+                    break
+                for w in works:
+                    ids.add(str(w.get("id", "")))
+                if len(works) < 48:
+                    break
+                offset += len(works)
+                time.sleep(0.3)
+            except Exception as e:
+                _log("main", f"抓取标签 {tag_name} 失败: {e}")
+                break
+        
+        result[tag_name] = list(ids)
+        _log("main", f"  {tag_name}: {len(ids)} 幅")
+    
+    # 3. 保存
+    json.dump(result, open(COLTAGS, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    _log("main", f"收藏标签已保存: {COLTAGS}")
 
 if __name__ == "__main__":
     sys.exit(main())
