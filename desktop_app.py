@@ -75,6 +75,24 @@ def _is_first_run():
 # ----------------------------------------------------------------------
 # GUI 子进程
 # ----------------------------------------------------------------------
+_ext_win_procs = []  # 外部链接窗口(pixiv 作品页等), 关掉即回主应用
+
+def open_external_window(url):
+    """在独立 WebView2 窗口打开外部链接(如 pixiv 作品页)。
+    供 pix_search_server 的 /api/open-work 调用 —— 前端点卡片链接时
+    不再弹系统浏览器(回不来), 而是开应用内窗口, 关掉即回主应用。"""
+    try:
+        p = multiprocessing.Process(target=gui_worker.start, args=(url, url.split("/")[2][:40]), daemon=True)
+        p.start()
+        _ext_win_procs.append(p)
+        # 清理已退出的
+        for q in list(_ext_win_procs):
+            if not q.is_alive():
+                _ext_win_procs.remove(q)
+        return True
+    except Exception:
+        return False
+
 def _start_webview(url=None):
     """启动 WebView2 窗口"""
     global _webview_proc
@@ -199,6 +217,23 @@ def _make_tray_image():
 # ----------------------------------------------------------------------
 def main():
     global _tray_icon
+    
+    # ---- 全新机器环境自检(首跑无数据时) ----
+    # WebView2 Runtime 缺失 → 弹窗引导安装; 其余环境问题记日志不拦启动
+    try:
+        import check_deps
+        if _is_first_run():
+            ok_wv, ver = check_deps.check_webview2()
+            if not ok_wv:
+                check_deps.install_webview2()   # 弹窗引导, 用户装完重启 exe
+                return                          # 没 WebView2 开窗必失败, 直接退出
+            if not check_deps.check_windows():
+                print("[WARN] Windows 版本过低(需 Win10 1809+), 部分功能可能异常", flush=True)
+            if not check_deps.check_proxy():
+                print("[WARN] 未检测到系统代理, pixiv 访问可能失败(建议开启 v2rayN/Clash)", flush=True)
+            print(f"[OK] 环境自检通过: WebView2 {ver}", flush=True)
+    except Exception as e:
+        print(f"[WARN] 环境自检异常(不拦截启动): {e}", flush=True)
     
     # 加载配置
     _load_draft()

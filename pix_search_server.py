@@ -902,7 +902,10 @@ def thumb_for(item, lang="zh"):
         if not url:
             return None
     # 提升缩略图分辨率 (250x250 → 480x480)
-    url = url.replace("c/250x250_80_a2", "c/480x480_80_a2").replace("custom-thumb", "custom1200x1200")
+    url = url.replace("c/250x250_80_a2", "c/600x600").replace("custom-thumb", "custom-thumb")
+    # 注: 旧代码把 custom-thumb 替换成 custom1200x1200 且用 480x480_80_a2 尺寸,
+    #     这两个变体实测全部 403(custom-thumb 目录下只有 600x600/1200x1200 可用)。
+    #     下载失败时回退原始 250x250 URL(永远有效)。
     # 并发限制: 同时最多 3 个下载, 防止 200 张卡片请求占满服务线程
     with THUMB_SEM:
         # 二次检查(可能在排队期间已下载)
@@ -923,11 +926,25 @@ def thumb_for(item, lang="zh"):
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), NoRedirect)
             else:
                 opener = urllib.request.build_opener(NoRedirect)
-            with opener.open(req, timeout=12) as r, open(local, "wb") as f:
-                data = r.read(5 * 1024 * 1024 + 1)
-                if len(data) > 5 * 1024 * 1024:
-                    return None
-                f.write(data)
+            try:
+                with opener.open(req, timeout=12) as r, open(local, "wb") as f:
+                    data = r.read(5 * 1024 * 1024 + 1)
+                    if len(data) > 5 * 1024 * 1024:
+                        return None
+                    f.write(data)
+            except urllib.error.HTTPError:
+                # 600x600 失败(如老图无此尺寸) → 回退原始 250x250 URL 再试一次
+                orig_url = (item.get("url", "") or "").replace("custom-thumb", "custom-thumb")
+                if orig_url and orig_url != url:
+                    req2 = urllib.request.Request(orig_url, headers={
+                        "Referer": "https://www.pixiv.net/",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
+                    })
+                    with opener.open(req2, timeout=12) as r, open(local, "wb") as f:
+                        data = r.read(5 * 1024 * 1024 + 1)
+                        if len(data) > 5 * 1024 * 1024:
+                            return None
+                        f.write(data)
             return local if os.path.getsize(local) > 500 else None
         except Exception as e:
             if not hasattr(thumb_for, '_err_logged'):
@@ -1217,6 +1234,13 @@ class H(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(u.query).get("q", [""])[0].strip()
             tagf = urllib.parse.parse_qs(u.query).get("tag", [""])[0].strip().lower()
             colt = urllib.parse.parse_qs(u.query).get("coltag", [""])[0].strip()
+            # 统计面板专用筛选参数(精确匹配, 不走模糊搜索):
+            #   author=作者名 / year=年份 / tag2=标签(与 tag 等价但不受 latin-1 转码影响)
+            f_author = urllib.parse.parse_qs(u.query).get("author", [""])[0].strip()
+            f_year = urllib.parse.parse_qs(u.query).get("year", [""])[0].strip()
+            f_tag2 = urllib.parse.parse_qs(u.query).get("tag2", [""])[0].strip()
+            if f_tag2:
+                tagf = f_tag2.lower()
             # 确保中文标签正确解码
             try:
                 tagf = tagf.encode('latin-1').decode('utf-8') if tagf else ""
@@ -1291,6 +1315,11 @@ class H(BaseHTTPRequestHandler):
             for it in BOOKMARKS:
                 # 限定收藏标签(coltag):作品必须属于该收藏标签
                 if coltag_ids is not None and str(it.get("id")) not in coltag_ids:
+                    continue
+                # 统计面板专用精确筛选: 作者/年份(不走模糊评分, 直接匹配)
+                if f_author and (it.get("userName") or "") != f_author:
+                    continue
+                if f_year and not ((it.get("createDate") or "").startswith(f_year)):
                     continue
                 # 限定作品标签过滤:作品的所有标签中要有一个等于 tagf
                 tagset = { (t.get("tag") if isinstance(t, dict) else str(t)).lower() for t in (it.get("tags") or []) }
@@ -1651,7 +1680,6 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/first-run/launch-login":
             """导航 WebView2 到登录页（通过 CDP 9223）"""
             try:
-                import json
                 import http.client
                 import websocket
                 import random
@@ -1703,6 +1731,28 @@ class H(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             return self.send_json(200, {"ok": True, "ready": False})
+
+        if u.path == "/api/open-work":
+            """前端跳转 pixiv: 通知 desktop_app 开新 WebView 窗口(关掉即回主应用)。
+            纯浏览器模式(8897 直开)没有 desktop_app, 前端会兜底 window.open。"""
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                data = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                return self.send_json(400, {"ok": False, "error": "bad json"})
+            url = data.get("url", "")
+            # 只允许 pixiv 域名(防开放跳转)
+            if not url.startswith("https://www.pixiv.net/"):
+                return self.send_json(400, {"ok": False, "error": "domain"})
+            opened = False
+            try:
+                import desktop_app as _da
+                if hasattr(_da, "open_external_window"):
+                    _da.open_external_window(url)
+                    opened = True
+            except Exception:
+                pass
+            return self.send_json(200, {"ok": True, "opened": opened})
 
         if u.path == "/api/import":
             # 从 Pixiv 抓取最新收藏(CDP)。启动导入线程, 返回是否已启动
@@ -2470,27 +2520,39 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .search-float input::placeholder{color:var(--sub)}
 
 /* 统计面板 */
-.stats-overview{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:22px}
-.stats-kpi{flex:1;min-width:130px;background:var(--glass);backdrop-filter:blur(30px);border:1px solid var(--glass-bd);border-radius:18px;padding:18px 20px;text-align:center}
-.stats-kpi .v{font-size:28px;font-weight:700;color:var(--txt)}
-.stats-kpi .l{font-size:12px;color:var(--sub);margin-top:4px}
-.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
-.stats-card{background:var(--glass);backdrop-filter:blur(30px);border:1px solid var(--glass-bd);border-radius:20px;padding:20px}
-.stats-card h3{font-size:15px;color:var(--txt);margin-bottom:14px}
-.stats-bars{display:flex;align-items:flex-end;gap:6px;height:140px;padding-top:10px}
-.stats-bar-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0}
-.stats-bar{width:100%;max-width:42px;border-radius:8px 8px 3px 3px;background:linear-gradient(180deg,var(--accent),#7c5cff88);transition:height .8s var(--ease-punch);cursor:pointer}
-.stats-bar:hover{filter:brightness(1.25)}
-.stats-bar-y{font-size:10px;color:var(--sub)}
-.stats-bar-n{font-size:10px;color:var(--txt)}
-.stats-list .srow{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:10px;cursor:pointer;transition:background .15s}
-.stats-list .srow:hover{background:rgba(255,255,255,.1)}
-.stats-list .rank{width:22px;font-size:12px;color:var(--sub);text-align:right}
+.stats-overview{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:20px}
+.stats-kpi{background:var(--glass);backdrop-filter:blur(30px);border:1px solid var(--glass-bd);border-radius:20px;padding:20px 16px;text-align:center;position:relative;overflow:hidden;transition:transform .3s var(--ease-punch)}
+.stats-kpi:hover{transform:translateY(-3px)}
+.stats-kpi::after{content:'';position:absolute;inset:0;background:linear-gradient(135deg,transparent 40%,rgba(255,255,255,.06));pointer-events:none}
+.stats-kpi .v{font-size:30px;font-weight:800;color:var(--txt);letter-spacing:-.5px}
+.stats-kpi .l{font-size:12px;color:var(--sub);margin-top:6px;font-weight:500}
+.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.stats-card{background:var(--glass);backdrop-filter:blur(30px);border:1px solid var(--glass-bd);border-radius:22px;padding:22px}
+.stats-card h3{font-size:14px;color:var(--txt);margin-bottom:16px;display:flex;align-items:center;gap:8px;font-weight:600}
+.stats-card h3::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--glass-bd),transparent)}
+.stats-card.wide{grid-column:1 / -1}
+/* 年度柱状图 */
+.stats-bars{display:flex;align-items:flex-end;gap:8px;height:150px;padding:12px 4px 0}
+.stats-bar-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0;cursor:pointer}
+.stats-bar-col:hover .stats-bar{filter:brightness(1.3)}
+.stats-bar-col:hover .stats-bar-y{color:var(--txt)}
+.stats-bar{width:100%;max-width:44px;border-radius:8px 8px 3px 3px;background:linear-gradient(180deg,var(--accent),transparent 160%);transition:height .8s var(--ease-punch),filter .2s}
+.stats-bar-y{font-size:10px;color:var(--sub);letter-spacing:.5px}
+.stats-bar-n{font-size:10px;color:var(--sub);font-weight:600}
+/* 作者排行 */
+.stats-list{display:flex;flex-direction:column;gap:2px}
+.stats-list .srow{display:flex;align-items:center;gap:12px;padding:8px 12px;border-radius:12px;cursor:pointer;transition:background .15s,transform .15s}
+.stats-list .srow:hover{background:rgba(255,255,255,.09);transform:translateX(4px)}
+.stats-list .rank{width:24px;font-size:11px;color:var(--sub);text-align:center;font-weight:700;flex-shrink:0}
+.stats-list .srow:nth-child(1) .rank{color:#ffd700}
+.stats-list .srow:nth-child(2) .rank{color:#c0c0c0}
+.stats-list .srow:nth-child(3) .rank{color:#cd7f32}
 .stats-list .nm{flex:1;font-size:13px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.stats-list .ct{font-size:12px;color:var(--sub)}
-.stats-tags{display:flex;flex-wrap:wrap;gap:8px;align-content:flex-start}
-.stats-tag{padding:6px 12px;border-radius:14px;background:rgba(255,255,255,.08);color:var(--txt);cursor:pointer;transition:all .2s var(--ease-punch)}
-.stats-tag:hover{background:var(--accent);color:#fff;transform:scale(1.08)}
+.stats-list .ct{font-size:11px;color:var(--sub);background:rgba(255,255,255,.07);padding:2px 8px;border-radius:8px;flex-shrink:0}
+/* 标签云 */
+.stats-tags{display:flex;flex-wrap:wrap;gap:10px 12px;align-content:flex-start;padding:4px 0}
+.stats-tag{padding:7px 14px;border-radius:16px;background:rgba(255,255,255,.07);border:1px solid transparent;color:var(--txt);cursor:pointer;transition:all .25s var(--ease-punch);font-weight:500}
+.stats-tag:hover{background:var(--accent);border-color:var(--accent);color:#fff;transform:scale(1.1) translateY(-2px);box-shadow:0 8px 20px var(--accent-g)}
 
 /* 图片查看器 */
 .viewer{position:fixed;inset:0;z-index:900;display:none;align-items:center;justify-content:center}
@@ -2748,16 +2810,16 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
     <h2 style="margin-bottom:18px">📊 收藏统计</h2>
     <div class="stats-overview" id="stats-overview"></div>
     <div class="stats-grid">
-      <div class="stats-card">
-        <h3>📈 年度趋势</h3>
+      <div class="stats-card wide">
+        <h3>📈 年度收藏趋势 <span style="font-weight:400;color:var(--sub);font-size:11px;margin-left:auto">点击柱子筛选该年份</span></h3>
         <div class="stats-bars" id="stats-years"></div>
       </div>
       <div class="stats-card">
-        <h3>🥇 作者排行 Top 15</h3>
+        <h3>🥇 作者排行 <span style="font-weight:400;color:var(--sub);font-size:11px;margin-left:auto">点击查看该作者</span></h3>
         <div class="stats-list" id="stats-authors"></div>
       </div>
       <div class="stats-card">
-        <h3>🏷️ 热门标签 Top 30</h3>
+        <h3>🏷️ 热门标签 <span style="font-weight:400;color:var(--sub);font-size:11px;margin-left:auto">点击筛选该标签</span></h3>
         <div class="stats-tags" id="stats-tags"></div>
       </div>
     </div>
@@ -2916,12 +2978,9 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 
   <div style="display:flex;gap:10px;margin-top:14px">
     <button class="btn" style="flex:1" onclick="resetAll()">恢复默认</button>
-    <div id="draft-tip" class="draft-tip">草稿已保存</div>
-  <div class="set-actions">
-   <button class="btn btn-ghost" onclick="cancelDraft()">取消</button>
-   <button class="btn btn-primary" onclick="applyDraft()">应用</button>
+    <button class="btn btn-primary" style="flex:1" onclick="saveAll()">保存</button>
   </div>
-  </div>
+  <div id="draft-tip" class="draft-tip"></div>
 </div>
 
 
@@ -2937,6 +2996,7 @@ let searchQuery='';
 let tagFilter='';
 let coltagFilter='';
 let sortMode='relevance';
+let statsFilter=null;   // 统计面板跳转的精确筛选 {type:'author'|'year'|'tag', val:...}
 let currentPage=0;
 let pageSize=200;
 let totalPages=0;
@@ -2959,7 +3019,15 @@ function colorHash(id){
 }
 
 function openWork(id){
- window.open('https://www.pixiv.net/artworks/'+id,'_blank');
+ // 在应用内新 WebView 窗口打开 pixiv(不是系统浏览器)
+ // window.open 在 WebView2 里会开系统浏览器, 用户回不来;
+ // 改走后端 API → desktop_app 开新 WebView 窗口, 关掉即回主应用
+ window._workWinOpened=false;
+ fetch('/api/open-work',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:'https://www.pixiv.net/artworks/'+id})})
+  .then(r=>r.json()).then(d=>{if(d&&d.opened)window._workWinOpened=true;})
+  .catch(()=>{});
+ // 兜底: API 不可用/纯浏览器模式时退回 window.open
+ setTimeout(()=>{if(!window._workWinOpened)window.open('https://www.pixiv.net/artworks/'+id,'_blank');},600);
 }
 
 function workCard(w){
@@ -2984,6 +3052,8 @@ function wallHTML(list){
 async function fetchWorks(){
  try{
   const p=new URLSearchParams({mode:'pixiv',q:searchQuery,tag:tagFilter,coltag:coltagFilter,sort:sortMode,offset:currentPage*pageSize,limit:pageSize,safe: safe ? '1' : '0'});
+  // 统计面板专用筛选参数
+  if(statsFilter){p.set(statsFilter.type,statsFilter.val);}
   const r=await fetch('/api/search?'+p);
   const d=await r.json();
   works=d.items||[];
@@ -3078,47 +3148,57 @@ async function renderStats(){
    statsCache=await r.json();
   }
   const d=statsCache;
+  // KPI 行
   const ov=document.getElementById('stats-overview');
   if(ov)ov.innerHTML=
    `<div class="stats-kpi"><div class="v">${d.total.toLocaleString()}</div><div class="l">📚 总收藏</div></div>`+
    `<div class="stats-kpi"><div class="v">${d.safe.toLocaleString()}</div><div class="l">🛡️ 安全作品</div></div>`+
    `<div class="stats-kpi"><div class="v">${d.r18.toLocaleString()}</div><div class="l">🔥 R-18</div></div>`+
    `<div class="stats-kpi"><div class="v">${d.masked.toLocaleString()}</div><div class="l">👻 已失效</div></div>`;
-  // 年度趋势柱状图(点击柱子→搜索该年份)
+  // 年度趋势(点击→按年份精确筛选)
   const yrs=document.getElementById('stats-years');
   if(yrs&&d.by_year.length){
    const mx=Math.max(...d.by_year.map(y=>y.count));
    yrs.innerHTML=d.by_year.map(y=>
-    `<div class="stats-bar-col" title="${y.year}: ${y.count} 幅" onclick="searchFromStats('${y.year}')">`+
+    `<div class="stats-bar-col" title="${y.year}年: ${y.count} 幅" onclick="filterFromStats('year','${y.year}')">`+
     `<div class="stats-bar-n">${y.count}</div>`+
     `<div class="stats-bar" style="height:${Math.max(6,Math.round(y.count/mx*100))}%"></div>`+
     `<div class="stats-bar-y">${y.year.slice(2)}</div></div>`).join('');
   }
-  // 作者排行(点击→搜索作者)
+  // 作者排行(点击→按作者精确筛选)
   const aus=document.getElementById('stats-authors');
   if(aus&&d.top_authors.length){
-   aus.innerHTML=d.top_authors.slice(0,15).map((a,i)=>
-    `<div class="srow" onclick="searchFromStats('${a.name.replace(/'/g,"\\\\'")}')">`+
-    `<span class="rank">${i+1}</span><span class="nm">${a.name.replace(/</g,'&lt;')}</span><span class="ct">${a.count}</span></div>`).join('');
+   aus.innerHTML=d.top_authors.slice(0,15).map((a,i)=>{
+    const nm=a.name.replace(/</g,'&lt;');
+    const q=encodeURIComponent(a.name);
+    return `<div class="srow" onclick="filterFromStats('author','${q}')">`+
+    `<span class="rank">${i+1}</span><span class="nm">${nm}</span><span class="ct">${a.count}</span></div>`;
+   }).join('');
   }
-  // 标签云(字号按频率, 点击→搜索标签)
+  // 标签云(字号按频率, 点击→按标签精确筛选)
   const tgs=document.getElementById('stats-tags');
   if(tgs&&d.top_tags.length){
    const mx=d.top_tags[0].count,mn=d.top_tags[Math.min(29,d.top_tags.length-1)].count;
    tgs.innerHTML=d.top_tags.slice(0,30).map(t=>{
     const sz=Math.round(11+(t.count-mn)/Math.max(1,mx-mn)*10);
-    return `<span class="stats-tag" style="font-size:${sz}px" onclick="searchFromStats('${t.tag.replace(/'/g,"\\\\'")}')">${t.tag.replace(/</g,'&lt;')}</span>`;
+    const q=encodeURIComponent(t.tag);
+    return `<span class="stats-tag" style="font-size:${sz}px" onclick="filterFromStats('tag','${q}')">${t.tag.replace(/</g,'&lt;')}</span>`;
    }).join('');
   }
  }catch(e){console.log('renderStats error',e)}
 }
 
-function searchFromStats(q){
- searchQuery=q;
+// 统计跳转: 专用精确筛选(不走搜索框模糊匹配)
+// type: 'author' | 'year' | 'tag';  val: 已 encodeURIComponent 的值
+function filterFromStats(type,val){
+ // 清掉搜索词, 走专用参数
+ searchQuery='';
  const input=document.querySelector('.search-float input');
- if(input)input.value=q;
+ if(input)input.value='';
+ tagFilter='';coltagFilter='';
  currentPage=0;
- go('search');
+ statsFilter={type:type,val:decodeURIComponent(val)};
+ renderWall();
 }
 
 // ===== 图片查看器 =====
@@ -3191,10 +3271,11 @@ document.addEventListener('DOMContentLoaded',function(){
  if(input){
   input.addEventListener('input',function(){
    searchQuery=this.value.trim();
+   if(searchQuery)statsFilter=null;   // 用户主动输入搜索词时清掉统计筛选
    renderWall();
   });
   input.addEventListener('keydown',function(e){
-   if(e.key==='Enter'){searchQuery=this.value.trim();renderWall();addSearchHistory(searchQuery);hideSearchHistory();}
+   if(e.key==='Enter'){searchQuery=this.value.trim();if(searchQuery)statsFilter=null;renderWall();addSearchHistory(searchQuery);hideSearchHistory();}
   });
   // ---- 搜索历史: 聚焦显示 / 失焦隐藏 / ↑↓选择 / 点击回填 ----
   input.addEventListener('focus',function(){showSearchHistory();});
@@ -3482,10 +3563,38 @@ function resetAll(){
 }
 
 function saveAll(){
+ // 真正保存: 主题色/背景/弹跳/全部效果开关+强度 → localStorage
+ const cfg={
+  accent:document.documentElement.style.getPropertyValue('--accent').trim()||'#c77dff',
+  bg:document.documentElement.style.getPropertyValue('--bg').trim()||'#000',
+  bgImg:(document.getElementById('bg-preview')&&document.getElementById('bg-preview').style.backgroundImage||'').slice(5,-2),
+  bounce:document.getElementById('bounce-slider')?document.getElementById('bounce-slider').value:'100',
+  fx:{},fxI:{}
+ };
+ for(const k in fxState)cfg.fx[k]=fxState[k];
+ for(const k in fxIntensity)cfg.fxI[k]=fxIntensity[k];
+ try{localStorage.setItem('pfs_theme',JSON.stringify(cfg));}catch(e){}
  const b=event.target;
  b.textContent='已保存 ✓';
  b.style.background='#27ae60';
- setTimeout(()=>{b.textContent='保存';b.style.background='';},1500);
+ setTimeout(()=>{b.textContent='保存';b.style.background='';},1200);
+ // 保存后自动关闭面板
+ setTimeout(()=>{const p=document.getElementById('theme-panel');if(p)p.classList.remove('open');},900);
+}
+
+function loadTheme(){
+ // 启动时恢复保存的主题设置
+ let cfg=null;
+ try{cfg=JSON.parse(localStorage.getItem('pfs_theme')||'null');}catch(e){}
+ if(!cfg)return;
+ if(cfg.accent){document.documentElement.style.setProperty('--accent',cfg.accent);document.documentElement.style.setProperty('--accent-g',cfg.accent+'80');const p=document.getElementById('pick-accent');if(p)p.value=cfg.accent;}
+ if(cfg.bg){document.documentElement.style.setProperty('--bg',cfg.bg);const p=document.getElementById('pick-bg');if(p)p.value=cfg.bg;}
+ if(cfg.bgImg&&cfg.bgImg!==''){document.body.style.backgroundImage=`url(${cfg.bgImg})`;document.body.classList.add('has-bg-img');}
+ if(cfg.bounce&&document.getElementById('bounce-slider')){document.getElementById('bounce-slider').value=cfg.bounce;changeBounce(cfg.bounce);}
+ if(cfg.fx){for(const k in cfg.fx){fxState[k]=cfg.fx[k];document.querySelectorAll(`.fx-tog[data-fx="${k}"]`).forEach(t=>t.classList.toggle('on',!!cfg.fx[k]));}}
+ if(cfg.fxI){for(const k in cfg.fxI){fxIntensity[k]=cfg.fxI[k];const s=document.getElementById(k+'-slider');if(s)s.value=cfg.fxI[k];}}
+ checkConflicts();
+ updateSliders();
 }
 
 // 草稿设置系统
@@ -3545,6 +3654,7 @@ function loadTagFilters(){
 
 function setTagFilter(tag,el){
  tagFilter=tag;
+ statsFilter=null;   // 手动选标签时清掉统计筛选
  document.querySelectorAll('.tag-pill').forEach(p=>p.classList.remove('active'));
  if(el)el.classList.add('active');
  currentPage=0;
@@ -3553,6 +3663,7 @@ function setTagFilter(tag,el){
 
 function setColtagFilter(val){
  coltagFilter=val;
+ statsFilter=null;   // 手动选收藏夹时清掉统计筛选
  currentPage=0;
  renderWall();
 }
@@ -3646,6 +3757,7 @@ function breathingLoop(){
 breathingLoop();
 
 renderWall();renderFavs();renderPresets();updateSliders();
+loadTheme();
 loadDraft();
 loadTagFilters();loadColtagOptions();
 changeBgBrightness(100);
