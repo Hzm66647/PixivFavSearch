@@ -100,7 +100,7 @@ def grab_cookies_via_cdp(port=9222, proxy_bypass=True):
     
     # 连接 WebSocket
     try:
-        ws_opts = {"timeout": 10}
+        ws_opts = {"timeout": 10, "suppress_origin": True}  # Edge 153+ 拒绝带 Origin 的握手(403)
         if proxy_bypass:
             ws_opts.update({
                 "http_proxy_host": None,
@@ -174,6 +174,14 @@ def save_cookies(cookies):
 def main():
     _log("main", "=== Import Start ===")
     
+    # 0. DNS 污染防护: 本地 DNS 可能把 www.pixiv.net 解析到假 IP, 交给代理后 TLS 握手
+    #    直接 EOF。让 getaddrinfo 不做本地解析, 域名原样交给代理远端解析
+    #    (等价 curl --socks5-hostname / HTTP CONNECT 的域名转发)。
+    _orig_gai = socket.getaddrinfo
+    def _remote_gai(host, port, *a, **kw):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, port))]
+    socket.getaddrinfo = _remote_gai
+    
     # 1. Load saved cookies
     if not os.path.exists(COOKIE_FILE):
         _log("main", "ERROR: No saved cookies found.")
@@ -200,6 +208,9 @@ def main():
     
     _log("main", f"Fetching bookmarks for uid {uid}...")
     all_items = []
+    # bookmarkId -> [自建收藏标签] 映射, 从每页响应的 bookmarkTags 字段顺路收集
+    # (pixiv 官方 API: body.bookmarkTags = {"<bookmarkData.id>": ["标签A", "标签B"]})
+    collected_tags = {}
     
     proxy_url = get_proxy()
     proxy = urllib.request.ProxyHandler({
@@ -226,10 +237,16 @@ def main():
                 if d.get("error"):
                     _log("main", f"[{rest}] API error: {d.get('message')}")
                     break
-                works = (d.get("body") or {}).get("works") or []
+                body = d.get("body") or {}
+                works = body.get("works") or []
+                # 顺路收集收藏标签映射 (bookmarkData.id -> tags)
+                btags = body.get("bookmarkTags") or {}
+                if isinstance(btags, dict):
+                    collected_tags.update(btags)
                 if not works:
                     break
                 for w in works:
+                    bm = w.get("bookmarkData") or {}
                     all_items.append({
                         "id": str(w.get("id")),
                         "title": w.get("title", ""),
@@ -244,6 +261,8 @@ def main():
                         "pageCount": w.get("pageCount"),
                         "createDate": w.get("createDate", ""),
                         "aiType": w.get("aiType"),
+                        "xRestrict": w.get("xRestrict", 0),
+                        "bookmarkId": str(bm.get("id", "")) if bm.get("id") else "",
                     })
                 _log("main", f"[{rest}] +{len(works)} (total {len(all_items)})")
                 if len(works) < 48:
@@ -258,6 +277,10 @@ def main():
                     _log("main", f"[{rest}] 409 conflict, retrying in 2s...")
                     time.sleep(2)
                     continue
+                elif e.code == 429:
+                    _log("main", f"[{rest}] 429 rate-limited, cooling 30s...")
+                    time.sleep(30)
+                    continue
                 else:
                     _log("main", f"[{rest}] HTTP {e.code}")
                     break
@@ -270,7 +293,17 @@ def main():
                     continue
                 _log("main", f"[{rest}] URLError: {e}")
                 break
+            except ConnectionError as e:
+                # pixiv 中途掐线(WinError 10054): 退避重试, 已抓数据不丢
+                _log("main", f"[{rest}] connection reset, retry in 10s (offset={offset})...")
+                time.sleep(10)
+                continue
             except Exception as e:
+                err_str = str(e)
+                if "10054" in err_str or "forcibly closed" in err_str or "远程主机强迫关闭" in err_str:
+                    _log("main", f"[{rest}] connection reset, retry in 10s (offset={offset})...")
+                    time.sleep(10)
+                    continue
                 _log("main", f"[{rest}] Error: {e}")
                 break
     
@@ -278,86 +311,55 @@ def main():
         print("ERROR: No items fetched")
         return 1
     
-    json.dump(all_items, open(DATA, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    # 原子写入: 先写临时文件再替换, 避免半成品数据砸掉旧库
+    _tmp = DATA + ".tmp"
+    json.dump(all_items, open(_tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    os.replace(_tmp, DATA)
     _log("main", f"=== Done: {len(all_items)} bookmarks ===")
     print(f"OK: {len(all_items)} bookmarks imported")
     
     # 抓取收藏标签
     try:
-        _fetch_bookmark_tags(uid, cookie_header, proxy, opener)
+        _save_coltags_from_collected(all_items, collected_tags)
     except Exception as e:
-        _log("main", f"抓取标签失败: {e}")
+        _log("main", f"保存收藏标签失败: {e}")
     
     return 0
 
-def _fetch_bookmark_tags(uid, cookie_header, proxy, opener):
-    """抓取用户收藏标签并保存到 coltags.json"""
+def _save_coltags_from_collected(all_items, collected_tags):
+    """从主下载循环顺路收集的 bookmarkTags 映射生成 coltags.json。
+
+    旧方案(ajax/user/{uid}/illusts/bookmarks/tags)已 404 —— pixiv 已下线该端点。
+    新方案零额外请求: 每页 body.bookmarkTags = {"<bookmarkId>": ["标签", ...]},
+    作品的 bookmarkData.id 就是 key。空结果保护: 有作品但映射为空时不覆盖旧文件。
+    """
     COLTAGS = os.path.join(OUT, "coltags.json")
-    
-    # 1. 获取标签列表
-    url = f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks/tags?lang=zh"
-    req = urllib.request.Request(url, headers={
-        "Cookie": cookie_header,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.pixiv.net/",
-        "Accept": "application/json",
-    })
-    with opener.open(req, timeout=30) as resp:
-        d = json.loads(resp.read())
-    
-    if d.get("error"):
-        _log("main", f"标签 API 错误: {d.get('message')}")
+    if not collected_tags:
+        if all_items:
+            _log("main", "bookmarkTags 映射为空(账号可能没打收藏标签), 保留旧 coltags.json")
+            return
         return
     
-    tags = d.get("body", [])
-    if not tags:
-        _log("main", "无收藏标签")
-        return
+    # 反查: bookmarkId -> 作品 id
+    bid2wid = {it.get("bookmarkId", ""): it.get("id", "") for it in all_items if it.get("bookmarkId")}
     
-    _log("main", f"发现 {len(tags)} 个收藏标签")
-    
-    # 2. 抓取每个标签下的作品 ID
     result = {}
-    for tag_info in tags:
-        tag_name = tag_info.get("tag", "")
-        if not tag_name:
+    n_mapped = 0
+    for bid, tags in collected_tags.items():
+        wid = bid2wid.get(str(bid), "")
+        if not wid:
             continue
-        
-        ids = set()
-        offset = 0
-        while True:
-            url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
-                   f"?tag={urllib.parse.quote(tag_name)}&offset={offset}&limit=48&rest=show&order=desc&mode=all&lang=zh")
-            req = urllib.request.Request(url, headers={
-                "Cookie": cookie_header,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://www.pixiv.net/",
-                "Accept": "application/json",
-            })
-            try:
-                with opener.open(req, timeout=30) as resp:
-                    d = json.loads(resp.read())
-                if d.get("error"):
-                    break
-                works = (d.get("body") or {}).get("works") or []
-                if not works:
-                    break
-                for w in works:
-                    ids.add(str(w.get("id", "")))
-                if len(works) < 48:
-                    break
-                offset += len(works)
-                time.sleep(0.3)
-            except Exception as e:
-                _log("main", f"抓取标签 {tag_name} 失败: {e}")
-                break
-        
-        result[tag_name] = list(ids)
-        _log("main", f"  {tag_name}: {len(ids)} 幅")
+        for t in tags or []:
+            if t:
+                result.setdefault(t, []).append(wid)
+                n_mapped += 1
     
-    # 3. 保存
+    if not result:
+        _log("main", "收藏标签映射后为空, 保留旧 coltags.json")
+        return
+    
     json.dump(result, open(COLTAGS, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-    _log("main", f"收藏标签已保存: {COLTAGS}")
+    _log("main", f"收藏标签已保存: {COLTAGS} ({len(result)} 个标签, {n_mapped} 条映射)")
 
 if __name__ == "__main__":
     sys.exit(main())
