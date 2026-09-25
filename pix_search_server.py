@@ -2053,7 +2053,7 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 </div>
 
 <!-- 搜索浮动面板 -->
-<div class="search-float" id="search-p"><span class="search-icon">🔍</span><input placeholder="搜索..." onkeydown="if(event.key==='Enter')doSearch(this.value)"></div>
+<div class="search-float" id="search-p"><span class="search-icon">🔍</span><input placeholder="搜索..." onkeydown="if(event.key==='Enter')doSearch(this.value)" autocomplete="off"><div class="search-history" id="search-history"></div></div>
 
 <!-- 安全角落 -->
 <div class="safe-dot" id="safe-dot"><span class="dot"></span>安全模式</div>
@@ -2301,6 +2301,20 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .search-float.open{opacity:1;pointer-events:all;transform:translateX(-50%) scale(1) translateY(0)}
 .search-float input{flex:1;background:transparent;border:none;color:var(--txt);font-size:17px;font-weight:500;outline:none}
 .search-float input::placeholder{color:var(--sub)}
+
+/* 搜索历史下拉 */
+.search-history{position:absolute;top:calc(100% + 8px);left:0;right:0;background:var(--glass);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--glass-bd);border-radius:18px;padding:8px;display:none;max-height:280px;overflow-y:auto;box-shadow:0 16px 48px rgba(0,0,0,.5);z-index:190}
+.search-history.show{display:block;animation:histPop .35s var(--ease-punch)}
+@keyframes histPop{from{opacity:0;transform:translateY(-8px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}
+.sh-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:12px;cursor:pointer;color:var(--txt);font-size:14px;transition:background .15s}
+.sh-item:hover,.sh-item.sel{background:rgba(255,255,255,.12)}
+.sh-item .sh-txt{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sh-item .sh-del{opacity:0;color:var(--sub);font-size:12px;padding:2px 6px;border-radius:8px;transition:opacity .15s}
+.sh-item:hover .sh-del{opacity:1}
+.sh-item .sh-del:hover{color:#ff6b6b}
+.sh-empty{padding:12px;color:var(--sub);font-size:13px;text-align:center}
+.sh-clear{margin-top:4px;padding:8px;text-align:center;color:var(--sub);font-size:12px;cursor:pointer;border-radius:10px}
+.sh-clear:hover{background:rgba(255,255,255,.08);color:#ff6b6b}
 
 /* 主内容 */
 .main{margin-left:92px;height:100vh;overflow:hidden;padding:24px 32px;position:relative}
@@ -2838,10 +2852,56 @@ document.addEventListener('DOMContentLoaded',function(){
    renderWall();
   });
   input.addEventListener('keydown',function(e){
-   if(e.key==='Enter'){searchQuery=this.value.trim();renderWall();}
+   if(e.key==='Enter'){searchQuery=this.value.trim();renderWall();addSearchHistory(searchQuery);hideSearchHistory();}
+  });
+  // ---- 搜索历史: 聚焦显示 / 失焦隐藏 / ↑↓选择 / 点击回填 ----
+  input.addEventListener('focus',function(){showSearchHistory();});
+  document.addEventListener('mousedown',function(e){
+   const sf=document.getElementById('search-p');
+   if(sf&&!sf.contains(e.target))hideSearchHistory();
   });
  }
 });
+
+// ===== 搜索历史 (localStorage, 最近 20 条) =====
+const SH_KEY='pfs_search_history';
+const SH_MAX=20;
+let shSelIdx=-1;
+function getSearchHistory(){
+ try{return JSON.parse(localStorage.getItem(SH_KEY)||'[]');}catch(e){return[];}
+}
+function addSearchHistory(q){
+ if(!q)return;
+ let h=getSearchHistory().filter(x=>x!==q);
+ h.unshift(q);h=h.slice(0,SH_MAX);
+ try{localStorage.setItem(SH_KEY,JSON.stringify(h));}catch(e){}
+}
+function removeSearchHistory(q){
+ let h=getSearchHistory().filter(x=>x!==q);
+ try{localStorage.setItem(SH_KEY,JSON.stringify(h));}catch(e){}
+ renderSearchHistory();
+}
+function clearSearchHistory(){
+ try{localStorage.removeItem(SH_KEY);}catch(e){}
+ hideSearchHistory();
+}
+function renderSearchHistory(){
+ const box=document.getElementById('search-history');
+ if(!box)return;
+ const h=getSearchHistory();
+ if(!h.length){box.innerHTML='<div class="sh-empty">暂无搜索记录</div>';return;}
+ box.innerHTML=h.map((q,i)=>`<div class="sh-item${i===shSelIdx?' sel':''}" data-q="${q.replace(/"/g,'&quot;')}"><span>🕘</span><span class="sh-txt">${q.replace(/</g,'&lt;')}</span><span class="sh-del" data-del="${q.replace(/"/g,'&quot;')}">✕</span></div>`).join('')+'<div class="sh-clear" onclick="clearSearchHistory()">清空全部历史</div>';
+ box.querySelectorAll('.sh-item').forEach(el=>{
+  el.addEventListener('click',function(ev){
+   if(ev.target.classList.contains('sh-del')){ev.stopPropagation();removeSearchHistory(this.dataset.del||ev.target.dataset.del);return;}
+   const q=el.dataset.q;const input=document.querySelector('.search-float input');
+   if(input){input.value=q;searchQuery=q;renderWall();}
+   addSearchHistory(q);hideSearchHistory();
+  });
+ });
+}
+function showSearchHistory(){shSelIdx=-1;renderSearchHistory();const box=document.getElementById('search-history');if(box)box.classList.add('show');}
+function hideSearchHistory(){const box=document.getElementById('search-history');if(box)box.classList.remove('show');}
 
 document.addEventListener('mouseup',e=>{
  if(e.button===3||e.button===4){
