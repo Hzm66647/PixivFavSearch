@@ -431,6 +431,7 @@ def _pub(it, hl=None):
     is_masked_url = "limit_" in img_url or "common/images/" in img_url or not img_url
     o["isMasked"] = it.get("isMasked", False) or is_masked_url
     # 作品链接
+    o["origUrl"] = img_url  # 原图/大图 URL(查看器用); isMasked 判断已在上面用过 img_url
     o["url"] = f"https://www.pixiv.net/artworks/{o['id']}"
     return o
 
@@ -2491,6 +2492,24 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .stats-tag{padding:6px 12px;border-radius:14px;background:rgba(255,255,255,.08);color:var(--txt);cursor:pointer;transition:all .2s var(--ease-punch)}
 .stats-tag:hover{background:var(--accent);color:#fff;transform:scale(1.08)}
 
+/* 图片查看器 */
+.viewer{position:fixed;inset:0;z-index:900;display:none;align-items:center;justify-content:center}
+.viewer.open{display:flex;animation:viewerIn .3s var(--ease-punch)}
+@keyframes viewerIn{from{opacity:0;transform:scale(.96)}to{opacity:1;transform:scale(1)}}
+.viewer-bg{position:absolute;inset:0;background:rgba(10,10,20,.88);backdrop-filter:blur(24px)}
+.viewer-img{position:relative;max-width:92vw;max-height:86vh;object-fit:contain;border-radius:12px;box-shadow:0 32px 96px rgba(0,0,0,.7);cursor:zoom-out;transition:transform .25s var(--ease-punch)}
+.viewer-img:hover{transform:scale(1.01)}
+.viewer-info{position:absolute;bottom:24px;left:50%;transform:translateX(-50%);max-width:80vw;text-align:center;color:var(--txt);font-size:14px;background:rgba(0,0,0,.45);padding:10px 18px;border-radius:14px;backdrop-filter:blur(12px)}
+.viewer-info .vt{font-weight:600}
+.viewer-info .va{color:var(--sub);font-size:12px;margin-top:2px}
+.viewer-nav{position:absolute;top:50%;transform:translateY(-50%);width:52px;height:52px;border-radius:50%;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.1);color:#fff;font-size:26px;cursor:pointer;backdrop-filter:blur(12px);transition:all .2s var(--ease-punch);display:flex;align-items:center;justify-content:center}
+.viewer-nav:hover{background:var(--accent);transform:translateY(-50%) scale(1.12)}
+.viewer-prev{left:22px}
+.viewer-next{right:22px}
+.viewer-close{position:absolute;top:20px;right:22px;width:42px;height:42px;border-radius:50%;border:none;background:rgba(255,255,255,.12);color:#fff;font-size:17px;cursor:pointer;backdrop-filter:blur(12px);transition:all .2s}
+.viewer-close:hover{background:#ff5b5b;transform:rotate(90deg) scale(1.08)}
+.viewer-count{position:absolute;top:24px;left:24px;color:rgba(255,255,255,.75);font-size:13px;background:rgba(0,0,0,.4);padding:6px 12px;border-radius:10px;backdrop-filter:blur(8px)}
+
 /* 搜索历史下拉 */
 .search-history{position:absolute;top:calc(100% + 8px);left:0;right:0;background:var(--glass);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--glass-bd);border-radius:18px;padding:8px;display:none;max-height:280px;overflow-y:auto;box-shadow:0 16px 48px rgba(0,0,0,.5);z-index:190}
 .search-history.show{display:block;animation:histPop .35s var(--ease-punch)}
@@ -2807,6 +2826,17 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 <!-- 亮度遮罩 -->
 <div class="brightness-overlay" id="brightness-overlay"></div>
 
+<!-- 图片查看器 -->
+<div class="viewer" id="viewer">
+  <div class="viewer-bg" onclick="closeViewer()"></div>
+  <img class="viewer-img" id="viewer-img" onclick="closeViewer()">
+  <div class="viewer-info" id="viewer-info"></div>
+  <button class="viewer-nav viewer-prev" id="viewer-prev" onclick="event.stopPropagation();viewerNav(-1)">‹</button>
+  <button class="viewer-nav viewer-next" id="viewer-next" onclick="event.stopPropagation();viewerNav(1)">›</button>
+  <button class="viewer-close" onclick="closeViewer()">✕</button>
+  <div class="viewer-count" id="viewer-count"></div>
+</div>
+
 
 <!-- 标签弹窗 -->
 <div class="modal-bg" id="tag-modal">
@@ -2937,7 +2967,7 @@ function workCard(w){
  const thumbUrl='/thumb/'+w.id;
  const author=w.userName||'Unknown';
  const title=w.title||'Untitled';
- return '<div class="card" data-id="'+w.id+'" onclick="openWork(\''+w.id+'\')">'+
+ return '<div class="card" data-id="'+w.id+'" onclick="openViewer(\''+w.id+'\')">'+
  '<img class="card-img" src="'+thumbUrl+'" loading="lazy" style="width:100%;max-height:280px;object-fit:cover;background:'+c+';min-height:80px" onerror="this.onerror=null;this.style.background=\'linear-gradient(135deg,'+c+','+c+'dd)\';this.parentElement.style.minHeight=\'80px\'">'+
  '<div class="card-ov"><div class="card-tt">'+title+'</div><div class="card-au">'+author+'</div>'+
  '<div class="card-act"><button class="card-btn" onclick="event.stopPropagation();showTags(\''+w.id+'\')">⭐</button>'+
@@ -3091,6 +3121,47 @@ function searchFromStats(q){
  go('search');
 }
 
+// ===== 图片查看器 =====
+let viewerList=[];   // 当前查看的作品列表
+let viewerIdx=0;     // 当前索引
+function openViewer(id){
+ // 在当前 works 里找(也支持 inner-wall)
+ const src=works&&works.length?works:[];
+ viewerList=src.filter(w=>!w.isMasked&&(!safe||!w.isR18));
+ viewerIdx=viewerList.findIndex(w=>w.id===id);
+ if(viewerIdx<0)return;
+ const v=document.getElementById('viewer');
+ if(v)v.classList.add('open');
+ showViewerItem();
+}
+function showViewerItem(){
+ const w=viewerList[viewerIdx];
+ if(!w)return;
+ const img=document.getElementById('viewer-img');
+ const info=document.getElementById('viewer-info');
+ const cnt=document.getElementById('viewer-count');
+ // 大图: origUrl 是 250x250 缩略图, 替换成大图尺寸路径
+ let big=(w.origUrl||'').replace('/c/250x250_80_a2/','/c/1200x1200/');
+ if(!big)big='/thumb/'+w.id;
+ if(img){img.src=big;img.onerror=function(){this.onerror=null;this.src='/thumb/'+w.id;};}
+ if(info)info.innerHTML='<div class="vt">'+(w.title||'').replace(/</g,'&lt;')+'</div><div class="va">'+(w.userName||'').replace(/</g,'&lt;')+' · '+(w.pageCount||1)+'P</div>';
+ if(cnt)cnt.textContent=(viewerIdx+1)+' / '+viewerList.length;
+ const prev=document.getElementById('viewer-prev');
+ const next=document.getElementById('viewer-next');
+ if(prev)prev.style.display=viewerIdx>0?'flex':'none';
+ if(next)next.style.display=viewerIdx<viewerList.length-1?'flex':'none';
+}
+function viewerNav(dir){
+ const ni=viewerIdx+dir;
+ if(ni<0||ni>=viewerList.length)return;
+ viewerIdx=ni;
+ showViewerItem();
+}
+function closeViewer(){
+ const v=document.getElementById('viewer');
+ if(v)v.classList.remove('open');
+}
+
 async function openFav(idx){
  window.currentFavIdx=idx;
  const f=folders[idx];
@@ -3201,7 +3272,22 @@ document.addEventListener('mouseup',e=>{
 
 document.addEventListener('contextmenu',e=>e.preventDefault());
 
+// 查看器打开时滚轮切换
+document.addEventListener('wheel',e=>{
+ const v=document.getElementById('viewer');
+ if(!v||!v.classList.contains('open'))return;
+ if(e.deltaY>0)viewerNav(1);
+ else if(e.deltaY<0)viewerNav(-1);
+},{passive:true});
+
 document.addEventListener('keydown',e=>{
+ // 查看器打开时: Esc关闭 / ←→切换 / 滚轮由 wheel 事件处理
+ const viewerOpen=document.getElementById('viewer')&&document.getElementById('viewer').classList.contains('open');
+ if(viewerOpen){
+  if(e.key==='Escape'){closeViewer();return;}
+  if(e.key==='ArrowLeft'){viewerNav(-1);return;}
+  if(e.key==='ArrowRight'){viewerNav(1);return;}
+ }
  if(e.key==='Escape')goBack();
  // Ctrl+F / Ctrl+K: 聚焦搜索框(没打开则先打开)
  if((e.ctrlKey||e.metaKey)&&(e.key==='f'||e.key==='k')){
