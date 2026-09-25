@@ -1353,6 +1353,41 @@ class H(BaseHTTPRequestHandler):
             total = len(merged)
             items = merged[offset:offset+limit]
             self.send_json(200, {"total": total, "items": items, "offset": offset, "limit": limit})
+        elif u.path == "/api/stats":
+            """收藏统计: 作者排行/标签排行/年度趋势/R18比例, 供统计面板"""
+            reload_pixiv_if_changed()
+            from collections import Counter
+            author_cnt = Counter()
+            tag_cnt = Counter()
+            year_cnt = Counter()
+            n_total = len(BOOKMARKS)
+            n_r18 = 0
+            n_masked = 0
+            for it in BOOKMARKS:
+                un = it.get("userName") or ""
+                if un and un != "-----":
+                    author_cnt[un] += 1
+                for t in (it.get("tags") or []):
+                    tg = t.get("tag") if isinstance(t, dict) else str(t)
+                    if tg:
+                        tag_cnt[tg] += 1
+                cd = it.get("createDate") or ""
+                if cd[:4].isdigit() and cd[:4] not in ("1970",):
+                    year_cnt[cd[:4]] += 1
+                xr = it.get("xRestrict")
+                if xr in (1, 2) or (it.get("sl") or 0) >= 6:
+                    n_r18 += 1
+                if it.get("isMasked"):
+                    n_masked += 1
+            self.send_json(200, {
+                "total": n_total,
+                "r18": n_r18,
+                "masked": n_masked,
+                "safe": max(0, n_total - n_r18 - n_masked),
+                "top_authors": [{"name": k, "count": v} for k, v in author_cnt.most_common(20)],
+                "top_tags": [{"tag": k, "count": v} for k, v in tag_cnt.most_common(50)],
+                "by_year": [{"year": y, "count": c} for y, c in sorted(year_cnt.items())],
+            })
         elif u.path == "/api/health":
             """健康检查: 数据/缓存/磁盘/端口状态, 供诊断用(只读)"""
             def _dir_ok(d):
@@ -2433,6 +2468,29 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .search-float input{flex:1;background:transparent;border:none;color:var(--txt);font-size:17px;font-weight:500;outline:none}
 .search-float input::placeholder{color:var(--sub)}
 
+/* 统计面板 */
+.stats-overview{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:22px}
+.stats-kpi{flex:1;min-width:130px;background:var(--glass);backdrop-filter:blur(30px);border:1px solid var(--glass-bd);border-radius:18px;padding:18px 20px;text-align:center}
+.stats-kpi .v{font-size:28px;font-weight:700;color:var(--txt)}
+.stats-kpi .l{font-size:12px;color:var(--sub);margin-top:4px}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+.stats-card{background:var(--glass);backdrop-filter:blur(30px);border:1px solid var(--glass-bd);border-radius:20px;padding:20px}
+.stats-card h3{font-size:15px;color:var(--txt);margin-bottom:14px}
+.stats-bars{display:flex;align-items:flex-end;gap:6px;height:140px;padding-top:10px}
+.stats-bar-col{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0}
+.stats-bar{width:100%;max-width:42px;border-radius:8px 8px 3px 3px;background:linear-gradient(180deg,var(--accent),#7c5cff88);transition:height .8s var(--ease-punch);cursor:pointer}
+.stats-bar:hover{filter:brightness(1.25)}
+.stats-bar-y{font-size:10px;color:var(--sub)}
+.stats-bar-n{font-size:10px;color:var(--txt)}
+.stats-list .srow{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:10px;cursor:pointer;transition:background .15s}
+.stats-list .srow:hover{background:rgba(255,255,255,.1)}
+.stats-list .rank{width:22px;font-size:12px;color:var(--sub);text-align:right}
+.stats-list .nm{flex:1;font-size:13px;color:var(--txt);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stats-list .ct{font-size:12px;color:var(--sub)}
+.stats-tags{display:flex;flex-wrap:wrap;gap:8px;align-content:flex-start}
+.stats-tag{padding:6px 12px;border-radius:14px;background:rgba(255,255,255,.08);color:var(--txt);cursor:pointer;transition:all .2s var(--ease-punch)}
+.stats-tag:hover{background:var(--accent);color:#fff;transform:scale(1.08)}
+
 /* 搜索历史下拉 */
 .search-history{position:absolute;top:calc(100% + 8px);left:0;right:0;background:var(--glass);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--glass-bd);border-radius:18px;padding:8px;display:none;max-height:280px;overflow-y:auto;box-shadow:0 16px 48px rgba(0,0,0,.5);z-index:190}
 .search-history.show{display:block;animation:histPop .35s var(--ease-punch)}
@@ -2640,9 +2698,10 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 
 <!-- 侧边栏 -->
 <nav class="sidebar">
-  <div class="sb-item active" onclick="go('search')">🔍<span class="sb-tip">搜索</span></div>
-  <div class="sb-item" onclick="go('fav')">⭐<span class="sb-tip">收藏夹</span></div>
-  <div class="sb-item" onclick="go('settings')">⚙️<span class="sb-tip">设置</span></div>
+  <div class="sb-item active" onclick="go('search')"><span class="sb-ico">🔍</span><span class="sb-tip">搜索</span></div>
+  <div class="sb-item" onclick="go('fav')"><span class="sb-ico">⭐</span><span class="sb-tip">收藏夹</span></div>
+  <div class="sb-item" onclick="go('stats')"><span class="sb-ico">📊</span><span class="sb-tip">统计</span></div>
+  <div class="sb-item" onclick="go('settings')"><span class="sb-ico">⚙️</span><span class="sb-tip">设置</span></div>
 </nav>
 
 <main class="main">
@@ -2665,6 +2724,24 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
     <button class="back-btn" onclick="go('fav')">← 返回</button>
     <h2 style="margin-bottom:20px" id="inner-title"></h2>
     <div class="masonry" id="inner-wall"></div>
+  </div>
+  <div class="page" id="pg-stats">
+    <h2 style="margin-bottom:18px">📊 收藏统计</h2>
+    <div class="stats-overview" id="stats-overview"></div>
+    <div class="stats-grid">
+      <div class="stats-card">
+        <h3>📈 年度趋势</h3>
+        <div class="stats-bars" id="stats-years"></div>
+      </div>
+      <div class="stats-card">
+        <h3>🥇 作者排行 Top 15</h3>
+        <div class="stats-list" id="stats-authors"></div>
+      </div>
+      <div class="stats-card">
+        <h3>🏷️ 热门标签 Top 30</h3>
+        <div class="stats-tags" id="stats-tags"></div>
+      </div>
+    </div>
   </div>
   <div class="page" id="pg-settings">
     <div class="stats">
@@ -2945,7 +3022,7 @@ function go(targetPage){
  cur.classList.add('exit');
  next.classList.add('active');
  document.querySelectorAll('.sb-item').forEach((s,i)=>{
-  const isActive=(targetPage==='search'&&i===0)||((targetPage==='fav'||targetPage==='inner')&&i===1)||(targetPage==='settings'&&i===2);
+  const isActive=(targetPage==='search'&&i===0)||((targetPage==='fav'||targetPage==='inner')&&i===1)||(targetPage==='stats'&&i===2)||(targetPage==='settings'&&i===3);
   if(s.classList.contains('active')!==isActive){
    s.classList.toggle('active');
    if(isActive){
@@ -2959,6 +3036,59 @@ function go(targetPage){
  if(targetPage==='search'){currentPage=0;renderWall();}
  else if(targetPage==='fav')renderFavs();
  else if(targetPage==='inner')openFav(window.currentFavIdx);
+ else if(targetPage==='stats')renderStats();
+}
+
+// ===== 统计面板 =====
+let statsCache=null;
+async function renderStats(){
+ try{
+  if(!statsCache){
+   const r=await fetch('/api/stats');
+   statsCache=await r.json();
+  }
+  const d=statsCache;
+  const ov=document.getElementById('stats-overview');
+  if(ov)ov.innerHTML=
+   `<div class="stats-kpi"><div class="v">${d.total.toLocaleString()}</div><div class="l">📚 总收藏</div></div>`+
+   `<div class="stats-kpi"><div class="v">${d.safe.toLocaleString()}</div><div class="l">🛡️ 安全作品</div></div>`+
+   `<div class="stats-kpi"><div class="v">${d.r18.toLocaleString()}</div><div class="l">🔥 R-18</div></div>`+
+   `<div class="stats-kpi"><div class="v">${d.masked.toLocaleString()}</div><div class="l">👻 已失效</div></div>`;
+  // 年度趋势柱状图(点击柱子→搜索该年份)
+  const yrs=document.getElementById('stats-years');
+  if(yrs&&d.by_year.length){
+   const mx=Math.max(...d.by_year.map(y=>y.count));
+   yrs.innerHTML=d.by_year.map(y=>
+    `<div class="stats-bar-col" title="${y.year}: ${y.count} 幅" onclick="searchFromStats('${y.year}')">`+
+    `<div class="stats-bar-n">${y.count}</div>`+
+    `<div class="stats-bar" style="height:${Math.max(6,Math.round(y.count/mx*100))}%"></div>`+
+    `<div class="stats-bar-y">${y.year.slice(2)}</div></div>`).join('');
+  }
+  // 作者排行(点击→搜索作者)
+  const aus=document.getElementById('stats-authors');
+  if(aus&&d.top_authors.length){
+   aus.innerHTML=d.top_authors.slice(0,15).map((a,i)=>
+    `<div class="srow" onclick="searchFromStats('${a.name.replace(/'/g,"\\\\'")}')">`+
+    `<span class="rank">${i+1}</span><span class="nm">${a.name.replace(/</g,'&lt;')}</span><span class="ct">${a.count}</span></div>`).join('');
+  }
+  // 标签云(字号按频率, 点击→搜索标签)
+  const tgs=document.getElementById('stats-tags');
+  if(tgs&&d.top_tags.length){
+   const mx=d.top_tags[0].count,mn=d.top_tags[Math.min(29,d.top_tags.length-1)].count;
+   tgs.innerHTML=d.top_tags.slice(0,30).map(t=>{
+    const sz=Math.round(11+(t.count-mn)/Math.max(1,mx-mn)*10);
+    return `<span class="stats-tag" style="font-size:${sz}px" onclick="searchFromStats('${t.tag.replace(/'/g,"\\\\'")}')">${t.tag.replace(/</g,'&lt;')}</span>`;
+   }).join('');
+  }
+ }catch(e){console.log('renderStats error',e)}
+}
+
+function searchFromStats(q){
+ searchQuery=q;
+ const input=document.querySelector('.search-float input');
+ if(input)input.value=q;
+ currentPage=0;
+ go('search');
 }
 
 async function openFav(idx){
