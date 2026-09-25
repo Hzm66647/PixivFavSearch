@@ -1263,6 +1263,18 @@ class H(BaseHTTPRequestHandler):
             if safe_mode:
                 merged = [m for m in merged if not m.get("isR18")]
             log_debug(f"安全模式: {safe_mode}, 过滤后: {len(merged)}")
+            # ---- 排序选项: relevance(默认相关度) / new(新→旧) / old(旧→新) / author / random ----
+            sort_param = urllib.parse.parse_qs(u.query).get("sort", ["relevance"])[0].strip()
+            if sort_param == "new":
+                merged.sort(key=lambda m: (m.get("createDate") or ""), reverse=True)
+            elif sort_param == "old":
+                merged.sort(key=lambda m: (m.get("createDate") or ""))
+            elif sort_param == "author":
+                merged.sort(key=lambda m: ((m.get("userName") or "").lower(), m.get("id", "")))
+            elif sort_param == "random":
+                import random as _rnd
+                _rnd.shuffle(merged)
+            # relevance / 默认: 保持上面的相关度序
             # 分页支持
             offset = int(urllib.parse.parse_qs(u.query).get("offset", [0])[0])
             limit = int(urllib.parse.parse_qs(u.query).get("limit", [200])[0])
@@ -2582,6 +2594,15 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
     <span class="tag-pill active" onclick="setTagFilter('',this)">全部</span>
   </div>
   <div class="tag-bar-select">
+    <select id="sort-select" onchange="setSortMode(this.value)" title="排序方式">
+      <option value="relevance">🎯 相关度</option>
+      <option value="new">🆕 最新收藏</option>
+      <option value="old">📜 最早收藏</option>
+      <option value="author">✍️ 按作者</option>
+      <option value="random">🎲 随机</option>
+    </select>
+  </div>
+  <div class="tag-bar-select">
     <select id="coltag-select" onchange="setColtagFilter(this.value)">
       <option value="">全部收藏夹</option>
     </select>
@@ -2689,6 +2710,7 @@ let safe=true;
 let searchQuery='';
 let tagFilter='';
 let coltagFilter='';
+let sortMode='relevance';
 let currentPage=0;
 let pageSize=200;
 let totalPages=0;
@@ -2735,7 +2757,7 @@ function wallHTML(list){
 
 async function fetchWorks(){
  try{
-  const p=new URLSearchParams({mode:'pixiv',q:searchQuery,tag:tagFilter,coltag:coltagFilter,offset:currentPage*pageSize,limit:pageSize,safe: safe ? '1' : '0'});
+  const p=new URLSearchParams({mode:'pixiv',q:searchQuery,tag:tagFilter,coltag:coltagFilter,sort:sortMode,offset:currentPage*pageSize,limit:pageSize,safe: safe ? '1' : '0'});
   const r=await fetch('/api/search?'+p);
   const d=await r.json();
   works=d.items||[];
@@ -3172,6 +3194,12 @@ function setTagFilter(tag,el){
 
 function setColtagFilter(val){
  coltagFilter=val;
+ currentPage=0;
+ renderWall();
+}
+
+function setSortMode(val){
+ sortMode=val;
  currentPage=0;
  renderWall();
 }
