@@ -1219,6 +1219,37 @@ class H(BaseHTTPRequestHandler):
                 tagf = tagf.encode('latin-1').decode('utf-8') if tagf else ""
             except:
                 pass
+            # ---- 高级搜索语法解析: 空格=AND, | =OR, -词=排除, 支持括号 ----
+            # 例: "和服 浴衣 -R18" / "(和服|浴衣) 蓝色" / "-触手"
+            def _parse_bool_query(query):
+                """返回 (must_terms, or_groups, not_terms)
+                must_terms: 必须全部命中的词(AND)
+                or_groups: 每组是 OR 列表, 组内任一命中即可(组间 AND)
+                not_terms: 任一命中即排除(NOT)"""
+                must, ors, nots = [], [], []
+                # 按括号分组提取: (a|b) 作为一个 or_group
+                import re as _re2
+                parens = _re2.findall(r'\(([^()]+)\)', query)
+                rest = _re2.sub(r'\([^()]+\)', ' ', query)
+                for p in parens:
+                    grp = [w for w in _re2.split(r'[|,，/]', p) if w.strip()]
+                    grp = [w.strip() for w in grp if w.strip()]
+                    if grp:
+                        ors.append(grp)
+                for tok in rest.split():
+                    if tok.startswith('-') and len(tok) > 1:
+                        nots.append(tok[1:].lower())
+                    elif '|' in tok or '，' in tok:
+                        grp = [w.strip() for w in _re2.split(r'[|,，]', tok) if w.strip()]
+                        if len(grp) > 1:
+                            ors.append(grp)
+                        elif grp:
+                            must.append(grp[0].lower())
+                    else:
+                        must.append(tok.lower())
+                return must, ors, nots
+            adv_must, adv_ors, adv_nots = _parse_bool_query(q)
+            has_adv_syntax = bool(adv_ors or adv_nots) or (len(adv_must) > 1 and ' ' in q)
             q_lower = q.lower()
             # 搜索词脱敏: 只记长度不记内容(防隐私泄露到日志)
             log_debug(f"搜索: 关键词长度={len(q)}, 标签={tagf or '-'}, 收藏标签={colt or '-'} | Search: q_len={len(q)}, tag={tagf or '-'}, coltag={colt or '-'}")
@@ -1228,6 +1259,25 @@ class H(BaseHTTPRequestHandler):
             q_py = _pinyin(q).lower()
             aliases = [a for k, v in NH_ALIAS.items() if k in q for a in v]
             words = [w for w in q.split() if w]
+            # 高级语法: 评分/高亮阶段用净化词(去掉 -/|/() 等语法符号), 布尔粗筛已在上面完成
+            if has_adv_syntax:
+                import re as _re3
+                if adv_must:
+                    # 有 AND 词: 用 must 词评分(OR 组已在布尔层放行)
+                    clean_q = ' '.join(adv_must)
+                    q = clean_q
+                    q_lower = q.lower()
+                    words = [w for w in q.split() if w]
+                elif adv_ors:
+                    # 纯 OR 查询: 用第一组的第一个词评分(保证 _match_score 能命中),
+                    # 其余 OR 组的命中由布尔层保证 —— 评分只影响排序不影响筛选
+                    q = adv_ors[0][0]
+                    q_lower = q.lower()
+                    words = [q]
+                else:
+                    # 纯排除词(如 "-触手"): 浏览模式, 布尔粗筛已过滤
+                    q_lower = ""
+                    words = []
             seg_words = _seg_query(q_lower)
             homophones = _get_homophones(q_lower)
             # 选中的收藏标签允许的作品id集
@@ -1244,6 +1294,22 @@ class H(BaseHTTPRequestHandler):
                 tagset -= {""}
                 if tagf and tagf not in tagset:
                     continue
+                # ---- 高级语法布尔过滤(在评分前粗筛) ----
+                if has_adv_syntax:
+                    hay = it.get("_search", "")
+                    # NOT: 任一排除词命中 → 跳过
+                    if any(n in hay for n in adv_nots):
+                        continue
+                    # AND: 必须词全部命中(原文或罗马音/拼音域)
+                    hay_rom = it.get("_search_rom", "")
+                    hay_py = it.get("_search_py", "")
+                    def _hit(term, h, hr, hp):
+                        return term in h or term in hr or term in hp
+                    if adv_must and not all(_hit(m, hay, hay_rom, hay_py) for m in adv_must):
+                        continue
+                    # OR 组: 每组内任一命中
+                    if adv_ors and not all(any(_hit(o, hay, hay_rom, hay_py) for o in grp) for grp in adv_ors):
+                        continue
                 if not words:
                     # 空搜索: 不排序, 保持收藏原始顺序(不进入 scored)
                     merged.append(_pub(it, []))
@@ -1252,6 +1318,10 @@ class H(BaseHTTPRequestHandler):
                 if res:
                     score, hitsrc, hl = res
                     scored.append((score, hitsrc, it, hl))
+                elif has_adv_syntax:
+                    # 高级语法: 布尔层已判定命中(如 OR 组里非首词命中的作品),
+                    # 评分函数对不上不代表不匹配 —— 保留, 给低分
+                    scored.append((1, "bool-pass", it, []))
             # 按相关度排序(同分保持收藏顺序稳定)
             scored.sort(key=lambda x: (-x[0], x[2].get("id", "")))
             merged += [_pub(it, hl) for _, _, it, hl in scored]
