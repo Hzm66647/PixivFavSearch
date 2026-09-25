@@ -3,7 +3,9 @@
 输入标题关键词 -> 列出匹配作品(标题/作者/链接/缩略图)
 缩略图按需下载并缓存到 data/thumbs/
 """
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+import time as _time_mod
+_START_TS = _time_mod.time()  # 启动时间戳(健康检查 uptime 用)
 UPDATE_CHECK_URL = "https://api.github.com/repos/Hzm66647/PixivFavSearch/releases/latest"
 UPDATE_DOWNLOAD_URL = "https://github.com/Hzm66647/PixivFavSearch/releases/latest/download/PixivFavSearch.exe"
 
@@ -1351,6 +1353,53 @@ class H(BaseHTTPRequestHandler):
             total = len(merged)
             items = merged[offset:offset+limit]
             self.send_json(200, {"total": total, "items": items, "offset": offset, "limit": limit})
+        elif u.path == "/api/health":
+            """健康检查: 数据/缓存/磁盘/端口状态, 供诊断用(只读)"""
+            def _dir_ok(d):
+                try:
+                    os.makedirs(d, exist_ok=True)
+                    t = os.path.join(d, ".healthcheck")
+                    open(t, "w").write("ok")
+                    os.remove(t)
+                    return True
+                except Exception:
+                    return False
+            try:
+                import shutil as _sh
+                _du = _sh.disk_usage(APP_DATA)
+                disk_free_gb = round(_du.free / (1024**3), 2)
+            except Exception:
+                disk_free_gb = -1
+            n_bookmarks = len(BOOKMARKS)
+            n_coltags = sum(len(v) for v in COLTAG_MAP.values())
+            n_thumbs = len(os.listdir(THUMB)) if os.path.isdir(THUMB) else 0
+            thumb_size_mb = -1
+            try:
+                thumb_size_mb = round(sum(
+                    os.path.getsize(os.path.join(THUMB, f))
+                    for f in os.listdir(THUMB) if os.path.isfile(os.path.join(THUMB, f))
+                ) / (1024**2), 1)
+            except Exception:
+                pass
+            n_backups = len(os.listdir(BACKUP_DIR)) if os.path.isdir(BACKUP_DIR) else 0
+            import time as _t
+            uptime_s = round(_t.time() - _START_TS, 0)
+            self.send_json(200, {
+                "ok": True,
+                "version": VERSION,
+                "uptime_s": uptime_s,
+                "data": {
+                    "bookmarks": n_bookmarks,
+                    "coltag_items": n_coltags,
+                    "coltag_groups": len(COLTAG_MAP),
+                    "data_writable": _dir_ok(OUT),
+                    "thumb_writable": _dir_ok(THUMB),
+                },
+                "cache": {"thumbs": n_thumbs, "thumbs_mb": thumb_size_mb},
+                "disk": {"free_gb": disk_free_gb},
+                "backup": {"files": n_backups},
+                "import": dict(_import_state),
+            })
         elif u.path == "/api/version":
             # 返回当前版本 + 是否有新版本(启动时后台查过 GitHub)
             v = LATEST_VER
