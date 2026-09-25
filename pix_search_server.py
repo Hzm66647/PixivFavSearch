@@ -3203,12 +3203,36 @@ document.addEventListener('contextmenu',e=>e.preventDefault());
 
 document.addEventListener('keydown',e=>{
  if(e.key==='Escape')goBack();
+ // Ctrl+F / Ctrl+K: 聚焦搜索框(没打开则先打开)
+ if((e.ctrlKey||e.metaKey)&&(e.key==='f'||e.key==='k')){
+  e.preventDefault();
+  const sp=document.getElementById('search-p');
+  if(sp&&!sp.classList.contains('open'))togSearch();
+  const inp=document.querySelector('.search-float input');
+  if(inp){inp.focus();inp.select();}
+  return;
+ }
+ // 非输入状态下的翻页快捷键: ←/→
+ const tag=document.activeElement&&document.activeElement.tagName;
+ const inInput=tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT';
+ if(!inInput){
+  const cur=document.querySelector('.page.active');
+  if(cur&&cur.id==='pg-search'){
+   if(e.key==='ArrowLeft'&&currentPage>0)goPage(currentPage-1);
+   if(e.key==='ArrowRight'&&currentPage<totalPages-1)goPage(currentPage+1);
+  }
+  // 数字键 1-9 快速跳页
+  if(cur&&cur.id==='pg-search'&&/^[1-9]$/.test(e.key)&&e.ctrlKey){
+   e.preventDefault();
+   goPage(parseInt(e.key)-1);
+  }
+ }
 });
 
 function goBack(){
  const cur=document.querySelector('.page.active');
  if(cur&&cur.id==='pg-fav-inner'){go('fav');return;}
- if(cur&&(cur.id==='pg-fav'||cur.id==='pg-settings')){go('search');return;}
+ if(cur&&(cur.id==='pg-fav'||cur.id==='pg-settings'||cur.id==='pg-stats')){go('search');return;}
  if(cur&&cur.id==='pg-search'&&currentPage>0){goPage(0);return;}
  const searchP=document.getElementById('search-p');
  if(searchP&&searchP.classList.contains('open')){togSearch();}
