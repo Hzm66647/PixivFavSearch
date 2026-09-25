@@ -98,6 +98,45 @@ CONFIG_FILE = os.path.join(APP_DATA, "config.json")
 os.makedirs(THUMB, exist_ok=True)
 
 
+# ---------------------------------------------------------------------- 
+# 自动备份: 数据文件变化时留快照(保留最近 N 份), 防导入失败/误删砸库
+# ----------------------------------------------------------------------
+BACKUP_DIR = os.path.join(APP_DATA, "backup")
+BACKUP_KEEP = 5          # 每个文件保留份数
+BACKUP_MIN_INTERVAL = 300  # 同一文件两次备份最小间隔(秒), 防频繁导入刷爆
+_backup_last = {}
+
+def backup_data_file(path, label=""):
+    """path 变化时复制一份到 backup/ 目录(带时间戳), 超额删旧。"""
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) < 10:
+            return False
+        now = time.time()
+        last = _backup_last.get(path, 0)
+        if now - last < BACKUP_MIN_INTERVAL:
+            return False
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        base = os.path.basename(path)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        dst = os.path.join(BACKUP_DIR, f"{base}.{ts}{label}")
+        import shutil
+        shutil.copy2(path, dst)
+        _backup_last[path] = now
+        # 清理超额旧备份(按修改时间排序删最旧)
+        prefix = base + "."
+        olds = sorted(
+            [f for f in os.listdir(BACKUP_DIR) if f.startswith(prefix)],
+            key=lambda f: os.path.getmtime(os.path.join(BACKUP_DIR, f)))
+        while len(olds) > BACKUP_KEEP:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, olds.pop(0)))
+            except OSError:
+                break
+        return True
+    except Exception:
+        return False
+
+
 # 草稿设置
 _draft_file = os.path.join(APP_DATA, "draft.json")
 def _get_draft_settings():
@@ -642,6 +681,8 @@ def reload_pixiv_if_changed():
             return
         try:
             data = json.load(open(DATA, encoding="utf-8"))
+            # 备份旧数据(在覆盖内存前留快照, 防新数据有问题时能回滚)
+            backup_data_file(DATA, ".pre-reload")
             _build_pixiv_index(data)
             BOOKMARKS = data
             BOOKMARKS_LOAD_TIME = mtime
