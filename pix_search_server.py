@@ -1479,6 +1479,22 @@ class H(BaseHTTPRequestHandler):
             # 返回用户自建收藏标签(带数量),供前端下拉
             ct = [{"tag": k, "count": len(v)} for k, v in sorted(COLTAG_MAP.items(), key=lambda x: -len(x[1]))]
             self.send_json(200, {"total": len(ct), "tags": ct})
+        elif _re.match(r"^/api/coltags/([^/]+)/works$", u.path):
+            # GET /api/coltags/{name}/works — 获取标签下的作品
+            # (此路由曾在 _handle_post 里但条件是 GET, 永远匹配不到 → 收藏夹点不进去)
+            name = urllib.parse.unquote(_re.match(r"^/api/coltags/([^/]+)/works$", u.path).group(1))
+            if name not in COLTAG_MAP:
+                return self.send_json(404, {"error": "标签不存在"})
+            ids = COLTAG_MAP[name]
+            items = [_pub(it, []) for it in BOOKMARKS if str(it.get("id")) in ids]
+            # limit 参数(收藏夹封面只需要最新几张, 不用全量拉)
+            try:
+                lim = int(urllib.parse.parse_qs(u.query).get("limit", [0])[0])
+            except Exception:
+                lim = 0
+            if lim > 0:
+                items = items[:lim]
+            self.send_json(200, {"total": len(COLTAG_MAP[name]), "tag": name, "items": items})
         elif u.path == "/api/settings":
             # 返回当前配置(proxy 等)
             cfg = load_config()
@@ -1872,14 +1888,7 @@ class H(BaseHTTPRequestHandler):
             return self.send_json(200, {"ok": True, "added": added, "count": len(COLTAG_MAP[name])})
 
         # GET /api/coltags/{name}/works — 获取标签下的作品
-        m_works = _re.match(r"^/api/coltags/([^/]+)/works$", u.path)
-        if m_works and self.command == "GET":
-            name = urllib.parse.unquote(m_works.group(1))
-            if name not in COLTAG_MAP:
-                return self.send_json(404, {"error": "标签不存在"})
-            ids = COLTAG_MAP[name]
-            items = [_pub(it, []) for it in BOOKMARKS if str(it.get("id")) in ids]
-            return self.send_json(200, {"total": len(items), "tag": name, "items": items})
+        # (已搬到 _handle_get: 此处是 POST handler, GET 请求永远进不来)
 
         # --- 设置 API ---
         if u.path == "/api/settings" and self.command == "POST":
@@ -2471,6 +2480,7 @@ function breathingLoop(){
  else{var btn=document.querySelectorAll('.island-btn')[2];if(btn)btn.style.animation=''}
  requestAnimationFrame(breathingLoop)}breathingLoop();
 
+
 setTimeout(function(){checkForUpdates();renderPresets()},1500);
 </script>
 <style>
@@ -2588,7 +2598,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .sh-clear:hover{background:rgba(255,255,255,.08);color:#ff6b6b}
 
 /* 主内容 */
-.main{margin-left:92px;height:100vh;overflow:hidden;padding:24px 32px;position:relative}
+.main{position:fixed;top:0;left:92px;right:0;bottom:0;overflow:hidden;padding:24px 32px}
 .page{position:absolute;top:0;left:0;right:0;bottom:0;padding:24px 32px;overflow-y:auto;opacity:0;transform:translateX(20px);transition:opacity .4s var(--ease-power),transform .4s var(--ease-power);pointer-events:none}
 .page.active{opacity:1;transform:translateX(0);pointer-events:auto}
 .page.exit{opacity:0;transform:translateX(-20px);pointer-events:none}
@@ -2738,12 +2748,13 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 .fx-tog::after{content:'';position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:transform .35s var(--ease-punch);box-shadow:0 2px 6px rgba(0,0,0,.3)}
 .fx-tog.on::after{transform:translateX(18px)}
 
-::-webkit-scrollbar{width:4px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:rgba(255,255,255,.06);border-radius:2px}
-::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.12)}
+::-webkit-scrollbar{width:10px}
+::-webkit-scrollbar-track{background:rgba(255,255,255,.04);border-radius:6px}
+::-webkit-scrollbar-thumb{background:rgba(199,125,255,.45);border-radius:6px;border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:rgba(199,125,255,.85);border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:active{background:var(--accent);border:2px solid transparent;background-clip:content-box}
 
-.pagination{display:flex;justify-content:center;align-items:center;gap:8px;padding:16px;margin-top:40px;flex-wrap:wrap}
+.pagination{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);display:flex;justify-content:center;align-items:center;gap:8px;padding:10px 18px;flex-wrap:wrap;background:var(--glass);backdrop-filter:blur(30px) saturate(180%);border:1px solid var(--glass-bd);border-radius:20px;z-index:150;box-shadow:0 12px 40px rgba(0,0,0,.45)}
 .page-btn{padding:8px 16px;border-radius:10px;background:var(--glass);backdrop-filter:blur(20px);border:1px solid var(--glass-bd);color:var(--txt);font-size:13px;font-weight:600;cursor:pointer;transition:all .3s var(--ease-snap)}
 .page-btn:hover{transform:scale(1.08);border-color:var(--accent)}
 .page-btn:active{transform:scale(.92)}
@@ -3092,6 +3103,9 @@ function goPage(page){
  if(page>=totalPages)page=totalPages-1;
  currentPage=page;
  renderWall();
+ // 翻页后回顶: 不然停留在旧滚动位置, 新页内容看着和旧页一样, 像没翻
+ const pg=document.getElementById('pg-search');
+ if(pg)pg.scrollTop=0;
 }
 
 async function renderWall(){
@@ -3106,7 +3120,19 @@ async function renderWall(){
 async function renderFavs(){
  try{
   await fetchFavs();
-  document.getElementById('fav-grid').innerHTML=folders.map((f,i)=>'<div class="fav-card" onclick="openFav('+i+')"><div class="fav-card-bg" style="background:linear-gradient(135deg,'+f.color+','+f.color+'88)"></div><div class="fav-card-info"><div class="fav-card-name">'+f.name+'</div><div class="fav-card-count">'+f.count+' 幅</div></div></div>').join('');
+  // 封面缩略图: 拉每个收藏夹的作品, 取最新一张(安全模式下取最新安全图, 没有则渐变兜底)
+  const covers = await Promise.all(folders.map(f =>
+    fetch('/api/coltags/'+encodeURIComponent(f.name)+'/works?limit=60')
+      .then(r=>r.json()).then(d=>{
+        const items=(d.items||[]).filter(w=>!w.isMasked&&(!safe||!w.isR18));
+        return items.length ? items[0].id : null;   // items 按收藏时间倒序, [0]即最新
+      }).catch(()=>null)
+  ));
+  document.getElementById('fav-grid').innerHTML=folders.map((f,i)=>{
+   const cover=covers[i];
+   const coverHTML=cover?'<img src="/thumb/'+cover+'" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover" onerror="this.remove()">':'';
+   return '<div class="fav-card" onclick="openFav('+i+')"><div class="fav-card-bg" style="background:linear-gradient(135deg,'+f.color+','+f.color+'88)">'+coverHTML+'</div><div class="fav-card-info"><div class="fav-card-name">'+f.name+'</div><div class="fav-card-count">'+f.count+' 幅</div></div></div>';
+  }).join('');
  }catch(e){
   document.getElementById('fav-grid').innerHTML='<div style="padding:40px;color:var(--sub)">加载失败</div>';
  }
@@ -3123,7 +3149,7 @@ function go(targetPage){
  cur.classList.add('exit');
  next.classList.add('active');
  document.querySelectorAll('.sb-item').forEach((s,i)=>{
-  const isActive=(targetPage==='search'&&i===0)||((targetPage==='fav'||targetPage==='inner')&&i===1)||(targetPage==='stats'&&i===2)||(targetPage==='settings'&&i===3);
+  const isActive=(targetPage==='search'&&i===0)||((targetPage==='fav'||targetPage==='fav-inner')&&i===1)||(targetPage==='stats'&&i===2)||(targetPage==='settings'&&i===3);
   if(s.classList.contains('active')!==isActive){
    s.classList.toggle('active');
    if(isActive){
@@ -3136,7 +3162,7 @@ function go(targetPage){
  setTimeout(()=>{cur.classList.remove('exit');pageTransitioning=false},400);
  if(targetPage==='search'){currentPage=0;renderWall();}
  else if(targetPage==='fav')renderFavs();
- else if(targetPage==='inner')openFav(window.currentFavIdx);
+ else if(targetPage==='fav-inner')openFav(window.currentFavIdx);
  else if(targetPage==='stats')renderStats();
 }
 
@@ -3256,7 +3282,7 @@ async function openFav(idx){
  }catch(e){
   document.getElementById('inner-wall').innerHTML='<div style="padding:40px;color:var(--sub)">加载失败</div>';
  }
- go('inner');
+ go('fav-inner');   // 页面 id 是 pg-fav-inner, 不是 pg-inner!
 }
 
 function togSearch(){
@@ -3755,6 +3781,138 @@ function breathingLoop(){
  }
  requestAnimationFrame(breathingLoop);
 }
+// ===== 背景动态效果引擎 (粒子/极光/波浪/网格/星云/等高线) =====
+// fxState.particles/aurora/waves/grid/nebula/contour 的真实渲染消费者
+let _bgCanvas=null,_bgCtx=null,_bgParts=[],_bgWaves=[],_bgLast=0;
+function _bgEnsureCanvas(){
+ if(_bgCanvas)return true;
+ try{
+  _bgCanvas=document.createElement('canvas');
+  _bgCanvas.style.cssText='position:fixed;inset:0;z-index:0;pointer-events:none';
+  document.body.insertBefore(_bgCanvas,document.body.firstChild);
+  _bgCtx=_bgCanvas.getContext('2d');
+  _bgResize();
+  window.addEventListener('resize',_bgResize);
+  return true;
+ }catch(e){return false}
+}
+function _bgResize(){
+ if(!_bgCanvas)return;
+ _bgCanvas.width=window.innerWidth||document.documentElement.clientWidth||1200;
+ _bgCanvas.height=window.innerHeight||document.documentElement.clientHeight||800;
+ // 重建粒子
+ _bgParts=[];
+ const n=Math.round((_bgCanvas.width*_bgCanvas.height)/26000);
+ for(let i=0;i<n;i++)_bgParts.push({
+  x:Math.random()*_bgCanvas.width,y:Math.random()*_bgCanvas.height,
+  vx:(Math.random()-.5)*.4,vy:(Math.random()-.5)*.4,
+  r:Math.random()*2+0.6,a:Math.random()*.5+.15
+ });
+ _bgWaves=[];
+ for(let i=0;i<3;i++)_bgWaves.push({amp:18+i*10,len:.006+i*.003,spd:.012+i*.008,yOff:i*36});
+}
+function _hexA(hex,a){
+ // #c77dff → rgba
+ const h=hex.replace('#','');
+ const r=parseInt(h.substr(0,2),16),g=parseInt(h.substr(2,2),16),b=parseInt(h.substr(4,2),16);
+ return 'rgba('+r+','+g+','+b+','+a+')';
+}
+function _bgFrame(ts){
+ requestAnimationFrame(_bgFrame);
+ const anyOn=fxState.particles||fxState.aurora||fxState.waves||fxState.grid||fxState.nebula||fxState.contour;
+ if(!anyOn||!_bgCanvas||!_bgCtx){if(_bgCtx)_bgCtx.clearRect(0,0,_bgCanvas.width,_bgCanvas.height);return}
+ const W=_bgCanvas.width,H=_bgCanvas.height;
+ const accent=getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()||'#c77dff';
+ const inten=k=>Math.max(.2,Math.min(1.6,(fxIntensity[k]||50)/50));
+ _bgCtx.clearRect(0,0,W,H);
+ _bgCtx.globalCompositeOperation='lighter';
+ // 波浪层
+ if(fxState.waves){
+  const t=ts*.001*inten('waves');
+  _bgWaves.forEach((wv,i)=>{
+   _bgCtx.beginPath();
+   _bgCtx.moveTo(0,H);
+   for(let x=0;x<=W;x+=6){
+    const y=H*.62+i*40+Math.sin(x*wv.len+t*wv.spd*60)*wv.amp*inten('waves');
+    _bgCtx.lineTo(x,y);
+   }
+   _bgCtx.lineTo(W,H);
+   _bgCtx.closePath();
+   _bgCtx.fillStyle=_hexA(accent,.045-i*.012);
+   _bgCtx.fill();
+  });
+ }
+ // 极光流体
+ if(fxState.aurora){
+  const t=ts*.00035*inten('aurora');
+  for(let i=0;i<3;i++){
+   const gx=W*(.25+.25*i)+Math.sin(t+i*2)*W*.12;
+   const gy=H*.28+Math.cos(t*1.3+i)*H*.1;
+   const gr=Math.max(W,H)*.3;
+   const g=_bgCtx.createRadialGradient(gx,gy,0,gx,gy,gr);
+   g.addColorStop(0,_hexA(accent,.10*inten('aurora')));
+   g.addColorStop(.5,_hexA(accent,.04*inten('aurora')));
+   g.addColorStop(1,'rgba(0,0,0,0)');
+   _bgCtx.fillStyle=g;
+   _bgCtx.fillRect(0,0,W,H);
+  }
+ }
+ // 粒子场
+ if(fxState.particles){
+  _bgCtx.fillStyle=_hexA(accent,1);
+  const pi=inten('particles');
+  _bgParts.forEach(p=>{
+   p.x+=p.vx*pi;p.y+=p.vy*pi;
+   if(p.x<-10)p.x=W+10;if(p.x>W+10)p.x=-10;
+   if(p.y<-10)p.y=H+10;if(p.y>H+10)p.y=-10;
+   _bgCtx.globalAlpha=p.a*pi;
+   _bgCtx.beginPath();
+   _bgCtx.arc(p.x,p.y,p.r,0,6.283);
+   _bgCtx.fill();
+  });
+  _bgCtx.globalAlpha=1;
+ }
+ // 呼吸网格
+ if(fxState.grid){
+  const t=ts*.001;
+  const step=52;
+  _bgCtx.strokeStyle=_hexA(accent,.05+Math.sin(t)*.02);
+  _bgCtx.lineWidth=1;
+  for(let x=0;x<W;x+=step){_bgCtx.beginPath();_bgCtx.moveTo(x,0);_bgCtx.lineTo(x,H);_bgCtx.stroke()}
+  for(let y=0;y<H;y+=step){_bgCtx.beginPath();_bgCtx.moveTo(0,y);_bgCtx.lineTo(W,y);_bgCtx.stroke()}
+ }
+ // 星云雾
+ if(fxState.nebula){
+  const t=ts*.0002;
+  for(let i=0;i<4;i++){
+   const nx=(Math.sin(t*.7+i*1.7)*.5+.5)*W;
+   const ny=(Math.cos(t*.9+i*2.3)*.5+.5)*H;
+   const nr=Math.max(W,H)*(.22+i*.06);
+   const g=_bgCtx.createRadialGradient(nx,ny,0,nx,ny,nr);
+   g.addColorStop(0,_hexA(accent,.07));
+   g.addColorStop(1,'rgba(0,0,0,0)');
+   _bgCtx.fillStyle=g;
+   _bgCtx.fillRect(0,0,W,H);
+  }
+ }
+ // 等高线
+ if(fxState.contour){
+  const t=ts*.0006;
+  _bgCtx.strokeStyle=_hexA(accent,.08);
+  _bgCtx.lineWidth=1.2;
+  for(let i=0;i<8;i++){
+   _bgCtx.beginPath();
+   const cy=H*.5+Math.sin(t+i*.8)*H*.06;
+   for(let x=0;x<=W;x+=8){
+    const y=cy+Math.sin(x*.01+i)*30+Math.sin(x*.003+t*2)*20;
+    x===0?_bgCtx.moveTo(x,y):_bgCtx.lineTo(x,y);
+   }
+   _bgCtx.stroke();
+  }
+ }
+ _bgCtx.globalCompositeOperation='source-over';
+}
+if(_bgEnsureCanvas())requestAnimationFrame(_bgFrame);
 breathingLoop();
 
 renderWall();renderFavs();renderPresets();updateSliders();
