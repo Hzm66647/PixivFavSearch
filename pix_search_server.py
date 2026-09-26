@@ -3386,7 +3386,11 @@ async function fetchWorks(){
   if(statsFilter){p.set(statsFilter.type,statsFilter.val);}
   const r=await fetch('/api/search?'+p);
   const d=await r.json();
-  if(seq!==_fetchSeq)return;   // 过期响应(用户已翻到别的页), 丢弃
+  if(seq!==_fetchSeq){
+   // 过期响应(用户已翻到别的页): 数据丢弃, 但分页 UI 仍按当前页刷新
+   updatePagination();
+   return;
+  }
   works=d.items||[];
   totalItems=d.total||0;
   totalPages=Math.max(1,Math.ceil(totalItems/pageSize));
