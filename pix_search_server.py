@@ -872,6 +872,44 @@ def demo_thumb_svg(item, lang="zh"):
             '</svg>')
 
 # ----------------------------------------------------------------------
+# 缩略图失败缓存: 下载失败的作品(如 limit_ 被限制图)记录下来, 24h 内不再重试
+# 防止每次刷新都发几百个注定 403 的请求
+# ----------------------------------------------------------------------
+_THUMB_FAIL_FILE = os.path.join(APP_DATA, "thumb_failed.json")
+_thumb_fail = {}          # pid -> 失败时间戳
+_thumb_fail_loaded = False
+_THUMB_FAIL_TTL = 86400   # 24h 后允许重试(作品可能解除限制)
+
+def _load_thumb_fail():
+    global _thumb_fail, _thumb_fail_loaded
+    if _thumb_fail_loaded:
+        return
+    _thumb_fail_loaded = True
+    try:
+        if os.path.exists(_THUMB_FAIL_FILE):
+            raw = json.load(open(_THUMB_FAIL_FILE, encoding="utf-8"))
+            now = time.time()
+            # 过期清理
+            _thumb_fail = {k: v for k, v in raw.items() if now - v < _THUMB_FAIL_TTL}
+    except Exception:
+        _thumb_fail = {}
+
+def _mark_thumb_fail(pid):
+    _load_thumb_fail()
+    _thumb_fail[str(pid)] = time.time()
+    try:
+        tmp = _THUMB_FAIL_FILE + ".tmp"
+        json.dump(_thumb_fail, open(tmp, "w", encoding="utf-8"))
+        os.replace(tmp, _THUMB_FAIL_FILE)
+    except Exception:
+        pass
+
+def _is_thumb_failed(pid):
+    _load_thumb_fail()
+    ts = _thumb_fail.get(str(pid))
+    return ts is not None and (time.time() - ts) < _THUMB_FAIL_TTL
+
+# ----------------------------------------------------------------------
 # 缩略图全量预载: 后台线程从最新到最旧批量下载, 断点续传, 进度可查
 # ----------------------------------------------------------------------
 _PREFETCH = {
@@ -966,6 +1004,10 @@ def thumb_for(item, lang="zh"):
     local = os.path.join(THUMB, pid + ".jpg")
     if os.path.exists(local) and os.path.getsize(local) > 500:
         return local
+    # 失败缓存: 近期下载失败的作品(如 limit_ 被限制图)不再重试,
+    # 防止每次刷新都发几百个注定 403 的请求占满下载信号量
+    if _is_thumb_failed(pid):
+        return None
     url = item.get("url", "")
     if not url or "i.pximg.net" not in url:
         # url 缺失或不是图片 URL, 尝试从 pixiv API 获取
@@ -1018,6 +1060,7 @@ def thumb_for(item, lang="zh"):
                         f.write(data)
             return local if os.path.getsize(local) > 500 else None
         except Exception as e:
+            _mark_thumb_fail(pid)   # 记入失败缓存, 24h 内不再重试
             if not hasattr(thumb_for, '_err_logged'):
                 thumb_for._err_logged = set()
             err_key = type(e).__name__
@@ -1648,12 +1691,32 @@ class H(BaseHTTPRequestHandler):
             local = thumb_for(it, lang)
             if not local:
                 return self.send_error(404)
+            # 304 支持: 浏览器带 If-Modified-Since 时零传输(图片不变)
+            try:
+                mtime = int(os.path.getmtime(local))
+                ims = self.headers.get("If-Modified-Since")
+                if ims:
+                    import email.utils as _eu
+                    try:
+                        ims_ts = int(_eu.mktime_tz(_eu.parsedate_tz(ims)))
+                        if mtime <= ims_ts:
+                            self.send_response(304)
+                            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+                            self.end_headers()
+                            return
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             with open(local, "rb") as f:
                 body = f.read()
             ctype = "image/svg+xml" if local.endswith(".svg") else "image/jpeg"
             self.send_response(200)
             self.send_header("Content-Type", ctype)
-            self.send_header("Cache-Control", "max-age=86400")
+            # immutable: 浏览器重启后也直接用本地缓存, 不发条件请求
+            # (图片内容永不变化, 无需重新验证)
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.send_header("Last-Modified", time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(os.path.getmtime(local))))
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -2855,7 +2918,8 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 ::-webkit-scrollbar-thumb:hover{background:rgba(199,125,255,.85);border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-thumb:active{background:var(--accent);border:2px solid transparent;background-clip:content-box}
 
-.pagination{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);display:flex;justify-content:center;align-items:center;gap:8px;padding:10px 18px;flex-wrap:wrap;background:var(--glass);backdrop-filter:blur(30px) saturate(180%);border:1px solid var(--glass-bd);border-radius:20px;z-index:150;box-shadow:0 12px 40px rgba(0,0,0,.45)}
+.pagination{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);display:none;justify-content:center;align-items:center;gap:8px;padding:10px 18px;flex-wrap:wrap;background:var(--glass);backdrop-filter:blur(30px) saturate(180%);border:1px solid var(--glass-bd);border-radius:20px;z-index:150;box-shadow:0 12px 40px rgba(0,0,0,.45)}
+.pagination.show{display:flex}
 .page-btn{padding:8px 16px;border-radius:10px;background:var(--glass);backdrop-filter:blur(20px);border:1px solid var(--glass-bd);color:var(--txt);font-size:13px;font-weight:600;cursor:pointer;transition:all .3s var(--ease-snap)}
 .page-btn:hover{transform:scale(1.08);border-color:var(--accent)}
 .page-btn:active{transform:scale(.92)}
@@ -2900,15 +2964,6 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 
 <main class="main">
   <div class="page active" id="pg-search"><div class="masonry" id="wall"></div>
-<!-- 分页 -->
-<div class="pagination" id="pagination">
-  <button class="page-btn" id="page-first" onclick="goPage(0)">⏮</button>
-  <button class="page-btn" id="page-prev" onclick="goPage(currentPage-1)">◀</button>
-  <input type="number" class="page-input" id="page-input" value="1" min="1" onchange="goPage(parseInt(this.value)-1)">
-  <span class="page-info">/ <b id="page-total">1</b> 页</span>
-  <button class="page-btn" id="page-next" onclick="goPage(currentPage+1)">▶</button>
-  <button class="page-btn" id="page-last" onclick="goPage(totalPages-1)">⏭</button>
-</div>
 </div>
   <div class="page" id="pg-fav">
     <div class="fav-top"><h2>⭐ 收藏夹</h2><button class="fav-add" onclick="newFolder()">+ 新建</button></div>
@@ -3015,6 +3070,16 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 </div>
 <!-- 亮度遮罩 -->
 <div class="brightness-overlay" id="brightness-overlay"></div>
+
+<!-- 分页条(独立于页面容器, 真正固定视口底部; .page 有 transform 会让内部 fixed 失效) -->
+<div class="pagination show" id="pagination">
+  <button class="page-btn" id="page-first" onclick="goPage(0)">⏮</button>
+  <button class="page-btn" id="page-prev" onclick="goPage(currentPage-1)">◀</button>
+  <input type="number" class="page-input" id="page-input" value="1" min="1" onchange="goPage(parseInt(this.value)-1)">
+  <span class="page-info">/ <b id="page-total">1</b> 页</span>
+  <button class="page-btn" id="page-next" onclick="goPage(currentPage+1)">▶</button>
+  <button class="page-btn" id="page-last" onclick="goPage(totalPages-1)">⏭</button>
+</div>
 
 <!-- 图片查看器 -->
 <div class="viewer" id="viewer">
@@ -3298,6 +3363,9 @@ function go(targetPage){
   pageTransitioning=false;
   _goTimer=null;
  },400);
+ // 分页条只在搜索页显示
+ const pagEl=document.getElementById('pagination');
+ if(pagEl)pagEl.classList.toggle('show', targetPage==='search');
  if(targetPage==='search'){currentPage=0;renderWall();}
  else if(targetPage==='fav')renderFavs();
  else if(targetPage==='fav-inner')openFav(window.currentFavIdx);
@@ -4146,6 +4214,26 @@ def register_open_window_callback(cb):
     global _OPEN_EXTERNAL_WINDOW_CB
     _OPEN_EXTERNAL_WINDOW_CB = cb
 
+def _auto_resume_prefetch():
+    """启动 8s 后自动恢复缩略图预载(还有未完成的才跑)。
+    WebView2 的 HTTP 缓存不持久化(WebView2Data 为空), 重启后浏览器缓存全丢;
+    靠服务器磁盘缓存 + 自动补全, 保证翻页秒开不依赖浏览器缓存。"""
+    def _delayed():
+        time.sleep(8)
+        try:
+            pending = sum(
+                1 for it in BOOKMARKS
+                if not _thumb_cached(str(it.get("id", "")))
+                and ("i.pximg.net" in (it.get("url") or "") or "s.pximg.net" in (it.get("url") or "")))
+            if pending > 20:   # 剩太多才自动跑(零星几张留给按需下载)
+                started = start_thumb_prefetch()
+                print(f"[预载] 检测到 {pending} 张未缓存, 自动恢复预载: {started}")
+            else:
+                print(f"[预载] 仅剩 {pending} 张未缓存, 走按需下载")
+        except Exception as e:
+            print(f"[预载] 自动恢复异常: {e}")
+    threading.Thread(target=_delayed, daemon=True).start()
+
 def start_server(host="127.0.0.1", port=None, daemon=True):
     global _server
     if _server is not None and _server._serving_thread and _server._serving_thread.is_alive():
@@ -4195,6 +4283,7 @@ if __name__ == "__main__":
     # 命令行直接运行: 前台绑定 0.0.0.0 供局域网访问, 阻塞等待
     srv = start_server(host="0.0.0.0", daemon=False)
     print(f"[OK] Started: http://127.0.0.1:{PORT}/ (whitelist={sorted(ALLOWED_IPS)})")
+    _auto_resume_prefetch()
     try:
         while srv._serving_thread.is_alive():
             time.sleep(1)
