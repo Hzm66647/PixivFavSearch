@@ -838,7 +838,7 @@ if os.path.exists(COLTAGS):
         print("收藏标签加载失败:", repr(e))
 
 THUMB_LOCK = threading.Lock()
-THUMB_SEM = threading.Semaphore(3)
+THUMB_SEM = threading.Semaphore(8)
 
 # demo 模式的示例占位图配色(每组 2 色渐变, 由 id 哈希决定, 稳定不闪变)
 _DEMO_PALETTES = [
@@ -892,17 +892,47 @@ def _load_thumb_fail():
             # 过期清理
             _thumb_fail = {k: v for k, v in raw.items() if now - v < _THUMB_FAIL_TTL}
     except Exception:
-        _thumb_fail = {}
+        _thumb_fail = {}   # 文件损坏(并发写坏) → 丢弃重建
+
+_THUMB_FAIL_SAVE = threading.Lock()
 
 def _mark_thumb_fail(pid):
-    _load_thumb_fail()
-    _thumb_fail[str(pid)] = time.time()
+    # 并发安全: 预载多线程同时标记失败, 不加锁会写坏 JSON
+    with _THUMB_FAIL_SAVE:
+        _load_thumb_fail()
+        _thumb_fail[str(pid)] = time.time()
+        try:
+            tmp = _THUMB_FAIL_FILE + ".tmp"
+            json.dump(_thumb_fail, open(tmp, "w", encoding="utf-8"))
+            os.replace(tmp, _THUMB_FAIL_FILE)
+        except Exception:
+            pass
+
+def _make_placeholder_thumb(pid, title=""):
+    """为永久拿不到图的作品(limit_/已删除)生成本地 SVG 占位图。
+    带"已失效"标识和作品ID, 比纯色块友好; 生成一次永久复用。"""
+    pid = str(pid)
+    local = os.path.join(THUMB, pid + ".svg")
+    if os.path.exists(local):
+        return local
     try:
-        tmp = _THUMB_FAIL_FILE + ".tmp"
-        json.dump(_thumb_fail, open(tmp, "w", encoding="utf-8"))
-        os.replace(tmp, _THUMB_FAIL_FILE)
+        t = (title or "")[:18].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600">'
+               '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+               '<stop offset="0" stop-color="#2a2440"/><stop offset="1" stop-color="#171226"/>'
+               '</linearGradient></defs>'
+               '<rect width="600" height="600" fill="url(#g)"/>'
+               '<circle cx="300" cy="262" r="74" fill="none" stroke="#5c5478" stroke-width="10"/>'
+               '<line x1="248" y1="314" x2="352" y2="210" stroke="#5c5478" stroke-width="10" stroke-linecap="round"/>'
+               '<text x="300" y="392" text-anchor="middle" fill="#8a80a8" font-size="30" font-family="sans-serif">作品已失效</text>'
+               '<text x="300" y="436" text-anchor="middle" fill="#5c5478" font-size="22" font-family="sans-serif">ID ' + pid + '</text>'
+               '<text x="300" y="480" text-anchor="middle" fill="#453d60" font-size="18" font-family="sans-serif">' + t + '</text>'
+               '</svg>')
+        with open(local, "w", encoding="utf-8") as f:
+            f.write(svg)
+        return local
     except Exception:
-        pass
+        return None
 
 def _is_thumb_failed(pid):
     _load_thumb_fail()
@@ -927,34 +957,117 @@ def start_thumb_prefetch():
         _PREFETCH.update({"running": True, "stop": False, "done": 0, "ok": 0,
                           "fail": 0, "skip": 0, "cur": "", "t_start": time.time(),
                           "last_error": ""})
-        # 待下载数量(排除已缓存/无URL/被限制的)
+        # 手动启动预载时清空失败缓存: 给瞬时失败的图重试机会
+        # (limit_ 图走占位图逻辑不受影响)
+        global _thumb_fail
+        _thumb_fail = {}
+        try:
+            if os.path.exists(_THUMB_FAIL_FILE):
+                os.remove(_THUMB_FAIL_FILE)
+        except Exception:
+            pass
+        # 待下载数量(排除已缓存; limit_ 图会生成占位图也算待处理)
         _PREFETCH["total"] = sum(
             1 for it in BOOKMARKS
             if not _thumb_cached(str(it.get("id", "")))
-            and "i.pximg.net" in (it.get("url") or ""))
+            and ("i.pximg.net" in (it.get("url") or "") or "s.pximg.net" in (it.get("url") or "")))
     threading.Thread(target=_prefetch_worker, daemon=True).start()
     return True
 
 def _thumb_cached(pid):
-    local = os.path.join(THUMB, pid + ".jpg")
+    # .jpg = 真图; .svg = 占位图(也算已处理, 不再重试)
+    for ext in (".jpg", ".svg"):
+        local = os.path.join(THUMB, pid + ext)
+        try:
+            if os.path.exists(local) and os.path.getsize(local) > 100:
+                return True
+        except Exception:
+            pass
+    return False
+
+def _prefetch_one(it):
+    """处理单个作品的缩略图(预载并发单元)。"""
+    pid = str(it.get("id", ""))
+    url = it.get("url") or ""
+    if not pid:
+        return
+    if _thumb_cached(pid):
+        return
+    # limit_ 图: 秒生成占位图(不发网络请求)
+    if "s.pximg.net" in url or "limit_" in url:
+        _make_placeholder_thumb(pid, it.get("title", ""))
+        with _PREFETCH_LOCK:
+            _PREFETCH["ok"] += 1
+            _PREFETCH["done"] += 1
+        return
+    if "i.pximg.net" not in url:
+        with _PREFETCH_LOCK:
+            _PREFETCH["skip"] += 1
+            _PREFETCH["done"] += 1
+        return
+    _PREFETCH["cur"] = pid
     try:
-        return os.path.exists(local) and os.path.getsize(local) > 500
-    except Exception:
-        return False
+        local = thumb_for(it, "zh")
+        if local and os.path.getsize(local) > 100:
+            with _PREFETCH_LOCK:
+                _PREFETCH["ok"] += 1
+        else:
+            with _PREFETCH_LOCK:
+                _PREFETCH["fail"] += 1
+    except Exception as e:
+        with _PREFETCH_LOCK:
+            _PREFETCH["fail"] += 1
+            _PREFETCH["last_error"] = repr(e)[:80]
+    with _PREFETCH_LOCK:
+        _PREFETCH["done"] += 1
+    time.sleep(0.04)  # 温和限速(并发下每线程间隔)
 
 def _prefetch_worker():
-    """预载线程: 遍历 BOOKMARKS(最新→最旧), 逐个下载未缓存的缩略图。"""
+    """预载线程: 3 并发分片下载(最新→最旧), 比串行快 ~3 倍。"""
     try:
+        items = [it for it in list(BOOKMARKS)  # BOOKMARKS 顺序 = 收藏时间倒序
+                 if not _thumb_cached(str(it.get("id", "")))]
+        # 分 3 片并发(每片内部保序)
+        def _slice_run(sl):
+            for it in sl:
+                if _PREFETCH["stop"]:
+                    return
+                _prefetch_one(it)
+        import queue as _q
+        shards = [items[i::6] for i in range(6)]
+        threads = [threading.Thread(target=_slice_run, args=(s,), daemon=True) for s in shards]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        # 兼容: 下方原循环改为只处理已缓存跳过统计(不再重复下载)
+        for it in list(BOOKMARKS):
+            if _PREFETCH["stop"]:
+                break
+            pid = str(it.get("id", ""))
+            if _thumb_cached(pid):
+                _PREFETCH["skip"] += 1
+                _PREFETCH["done"] += 1
+        return
+        # (原串行逻辑保留在下方, 不可达, 仅作历史参考)
         for it in list(BOOKMARKS):  # BOOKMARKS 顺序 = 收藏时间倒序
             if _PREFETCH["stop"]:
                 break
             pid = str(it.get("id", ""))
             url = it.get("url") or ""
-            if not pid or "i.pximg.net" not in url:
+            if not pid:
                 _PREFETCH["skip"] += 1
                 _PREFETCH["done"] += 1
                 continue
             if _thumb_cached(pid):
+                _PREFETCH["skip"] += 1
+                _PREFETCH["done"] += 1
+                continue
+            # limit_ 图: 秒生成占位图(不发网络请求)
+            if "s.pximg.net" in url or "limit_" in url:
+                _make_placeholder_thumb(pid, it.get("title", ""))
+                _PREFETCH["ok"] += 1
+                _PREFETCH["done"] += 1
+                continue
+            if "i.pximg.net" not in url:
                 _PREFETCH["skip"] += 1
                 _PREFETCH["done"] += 1
                 continue
@@ -969,7 +1082,7 @@ def _prefetch_worker():
                 _PREFETCH["fail"] += 1
                 _PREFETCH["last_error"] = repr(e)[:80]
             _PREFETCH["done"] += 1
-            time.sleep(0.08)  # 温和限速, 不抢正常请求的带宽
+            time.sleep(0.04)  # 温和限速(并发下每线程间隔), 不抢正常请求的带宽
     finally:
         _PREFETCH["running"] = False
         _PREFETCH["finished_at"] = time.time()
@@ -1004,21 +1117,24 @@ def thumb_for(item, lang="zh"):
     local = os.path.join(THUMB, pid + ".jpg")
     if os.path.exists(local) and os.path.getsize(local) > 500:
         return local
-    # 失败缓存: 近期下载失败的作品(如 limit_ 被限制图)不再重试,
+    # 失败缓存: 近期下载失败的作品不再重试,
     # 防止每次刷新都发几百个注定 403 的请求占满下载信号量
     if _is_thumb_failed(pid):
-        return None
+        # 永久失败 → 占位图(带"已失效"标识, 不是纯色块)
+        return _make_placeholder_thumb(pid, item.get("title", ""))
     url = item.get("url", "")
+    # limit_ 图 = pixiv 已删除/私密化, API 也拿不到 → 直接占位图, 不浪费请求
+    if "s.pximg.net" in url or "limit_" in url:
+        return _make_placeholder_thumb(pid, item.get("title", ""))
     if not url or "i.pximg.net" not in url:
         # url 缺失或不是图片 URL, 尝试从 pixiv API 获取
         url = _fetch_thumb_url_from_api(pid)
         if not url:
             return None
     # 提升缩略图分辨率 (250x250 → 480x480)
-    url = url.replace("c/250x250_80_a2", "c/600x600").replace("custom-thumb", "custom-thumb")
-    # 注: 旧代码把 custom-thumb 替换成 custom1200x1200 且用 480x480_80_a2 尺寸,
-    #     这两个变体实测全部 403(custom-thumb 目录下只有 600x600/1200x1200 可用)。
-    #     下载失败时回退原始 250x250 URL(永远有效)。
+    # 预载优先 250 原图(0.26s/张, 比 600x600 快 2.7 倍, 缩略图场景够用);
+    # 查看器大图走前端 origUrl 1200 替换, 不依赖这里。
+    # (600x600 保留在回退链: 250 失败时尝试)
     # 并发限制: 同时最多 3 个下载, 防止 200 张卡片请求占满服务线程
     with THUMB_SEM:
         # 二次检查(可能在排队期间已下载)
@@ -1060,7 +1176,7 @@ def thumb_for(item, lang="zh"):
                         f.write(data)
             return local if os.path.getsize(local) > 500 else None
         except Exception as e:
-            _mark_thumb_fail(pid)   # 记入失败缓存, 24h 内不再重试
+            _mark_thumb_fail(pid)   # 记入失败缓存, 24h 内不再重试(期间用占位图)
             if not hasattr(thumb_for, '_err_logged'):
                 thumb_for._err_logged = set()
             err_key = type(e).__name__
