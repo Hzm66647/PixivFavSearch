@@ -3377,13 +3377,16 @@ function wallHTML(list){
  return filtered.map(w=>workCard(w)).join('');
 }
 
+let _fetchSeq=0;   // 请求序号: 快速翻页时旧响应后到会覆盖新数据, 守卫丢弃过期响应
 async function fetchWorks(){
+ const seq=++_fetchSeq;
  try{
   const p=new URLSearchParams({mode:'pixiv',q:searchQuery,tag:tagFilter,coltag:coltagFilter,sort:sortMode,offset:currentPage*pageSize,limit:pageSize,safe: safe ? '1' : '0'});
   // 统计面板专用筛选参数
   if(statsFilter){p.set(statsFilter.type,statsFilter.val);}
   const r=await fetch('/api/search?'+p);
   const d=await r.json();
+  if(seq!==_fetchSeq)return;   // 过期响应(用户已翻到别的页), 丢弃
   works=d.items||[];
   totalItems=d.total||0;
   totalPages=Math.max(1,Math.ceil(totalItems/pageSize));
@@ -3679,10 +3682,13 @@ function togSearch(){
 document.addEventListener('DOMContentLoaded',function(){
  const input=document.querySelector('.search-float input');
  if(input){
+  let _searchDebounce=null;
   input.addEventListener('input',function(){
    searchQuery=this.value.trim();
    if(searchQuery)statsFilter=null;   // 用户主动输入搜索词时清掉统计筛选
-   renderWall();
+   // 防抖 250ms: 打字过程不发请求(防 429 限流), 停顿才搜
+   clearTimeout(_searchDebounce);
+   _searchDebounce=setTimeout(()=>renderWall(),250);
   });
   input.addEventListener('keydown',function(e){
    if(e.key==='Enter'){searchQuery=this.value.trim();if(searchQuery)statsFilter=null;renderWall();addSearchHistory(searchQuery);hideSearchHistory();}
@@ -3736,8 +3742,20 @@ function renderSearchHistory(){
 function showSearchHistory(){shSelIdx=-1;renderSearchHistory();const box=document.getElementById('search-history');if(box)box.classList.add('show');}
 function hideSearchHistory(){const box=document.getElementById('search-history');if(box)box.classList.remove('show');}
 
-document.addEventListener('mouseup',e=>{
+// 侧键撤回(X1/X2): 必须在 mousedown 阶段 preventDefault ——
+// WebView2 在 mousedown 时触发原生历史后退, 等 mouseup 早就导航走了。
+let _sideBtnHandled=0;   // 时间戳: mousedown 处理过, 300ms 内 mouseup 不重复触发
+document.addEventListener('mousedown',e=>{
  if(e.button===3||e.button===4){
+  e.preventDefault();   // 挡掉 WebView2 原生后退/前进
+  e.stopPropagation();
+  _sideBtnHandled=Date.now();
+  goBack();
+ }
+},{capture:true});
+// mouseup 兜底(仅当 mousedown 被别的层吃掉时才生效)
+document.addEventListener('mouseup',e=>{
+ if((e.button===3||e.button===4)&&Date.now()-_sideBtnHandled>300){
   goBack();
  }
 });
@@ -3812,7 +3830,8 @@ function goBack(){
  const cur=document.querySelector('.page.active');
  if(cur&&cur.id==='pg-fav-inner'){go('fav');return;}
  if(cur&&(cur.id==='pg-fav'||cur.id==='pg-settings'||cur.id==='pg-stats')){go('search');return;}
- if(cur&&cur.id==='pg-search'&&currentPage>0){goPage(0);return;}
+ // 搜索页: 侧键/Esc = 翻回上一页(第0页时再按 = 关搜索面板)
+ if(cur&&cur.id==='pg-search'&&currentPage>0){goPage(currentPage-1);return;}
  const searchP=document.getElementById('search-p');
  if(searchP&&searchP.classList.contains('open')){togSearch();}
 }
