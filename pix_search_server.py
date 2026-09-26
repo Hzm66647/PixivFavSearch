@@ -1746,10 +1746,12 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(400, {"ok": False, "error": "domain"})
             opened = False
             try:
-                import desktop_app as _da
-                if hasattr(_da, "open_external_window"):
-                    _da.open_external_window(url)
-                    opened = True
+                # 注意: exe 里 desktop_app 是 __main__ 模块, 直接 import 会
+                # 重新加载副本并触发托盘初始化死锁。改用注册回调:
+                # desktop_app 启动时把 open_external_window 注册到本模块。
+                _cb = globals().get("_OPEN_EXTERNAL_WINDOW_CB")
+                if _cb:
+                    opened = bool(_cb(url))
             except Exception:
                 pass
             return self.send_json(200, {"ok": True, "opened": opened})
@@ -3771,6 +3773,16 @@ changeBgBrightness(100);
 
 # --- 可复用的启动/停止函数(供 desktop_app 导入调用) ---
 _server = None
+# --- 外部窗口回调(desktop_app 启动时注册, 避免 exe 里循环 import) ---
+_OPEN_EXTERNAL_WINDOW_CB = None
+
+def register_open_window_callback(cb):
+    """desktop_app 启动时调用, 把 open_external_window 注册进来。
+    /api/open-work 通过回调开新 WebView 窗口, 不直接 import desktop_app
+    (exe 里它是 __main__, import 会重新加载副本导致托盘死锁)。"""
+    global _OPEN_EXTERNAL_WINDOW_CB
+    _OPEN_EXTERNAL_WINDOW_CB = cb
+
 def start_server(host="127.0.0.1", port=None, daemon=True):
     global _server
     if _server is not None and _server._serving_thread and _server._serving_thread.is_alive():

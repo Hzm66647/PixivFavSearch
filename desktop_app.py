@@ -238,6 +238,12 @@ def main():
     # 加载配置
     _load_draft()
     
+    # 注册外部窗口回调(openWork 跳 pixiv 用, 避免 exe 里循环 import)
+    try:
+        server.register_open_window_callback(open_external_window)
+    except Exception:
+        pass
+
     # 启动 HTTP 服务
     server.start_server(host="127.0.0.1")
     port = server.PORT
