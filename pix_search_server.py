@@ -2701,8 +2701,8 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 /* 主内容 */
 .main{position:fixed;top:0;left:92px;right:0;bottom:0;overflow:hidden;padding:24px 32px}
 .page{position:absolute;top:0;left:0;right:0;bottom:0;padding:24px 32px;overflow-y:auto;opacity:0;transform:translateX(20px);transition:opacity .4s var(--ease-power),transform .4s var(--ease-power);pointer-events:none}
-.page.active{opacity:1;transform:translateX(0);pointer-events:auto}
-.page.exit{opacity:0;transform:translateX(-20px);pointer-events:none}
+.page.active{opacity:1;transform:translateX(0);pointer-events:auto;z-index:2}
+.page.exit{opacity:0;transform:translateX(-20px);pointer-events:none;z-index:1}
 
 /* 进度条 */
 .progress{position:fixed;top:0;left:0;height:3px;background:linear-gradient(90deg,var(--accent),#e0aaff);width:0;z-index:9999;transition:width .3s;box-shadow:0 0 20px var(--accent-g)}
@@ -3268,8 +3268,15 @@ function go(targetPage){
  document.querySelectorAll('.page.exit').forEach(p=>p.classList.remove('exit'));
  // 清掉历史遗留的内联 opacity(上次快速切换可能留下)
  document.querySelectorAll('.page').forEach(p=>p.style.opacity='');
- if(cur){cur.classList.remove('active');cur.classList.add('exit');}
- // 新页: 先关 transition 瞬移到起点(20px/透明), 强制 reflow, 再开 transition 激活
+ if(cur){
+  // 旧页瞬移退出(关 transition 再移除 active, 避免渐隐期盖住新页)
+  cur.style.transition='none';
+  cur.classList.remove('active');
+  void cur.offsetWidth;
+  cur.style.transition='';
+ }
+ // 新页: 先关 transition 瞬移到起点(20px/透明), 强制 reflow, 再开 transition 播放入场动画
+ // (旧页不再做 exit 动画: exit 淡出会与新页视觉重叠 → "卡在一半"的观感)
  next.style.transition='none';
  next.classList.add('active');
  void next.offsetWidth;
