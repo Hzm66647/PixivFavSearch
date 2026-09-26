@@ -871,6 +871,77 @@ def demo_thumb_svg(item, lang="zh"):
             '<text x="380" y="380" text-anchor="end" font-family="Segoe UI,Arial,sans-serif" font-size="13" fill="rgba(255,255,255,0.55)">PixivFavSearch demo</text>'
             '</svg>')
 
+# ----------------------------------------------------------------------
+# 缩略图全量预载: 后台线程从最新到最旧批量下载, 断点续传, 进度可查
+# ----------------------------------------------------------------------
+_PREFETCH = {
+    "running": False, "stop": False,
+    "total": 0, "done": 0, "ok": 0, "fail": 0, "skip": 0,
+    "cur": "", "t_start": 0.0, "finished_at": 0.0, "last_error": "",
+}
+_PREFETCH_LOCK = threading.Lock()
+
+def start_thumb_prefetch():
+    """启动全量预载(已在跑则返回 False)。按 BOOKMARKS 顺序 = 收藏时间倒序(最新→最旧)。"""
+    with _PREFETCH_LOCK:
+        if _PREFETCH["running"]:
+            return False
+        _PREFETCH.update({"running": True, "stop": False, "done": 0, "ok": 0,
+                          "fail": 0, "skip": 0, "cur": "", "t_start": time.time(),
+                          "last_error": ""})
+        # 待下载数量(排除已缓存/无URL/被限制的)
+        _PREFETCH["total"] = sum(
+            1 for it in BOOKMARKS
+            if not _thumb_cached(str(it.get("id", "")))
+            and "i.pximg.net" in (it.get("url") or ""))
+    threading.Thread(target=_prefetch_worker, daemon=True).start()
+    return True
+
+def _thumb_cached(pid):
+    local = os.path.join(THUMB, pid + ".jpg")
+    try:
+        return os.path.exists(local) and os.path.getsize(local) > 500
+    except Exception:
+        return False
+
+def _prefetch_worker():
+    """预载线程: 遍历 BOOKMARKS(最新→最旧), 逐个下载未缓存的缩略图。"""
+    try:
+        for it in list(BOOKMARKS):  # BOOKMARKS 顺序 = 收藏时间倒序
+            if _PREFETCH["stop"]:
+                break
+            pid = str(it.get("id", ""))
+            url = it.get("url") or ""
+            if not pid or "i.pximg.net" not in url:
+                _PREFETCH["skip"] += 1
+                _PREFETCH["done"] += 1
+                continue
+            if _thumb_cached(pid):
+                _PREFETCH["skip"] += 1
+                _PREFETCH["done"] += 1
+                continue
+            _PREFETCH["cur"] = pid
+            try:
+                local = thumb_for(it, "zh")
+                if local and os.path.getsize(local) > 500:
+                    _PREFETCH["ok"] += 1
+                else:
+                    _PREFETCH["fail"] += 1
+            except Exception as e:
+                _PREFETCH["fail"] += 1
+                _PREFETCH["last_error"] = repr(e)[:80]
+            _PREFETCH["done"] += 1
+            time.sleep(0.08)  # 温和限速, 不抢正常请求的带宽
+    finally:
+        _PREFETCH["running"] = False
+        _PREFETCH["finished_at"] = time.time()
+        log_info(f"缩略图预载完成: 成功{_PREFETCH['ok']} 失败{_PREFETCH['fail']} 跳过{_PREFETCH['skip']} | "
+                 f"Thumb prefetch done: ok={_PREFETCH['ok']} fail={_PREFETCH['fail']} skip={_PREFETCH['skip']}")
+
+def stop_thumb_prefetch():
+    _PREFETCH["stop"] = True
+    return True
+
 def thumb_for(item, lang="zh"):
     """返回本地缩略图路径(不存在则下载, 受并发信号量限制避免占满线程池)。
     demo 数据(未导入收藏)直接返回本地 SVG 占位图。lang 参数只在 demo 模式生效(控制 SVG 占位文字语言)。"""
@@ -1495,6 +1566,22 @@ class H(BaseHTTPRequestHandler):
             if lim > 0:
                 items = items[:lim]
             self.send_json(200, {"total": len(COLTAG_MAP[name]), "tag": name, "items": items})
+        elif u.path == "/api/thumb-prefetch/status":
+            """预载进度查询"""
+            p = dict(_PREFETCH)
+            p["pending"] = max(0, p["total"] - p["done"])
+            if p["running"] and p["done"] > 0 and p["t_start"]:
+                rate = p["done"] / max(0.1, time.time() - p["t_start"])
+                p["eta_s"] = int(p["pending"] / max(0.01, rate)) if rate > 0 else -1
+            else:
+                p["eta_s"] = -1
+            # 本地缓存总量
+            try:
+                p["cached"] = sum(1 for f in os.listdir(THUMB) if f.endswith(".jpg"))
+            except Exception:
+                p["cached"] = -1
+            return self.send_json(200, p)
+
         elif u.path == "/api/settings":
             # 返回当前配置(proxy 等)
             cfg = load_config()
@@ -1770,6 +1857,20 @@ class H(BaseHTTPRequestHandler):
             except Exception:
                 pass
             return self.send_json(200, {"ok": True, "opened": opened})
+
+        elif u.path == "/api/thumb-prefetch" and self.command == "POST":
+            """启动/停止缩略图全量预载(最新→最旧)"""
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                data = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                data = {}
+            if data.get("stop"):
+                stop_thumb_prefetch()
+                return self.send_json(200, {"ok": True, "stopping": True})
+            started = start_thumb_prefetch()
+            return self.send_json(200, {"ok": True, "started": started,
+                                        "running": _PREFETCH["running"]})
 
         if u.path == "/api/import":
             # 从 Pixiv 抓取最新收藏(CDP)。启动导入线程, 返回是否已启动
@@ -2850,6 +2951,21 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
       </div>
     </div>
     <div class="sec">
+      <h3>🖼️ 缩略图预载</h3>
+      <div class="set-row">
+        <div><div class="set-label">全量下载缩略图</div><div class="set-desc">后台从最新到最旧批量下载，翻页即秒开</div></div>
+        <button class="btn btn-primary" id="prefetch-btn" onclick="togglePrefetch()">开始预载</button>
+      </div>
+      <div id="prefetch-progress" style="display:none;margin-top:12px">
+        <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--sub);margin-bottom:6px">
+          <span id="prefetch-stat">准备中…</span><span id="prefetch-eta"></span>
+        </div>
+        <div style="height:8px;border-radius:4px;background:rgba(255,255,255,.08);overflow:hidden">
+          <div id="prefetch-bar" style="height:100%;width:0%;border-radius:4px;background:linear-gradient(90deg,var(--accent),#e0aaff);transition:width .4s var(--ease-power)"></div>
+        </div>
+      </div>
+    </div>
+    <div class="sec">
       <h3>🌐 代理设置</h3>
       <div class="set-row"><div><div class="set-label">HTTP 代理</div><div class="set-desc">连接 Pixiv API</div></div><input class="set-input" value="http://127.0.0.1:10808"></div>
       <div class="set-row"><div><div class="set-label">启用代理</div></div><div class="tog on" onclick="this.classList.toggle('on')"></div></div>
@@ -3139,17 +3255,27 @@ async function renderFavs(){
 }
 
 let pageTransitioning=false;
+let _goTimer=null;
 function go(targetPage){
- if(pageTransitioning)return;
+ // 目标页(高亮映射用): fav-inner 归到 fav
+ const navPage=(targetPage==='fav-inner')?'fav':targetPage;
  const cur=document.querySelector('.page.active');
  const next=document.getElementById('pg-'+targetPage);
- if(!cur||!next||cur===next)return;
- pageTransitioning=true;
- cur.classList.remove('active');
- cur.classList.add('exit');
+ if(!next)return;
+ if(cur===next)return;
+ // 防卡死: 先把上一轮切换的残留全部清干净(exit 残留会让页面永久透明)
+ if(_goTimer){clearTimeout(_goTimer);_goTimer=null;}
+ document.querySelectorAll('.page.exit').forEach(p=>p.classList.remove('exit'));
+ // 清掉历史遗留的内联 opacity(上次快速切换可能留下)
+ document.querySelectorAll('.page').forEach(p=>p.style.opacity='');
+ if(cur){cur.classList.remove('active');cur.classList.add('exit');}
+ // 新页: 先关 transition 瞬移到起点(20px/透明), 强制 reflow, 再开 transition 激活
+ next.style.transition='none';
  next.classList.add('active');
+ void next.offsetWidth;
+ next.style.transition='';
  document.querySelectorAll('.sb-item').forEach((s,i)=>{
-  const isActive=(targetPage==='search'&&i===0)||((targetPage==='fav'||targetPage==='fav-inner')&&i===1)||(targetPage==='stats'&&i===2)||(targetPage==='settings'&&i===3);
+  const isActive=(navPage==='search'&&i===0)||(navPage==='fav'&&i===1)||(navPage==='stats'&&i===2)||(navPage==='settings'&&i===3);
   if(s.classList.contains('active')!==isActive){
    s.classList.toggle('active');
    if(isActive){
@@ -3159,7 +3285,12 @@ function go(targetPage){
    }
   }
  });
- setTimeout(()=>{cur.classList.remove('exit');pageTransitioning=false},400);
+ pageTransitioning=true;
+ _goTimer=setTimeout(()=>{
+  document.querySelectorAll('.page.exit').forEach(p=>p.classList.remove('exit'));
+  pageTransitioning=false;
+  _goTimer=null;
+ },400);
  if(targetPage==='search'){currentPage=0;renderWall();}
  else if(targetPage==='fav')renderFavs();
  else if(targetPage==='fav-inner')openFav(window.currentFavIdx);
@@ -3457,6 +3588,15 @@ async function doImport(){
        if(islandTxt)islandTxt.innerHTML='<b>PixivFavSearch</b> · '+sd.count+' 幅';
        setTimeout(()=>{b.style.width='0%';b.textContent=''},3000);
        await fetchWorks();renderWall();await fetchFavs();renderFavs();
+       // 导入成功 → 自动启动缩略图全量预载(最新→最旧)
+       try{
+        await fetch('/api/thumb-prefetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+        const pb=document.getElementById('prefetch-btn');
+        const pp=document.getElementById('prefetch-progress');
+        if(pb)pb.textContent='停止预载';
+        if(pp)pp.style.display='block';
+        startPrefetchPolling();
+       }catch(e){}
       }else{
        b.textContent='❌ '+(sd.msg||'失败');
        if(islandTxt)islandTxt.innerHTML='<b>PixivFavSearch</b>';
@@ -3661,6 +3801,65 @@ async function cancelDraft(){
   showDraftTip('已取消');
  }catch(e){showDraftTip('取消失败');}
 }
+
+// ===== 缩略图全量预载 UI =====
+let _pfTimer=null;
+async function togglePrefetch(){
+ const btn=document.getElementById('prefetch-btn');
+ const prog=document.getElementById('prefetch-progress');
+ // 若在跑 → 停止; 否则启动
+ const st=await fetch('/api/thumb-prefetch/status').then(r=>r.json()).catch(()=>null);
+ if(st&&st.running){
+  await fetch('/api/thumb-prefetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({stop:true})});
+  if(btn)btn.textContent='已停止';
+  return;
+ }
+ await fetch('/api/thumb-prefetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+ if(btn)btn.textContent='停止预载';
+ if(prog)prog.style.display='block';
+ startPrefetchPolling();
+}
+function startPrefetchPolling(){
+ if(_pfTimer)clearInterval(_pfTimer);
+ _pfTimer=setInterval(async()=>{
+  try{
+   const d=await fetch('/api/thumb-prefetch/status').then(r=>r.json());
+   const btn=document.getElementById('prefetch-btn');
+   const prog=document.getElementById('prefetch-progress');
+   const stat=document.getElementById('prefetch-stat');
+   const eta=document.getElementById('prefetch-eta');
+   const bar=document.getElementById('prefetch-bar');
+   const pct=d.total>0?Math.round(d.done/d.total*100):0;
+   if(stat)stat.textContent=`✓ ${d.ok} 成功 · ${d.fail} 失败 · ${d.skip} 已有 · ${d.pending} 待下`;
+   if(eta){
+    if(d.running&&d.eta_s>=0)eta.textContent=`剩余 ~${Math.max(1,Math.round(d.eta_s/60))} 分钟 (${pct}%)`;
+    else eta.textContent=d.running?'':'完成';
+   }
+   if(bar)bar.style.width=pct+'%';
+   if(!d.running){
+    clearInterval(_pfTimer);_pfTimer=null;
+    if(btn)btn.textContent='开始预载';
+    if(eta)eta.textContent=`完成! 本地缓存 ${d.cached} 张`;
+    if(bar)bar.style.width='100%';
+    // 完成后刷新当前页(新缩略图立即可见)
+    renderWall();
+   }
+  }catch(e){}
+ },1500);
+}
+// 启动时查一次: 上次没跑完的继续显示进度
+setTimeout(async()=>{
+ try{
+  const d=await fetch('/api/thumb-prefetch/status').then(r=>r.json());
+  if(d.running){
+   const btn=document.getElementById('prefetch-btn');
+   const prog=document.getElementById('prefetch-progress');
+   if(btn)btn.textContent='停止预载';
+   if(prog)prog.style.display='block';
+   startPrefetchPolling();
+  }
+ }catch(e){}
+},2000);
 
 function loadTagFilters(){
  try{
