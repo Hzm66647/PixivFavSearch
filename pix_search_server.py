@@ -1447,8 +1447,7 @@ class H(BaseHTTPRequestHandler):
             except Exception:
                 pass
             n_backups = len(os.listdir(BACKUP_DIR)) if os.path.isdir(BACKUP_DIR) else 0
-            import time as _t
-            uptime_s = round(_t.time() - _START_TS, 0)
+            uptime_s = round(_time_mod.time() - _START_TS, 0)
             self.send_json(200, {
                 "ok": True,
                 "version": VERSION,
