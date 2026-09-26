@@ -1826,13 +1826,30 @@ class H(BaseHTTPRequestHandler):
                 pass
             with open(local, "rb") as f:
                 body = f.read()
-            ctype = "image/svg+xml" if local.endswith(".svg") else "image/jpeg"
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            # immutable: 浏览器重启后也直接用本地缓存, 不发条件请求
-            # (图片内容永不变化, 无需重新验证)
-            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
-            self.send_header("Last-Modified", time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(os.path.getmtime(local))))
+            is_svg = local.endswith(".svg")
+            ctype = "image/svg+xml" if is_svg else "image/jpeg"
+            if is_svg:
+                # 占位图(SVG): 可能被真图替换(重试成功后), 不 immutable,
+                # 每次用 ETag 验证, 内容变了浏览器自动拉新
+                import hashlib as _hl
+                etag = '"' + _hl.md5(body).hexdigest()[:16] + '"'
+                inm = self.headers.get("If-None-Match")
+                if inm and inm == etag:
+                    self.send_response(304)
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("ETag", etag)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("ETag", etag)
+            else:
+                # 真图(jpg): 内容永不变化, immutable 浏览器零请求
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+                self.send_header("Last-Modified", time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(os.path.getmtime(local))))
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -2518,6 +2535,7 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 <div class="island" id="island">
   <button class="island-btn" onclick="document.getElementById('q').focus()" title="搜索 (/)">🔍</button>
   <span class="island-txt"><b>PixivFavSearch</b> · <span id="island-count">0</span> 幅</span>
+  <button class="island-btn" id="refresh-btn" onclick="refreshAll()" title="刷新 (F5)">🔄</button>
   <button class="island-btn" onclick="doImport()" title="导入收藏">📥</button>
   <button class="island-btn" onclick="toggleTheme()" title="主题">🎨</button>
 </div>
@@ -3065,7 +3083,8 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 <!-- 灵动岛 -->
 <div class="island">
   <button class="island-btn" onclick="togSearch()">🔍</button>
-  <span class="island-txt"><b>PixivFavSearch</b> · 8,237 幅</span>
+  <span class="island-txt"><b>PixivFavSearch</b> · <span id="island-count">0</span> 幅</span>
+  <button class="island-btn" id="refresh-btn" onclick="refreshAll()" title="刷新 (F5)">🔄</button>
   <button class="island-btn" onclick="doImport()">📥</button>
   <button class="island-btn" onclick="togTheme()" title="主题 & 动效">🎨</button>
 </div>
@@ -3607,6 +3626,48 @@ async function openFav(idx){
  go('fav-inner');   // 页面 id 是 pg-fav-inner, 不是 pg-inner!
 }
 
+// ===== 刷新(灵动岛🔄/F5): 重渲染当前页 + 强制重载图片 =====
+async function refreshAll(){
+ // 旋转动画
+ const btn=document.getElementById('refresh-btn');
+ if(btn){
+  btn.style.transition='transform .6s cubic-bezier(.22,1.4,.36,1)';
+  btn.style.transform='rotate(360deg)';
+  setTimeout(()=>{btn.style.transition='none';btn.style.transform='rotate(0deg)';void btn.offsetWidth;btn.style.transition='';},650);
+ }
+ // 清统计缓存(收藏数变化后统计也要新)
+ statsCache=null;
+ // 找当前页重渲染
+ const cur=document.querySelector('.page.active');
+ const page=cur?cur.id.replace('pg-',''):null;
+ if(page==='search'){
+  await fetchWorks();
+  document.getElementById('wall').innerHTML=wallHTML(works);
+ }else if(page==='fav'){
+  await fetchFavs();
+  renderFavs();
+ }else if(page==='fav-inner'){
+  openFav(window.currentFavIdx);
+ }else if(page==='stats'){
+  renderStats();
+ }
+ // 强制重载当前页所有缩略图(绕过缓存: 加时间戳查询参数)
+ // 场景: 预载刚下完/占位图被真图替换, img 标签还挂着旧地址
+ document.querySelectorAll('.page.active img').forEach(img=>{
+  const src=img.getAttribute('src')||'';
+  if(src.startsWith('/thumb/')){
+   const base=src.split('?')[0];
+   img.src=base+'?v='+Date.now();
+  }
+ });
+ // 灵动岛计数也更新
+ try{
+  const st=await fetch('/api/thumb-prefetch/status').then(r=>r.json());
+  const cnt=document.getElementById('island-count');
+  if(cnt)cnt.textContent=(st.cached>=0?st.cached:0).toLocaleString();
+ }catch(e){}
+}
+
 function togSearch(){
  const p=document.getElementById('search-p');
  const tb=document.getElementById('tag-bar');
@@ -3711,6 +3772,8 @@ document.addEventListener('wheel',e=>{
 },{passive:true});
 
 document.addEventListener('keydown',e=>{
+ // F5: 应用内刷新(重渲染+图片重载), 不整页 reload
+ if(e.key==='F5'){e.preventDefault();refreshAll();return;}
  // 查看器打开时: Esc关闭 / ←→切换 / 滚轮由 wheel 事件处理
  const viewerOpen=document.getElementById('viewer')&&document.getElementById('viewer').classList.contains('open');
  if(viewerOpen){
