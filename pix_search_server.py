@@ -1595,12 +1595,13 @@ class H(BaseHTTPRequestHandler):
             if safe_mode:
                 merged = [m for m in merged if not m.get("isR18")]
             log_debug(f"安全模式: {safe_mode}, 过滤后: {len(merged)}")
-            # ---- 排序选项: relevance(默认相关度) / new(新→旧) / old(旧→新) / author / random ----
-            sort_param = urllib.parse.parse_qs(u.query).get("sort", ["relevance"])[0].strip()
+            # ---- 排序选项: new(默认=最新收藏,按bookmarkId收藏时间) / old / relevance(搜索相关度,手动选) / author / random ----
+            # 注意: createDate 是作品发布日期, 不是收藏时间; bookmarkId 才随收藏单调递增
+            sort_param = urllib.parse.parse_qs(u.query).get("sort", ["new"])[0].strip()
             if sort_param == "new":
-                merged.sort(key=lambda m: (m.get("createDate") or ""), reverse=True)
+                merged.sort(key=lambda m: int(m.get("bookmarkId") or 0), reverse=True)
             elif sort_param == "old":
-                merged.sort(key=lambda m: (m.get("createDate") or ""))
+                merged.sort(key=lambda m: int(m.get("bookmarkId") or 0))
             elif sort_param == "author":
                 merged.sort(key=lambda m: ((m.get("userName") or "").lower(), m.get("id", "")))
             elif sort_param == "random":
@@ -3190,8 +3191,8 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
   </div>
   <div class="tag-bar-select">
     <select id="sort-select" onchange="setSortMode(this.value)" title="排序方式">
+      <option value="new" selected>🆕 最新收藏</option>
       <option value="relevance">🎯 相关度</option>
-      <option value="new">🆕 最新收藏</option>
       <option value="old">📜 最早收藏</option>
       <option value="author">✍️ 按作者</option>
       <option value="random">🎲 随机</option>
@@ -3323,7 +3324,7 @@ let safe=true;
 let searchQuery='';
 let tagFilter='';
 let coltagFilter='';
-let sortMode='relevance';
+let sortMode='new';   // 默认最新收藏(搜索相关度需手动选)
 let statsFilter=null;   // 统计面板跳转的精确筛选 {type:'author'|'year'|'tag', val:...}
 let currentPage=0;
 let pageSize=200;
