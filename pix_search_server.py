@@ -4267,6 +4267,8 @@ def start_server(host="127.0.0.1", port=None, daemon=True):
     srv._serving_thread = t
     t.start()
     log_info(f"服务已启动 http://{host}:{port} | Server started at http://{host}:{port}")
+    # 自动恢复缩略图预载(桌面 exe import 启动 / 命令行直跑 都走这里)
+    _auto_resume_prefetch()
     return srv
 
 def stop_server():
@@ -4283,7 +4285,6 @@ if __name__ == "__main__":
     # 命令行直接运行: 前台绑定 0.0.0.0 供局域网访问, 阻塞等待
     srv = start_server(host="0.0.0.0", daemon=False)
     print(f"[OK] Started: http://127.0.0.1:{PORT}/ (whitelist={sorted(ALLOWED_IPS)})")
-    _auto_resume_prefetch()
     try:
         while srv._serving_thread.is_alive():
             time.sleep(1)
