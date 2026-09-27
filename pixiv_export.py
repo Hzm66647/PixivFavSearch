@@ -60,6 +60,61 @@ def _ws_send(ws, method, params=None):
         except Exception:
             return None
 
+def _edge_exe_path():
+    """找 msedge.exe: 常见安装位置 + PATH。"""
+    import shutil
+    candidates = [
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return shutil.which("msedge")
+
+def _edge_debug_running(port=9222):
+    """CDP 端口是否已有 Edge 在监听。"""
+    try:
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        conn.request("GET", "/json/version")
+        conn.getresponse().read()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+def launch_edge_for_login(port=9222):
+    """用调试端口启动独立 Edge 实例打开 pixiv 登录页(不动用户正在用的 Edge)。
+    新测试机上 Edge 默认不开调试端口 → 方式A 之前 100% 失败。
+    独立 user-data-dir 避免和用户日常 Edge 冲突(配置文件锁)。
+    Returns: (ok, msg)"""
+    if _edge_debug_running(port):
+        return True, "CDP 已在运行"
+    exe = _edge_exe_path()
+    if not exe:
+        return False, "未找到 Microsoft Edge"
+    import tempfile, subprocess
+    profile = os.path.join(tempfile.gettempdir(), "pfs_edge_login")
+    try:
+        subprocess.Popen([
+            exe,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile}",
+            "--no-first-run", "--no-default-browser-check",
+            "https://www.pixiv.net/login.php",
+        ], close_fds=True)
+        # 等端口就绪(最多 10s)
+        import time as _t
+        for _ in range(20):
+            _t.sleep(0.5)
+            if _edge_debug_running(port):
+                return True, "Edge 已启动(独立实例)"
+        return False, "Edge 启动超时"
+    except Exception as e:
+        return False, repr(e)[:80]
+
 def grab_cookies_via_cdp(port=9222, proxy_bypass=True):
     """通过 CDP 从浏览器抓取 Pixiv cookie
     

@@ -729,7 +729,13 @@ def _import_worker():
             msg = f"导入完成, 当前共 {count} 幅收藏"
             log_info(f"收藏导入完成, 共 {count} 幅 | Import finished, {count} bookmarks")
         else:
-            msg = "导入失败。Edge 浏览器正在运行导致无法读取 cookie，请先关闭 Edge 浏览器，然后再点导入"
+            _proxy_hint = ""
+            try:
+                if not urllib.request.getproxies():
+                    _proxy_hint = "。未检测到系统代理 —— 访问 Pixiv 需要代理(如 v2rayN/Clash), 请先开启"
+            except Exception:
+                pass
+            msg = "导入失败。Edge 浏览器正在运行导致无法读取 cookie，请先关闭 Edge 浏览器，然后再点导入" + _proxy_hint
             log_error(f"收藏导入失败(code={code}) | Import failed (code={code})")
         _import_state.update({"running": False, "code": code, "msg": msg, "count": count, "t": time.time()})
     except Exception as e:
@@ -1953,11 +1959,22 @@ class H(BaseHTTPRequestHandler):
             return
         u = urllib.parse.urlparse(self.path)
         if u.path == "/api/first-run/edge":
-            """从 Edge CDP 抓取 Pixiv cookie"""
+            """从 Edge CDP 抓取 Pixiv cookie。
+            新机器上 Edge 默认不开调试端口 → 先自动用调试端口拉起
+            独立 Edge 实例(不动用户日常 Edge), 用户在里面登录即可。"""
             import pixiv_export as _pe
             cookies = _pe.grab_cookies_from_edge()
             if not cookies:
-                return self.send_json(400, {"ok": False, "error": "无法连接 Edge CDP (9222) 或未登录 Pixiv"})
+                # CDP 不通: 自动启动独立 Edge 调试实例
+                ok, msg = _pe.launch_edge_for_login()
+                if not ok:
+                    return self.send_json(400, {"ok": False, "error": f"无法启动 Edge: {msg}"})
+                # 已拉起登录页, 等用户登录(前端轮询 check)
+                return self.send_json(200, {"ok": True, "launched": True, "msg": "已打开 Edge 登录页, 登录后点【我已登录】按钮"})
+            # 校验登录态: 匿名 PHPSESSID(登录页自己种的)没有 uid → 不算登录成功
+            uid_probe = _pe._detect_uid(cookies)
+            if not uid_probe:
+                return self.send_json(400, {"ok": False, "error": "检测到的是未登录状态(匿名 cookie)。请在打开的 Edge 里登录 Pixiv 后再点一次"})
             ok, uid, count = _pe.save_cookies(cookies)
             if ok:
                 log_info(f"首次引导: 从 Edge 抓取 {count} 个 cookie, uid={uid}")
@@ -1980,6 +1997,14 @@ class H(BaseHTTPRequestHandler):
 
         if u.path == "/api/first-run/launch-login":
             """导航 WebView2 到登录页（通过 CDP 9223）"""
+            # 桌面模式: 走 desktop_app 回调拉起带 CDP 9223 的登录窗口(纯服务器模式无回调, 走下方 CDP 导航)
+            _login_cb = globals().get("_START_LOGIN_CB")
+            if _login_cb:
+                try:
+                    if _login_cb():
+                        return self.send_json(200, {"ok": True, "mode": "window"})
+                except Exception:
+                    pass
             try:
                 import http.client
                 import websocket
@@ -2646,7 +2671,12 @@ async function grabEdge() {
   try {
     const r = await fetch('/api/first-run/edge', {method: 'POST'});
     const j = await r.json();
-    if (j.ok) {
+    if (j.ok && j.launched) {
+      // 新机: 已自动打开 Edge 登录页, 等用户登录后再点本按钮抓 cookie
+      setStatus('🌐 已打开 Edge 登录页 — 请在里面登录 Pixiv, 完成后再点一次本按钮');
+      btn.disabled = false;
+      btn.querySelector('.label').textContent = '方式 A：我已在 Edge 里登录，抓取登录态';
+    } else if (j.ok) {
       showSuccess(j.uid);
     } else {
       setStatus('❌ ' + (j.error || '连接失败，请先用 Edge 登录 Pixiv'), 'error');
@@ -4473,6 +4503,13 @@ def register_browser_callback(cb):
     """desktop_app 启动时注册: 用系统默认浏览器打开链接(默认模式)。"""
     global _OPEN_BROWSER_CB
     _OPEN_BROWSER_CB = cb
+
+_START_LOGIN_CB = None
+
+def register_login_callback(cb):
+    """desktop_app 启动时注册: 拉起 WebView2 登录窗口(带 CDP 9223)。"""
+    global _START_LOGIN_CB
+    _START_LOGIN_CB = cb
 
 def _auto_resume_prefetch():
     """启动 8s 后自动恢复缩略图预载(还有未完成的才跑)。

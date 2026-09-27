@@ -94,6 +94,18 @@ def open_external_window(url):
     except Exception:
         return False
 
+def _start_login_window():
+    """拉起 WebView2 登录窗口(独立进程, 带 CDP 9223 环境)。
+    供 /api/first-run/launch-login 调用 —— 纯服务器模式直接调
+    gui_worker 会没有 9223 环境, cookie 抓不到。"""
+    try:
+        p = multiprocessing.Process(target=gui_worker.start_login, daemon=True)
+        p.start()
+        _ext_win_procs.append(p)
+        return True
+    except Exception:
+        return False
+
 def open_in_browser(url):
     """用系统默认浏览器打开链接(默认模式)。
     跳转后弹托盘气泡提示 —— 用户在浏览器里看完,
@@ -271,6 +283,7 @@ def main():
     try:
         server.register_open_window_callback(open_external_window)   # inner 模式
         server.register_browser_callback(open_in_browser)             # browser 模式(默认)
+        server.register_login_callback(_start_login_window)           # 首跑登录窗口
     except Exception:
         pass
 
