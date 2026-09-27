@@ -2042,20 +2042,26 @@ class H(BaseHTTPRequestHandler):
             except Exception:
                 return self.send_json(400, {"ok": False, "error": "bad json"})
             url = data.get("url", "")
+            mode = data.get("mode", "browser")   # browser=系统默认浏览器(默认) / inner=应用内窗口(备选)
             # 只允许 pixiv 域名(防开放跳转)
             if not url.startswith("https://www.pixiv.net/"):
                 return self.send_json(400, {"ok": False, "error": "domain"})
             opened = False
             try:
-                # 注意: exe 里 desktop_app 是 __main__ 模块, 直接 import 会
-                # 重新加载副本并触发托盘初始化死锁。改用注册回调:
-                # desktop_app 启动时把 open_external_window 注册到本模块。
-                _cb = globals().get("_OPEN_EXTERNAL_WINDOW_CB")
-                if _cb:
-                    opened = bool(_cb(url))
+                # 回调模式(exe 里 desktop_app 是 __main__, 不能直接 import):
+                # browser → webbrowser.open + 托盘气泡(点图标回主应用)
+                # inner   → 应用内 WebView 窗口(关掉即回)
+                if mode == "inner":
+                    _cb = globals().get("_OPEN_EXTERNAL_WINDOW_CB")
+                    if _cb:
+                        opened = bool(_cb(url))
+                else:
+                    _cb = globals().get("_OPEN_BROWSER_CB")
+                    if _cb:
+                        opened = bool(_cb(url))
             except Exception:
                 pass
-            return self.send_json(200, {"ok": True, "opened": opened})
+            return self.send_json(200, {"ok": True, "opened": opened, "mode": mode})
 
         elif u.path == "/api/thumb-prefetch" and self.command == "POST":
             """启动/停止缩略图全量预载(最新→最旧)"""
@@ -3144,6 +3150,13 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
       </div>
     </div>
     <div class="sec">
+      <h3>🔗 链接打开方式</h3>
+      <div class="set-row">
+        <div><div class="set-label">作品链接用系统浏览器打开</div><div class="set-desc">默认: 常用浏览器打开 + 托盘气泡提示返回；关闭后用应用内窗口(关窗即回)</div></div>
+        <div class="tog on" id="open-mode-tog" onclick="togOpenMode(this)"></div>
+      </div>
+    </div>
+    <div class="sec">
       <h3>🖼️ 缩略图预载</h3>
       <div class="set-row">
         <div><div class="set-label">全量下载缩略图</div><div class="set-desc">后台从最新到最旧批量下载，翻页即秒开</div></div>
@@ -3349,16 +3362,26 @@ function colorHash(id){
  return 'hsl('+(Math.abs(h)%360)+', 60%, 50%)';
 }
 
+// 链接打开方式: 'browser'=系统默认浏览器(默认) / 'inner'=应用内窗口(备选)
+function getOpenMode(){try{return localStorage.getItem('pfs_open_mode')||'browser'}catch(e){return 'browser'}}
+function setOpenMode(m){try{localStorage.setItem('pfs_open_mode',m)}catch(e){}}
 function openWork(id){
- // 在应用内新 WebView 窗口打开 pixiv(不是系统浏览器)
- // window.open 在 WebView2 里会开系统浏览器, 用户回不来;
- // 改走后端 API → desktop_app 开新 WebView 窗口, 关掉即回主应用
- window._workWinOpened=false;
- fetch('/api/open-work',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:'https://www.pixiv.net/artworks/'+id})})
-  .then(r=>r.json()).then(d=>{if(d&&d.opened)window._workWinOpened=true;})
-  .catch(()=>{});
- // 兜底: API 不可用/纯浏览器模式时退回 window.open
- setTimeout(()=>{if(!window._workWinOpened)window.open('https://www.pixiv.net/artworks/'+id,'_blank');},600);
+ const url='https://www.pixiv.net/artworks/'+id;
+ const mode=getOpenMode();
+ if(mode==='inner'){
+  // 备选: 应用内 WebView 窗口(关掉即回主应用)
+  window._workWinOpened=false;
+  fetch('/api/open-work',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url,mode:'inner'})})
+   .then(r=>r.json()).then(d=>{if(d&&d.opened)window._workWinOpened=true;})
+   .catch(()=>{});
+  setTimeout(()=>{if(!window._workWinOpened)window.open(url,'_blank');},600);
+ }else{
+  // 默认: 系统常用浏览器。走后端(带托盘气泡"点图标返回");
+  // 纯浏览器模式(8897直开)后端没注册回调 → opened:false → 前端直接 window.open
+  fetch('/api/open-work',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url,mode:'browser'})})
+   .then(r=>r.json()).then(d=>{if(!d||!d.opened)window.open(url,'_blank');})
+   .catch(()=>{window.open(url,'_blank');});
+ }
 }
 
 function workCard(w){
@@ -4197,6 +4220,11 @@ function setSortMode(val){
  renderWall();
 }
 
+function togOpenMode(el){
+ const useBrowser=el.classList.toggle('on');
+ setOpenMode(useBrowser?'browser':'inner');
+}
+
 function loadColtagOptions(){
  try{
   fetch('/api/coltags').then(r=>r.json()).then(d=>{
@@ -4413,6 +4441,8 @@ breathingLoop();
 
 renderWall();renderFavs();renderPresets();updateSliders();
 loadTheme();
+// 恢复链接打开方式开关显示
+(function(){const t=document.getElementById('open-mode-tog');if(t)t.classList.toggle('on',getOpenMode()==='browser');})();
 loadDraft();
 loadTagFilters();loadColtagOptions();
 changeBgBrightness(100);
@@ -4435,6 +4465,13 @@ def register_open_window_callback(cb):
     (exe 里它是 __main__, import 会重新加载副本导致托盘死锁)。"""
     global _OPEN_EXTERNAL_WINDOW_CB
     _OPEN_EXTERNAL_WINDOW_CB = cb
+
+_OPEN_BROWSER_CB = None
+
+def register_browser_callback(cb):
+    """desktop_app 启动时注册: 用系统默认浏览器打开链接(默认模式)。"""
+    global _OPEN_BROWSER_CB
+    _OPEN_BROWSER_CB = cb
 
 def _auto_resume_prefetch():
     """启动 8s 后自动恢复缩略图预载(还有未完成的才跑)。

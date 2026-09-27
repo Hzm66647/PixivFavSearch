@@ -22,6 +22,7 @@ if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
     sys.exit(0)
 
 import webview
+import webbrowser
 from PIL import Image, ImageDraw, ImageFont
 from pystray import Icon, Menu, MenuItem
 
@@ -78,9 +79,9 @@ def _is_first_run():
 _ext_win_procs = []  # 外部链接窗口(pixiv 作品页等), 关掉即回主应用
 
 def open_external_window(url):
-    """在独立 WebView2 窗口打开外部链接(如 pixiv 作品页)。
-    供 pix_search_server 的 /api/open-work 调用 —— 前端点卡片链接时
-    不再弹系统浏览器(回不来), 而是开应用内窗口, 关掉即回主应用。"""
+    """在独立 WebView2 窗口打开外部链接(备选模式)。
+    供 pix_search_server 的 /api/open-work(mode=inner) 调用 ——
+    应用内窗口, 关掉即回主应用。"""
     try:
         p = multiprocessing.Process(target=gui_worker.start, args=(url, url.split("/")[2][:40]), daemon=True)
         p.start()
@@ -89,6 +90,22 @@ def open_external_window(url):
         for q in list(_ext_win_procs):
             if not q.is_alive():
                 _ext_win_procs.remove(q)
+        return True
+    except Exception:
+        return False
+
+def open_in_browser(url):
+    """用系统默认浏览器打开链接(默认模式)。
+    跳转后弹托盘气泡提示 —— 用户在浏览器里看完,
+    点一下托盘图标(或气泡)即回主应用窗口。"""
+    try:
+        webbrowser.open(url)
+        # 气泡提示: 点击托盘图标回主窗口
+        try:
+            if _tray_icon is not None:
+                _tray_icon.notify("已在浏览器打开 · 点托盘图标返回主界面", "PixivFavSearch")
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -117,6 +134,18 @@ def _stop_webview():
 # ----------------------------------------------------------------------
 # 托盘回调
 # ----------------------------------------------------------------------
+def _on_show_main(icon=None, item=None):
+    """托盘左键单击: 显示主窗口(从浏览器看完作品, 点托盘一键回主应用)。"""
+    global _webview_visible
+    port = server.PORT
+    if _webview_proc is None or not _webview_proc.is_alive():
+        if _cookies_exist():
+            _start_webview(f"http://127.0.0.1:{port}/")
+        else:
+            _start_webview(f"http://127.0.0.1:{port}/first-run")
+        _webview_visible = True
+        _update_menu()
+
 def _on_toggle(icon, item):
     """显示/隐藏窗口"""
     global _webview_visible
@@ -238,9 +267,10 @@ def main():
     # 加载配置
     _load_draft()
     
-    # 注册外部窗口回调(openWork 跳 pixiv 用, 避免 exe 里循环 import)
+    # 注册链接打开回调(openWork 跳 pixiv 用, 避免 exe 里循环 import)
     try:
-        server.register_open_window_callback(open_external_window)
+        server.register_open_window_callback(open_external_window)   # inner 模式
+        server.register_browser_callback(open_in_browser)             # browser 模式(默认)
     except Exception:
         pass
 
@@ -260,7 +290,7 @@ def main():
         MenuItem("设置", _on_settings),
         Menu.SEPARATOR,
         MenuItem("退出", _on_exit),
-    ))
+    ), default_action=_on_show_main)
     
     # 托盘主循环
     _tray_icon.run()
