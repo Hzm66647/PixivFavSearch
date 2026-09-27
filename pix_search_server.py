@@ -2915,12 +2915,13 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .progress.active{width:100%;transition:width 8s ease-out}
 
 /* 卡片 */
-.masonry{columns:4;column-gap:14px;padding-top:64px;max-width:1400px;margin:0 auto}
-@media(max-width:1400px){.masonry{columns:3}}
-@media(max-width:1100px){.masonry{columns:3}}
-@media(max-width:800px){.masonry{columns:2}}
+/* 行优先网格: 从左往右一行行往下(pixiv 官方样式), 翻页不跳动 */
+.masonry{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;padding-top:64px;padding-bottom:90px;max-width:1400px;margin:0 auto}
+@media(max-width:1400px){.masonry{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:1100px){.masonry{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:800px){.masonry{grid-template-columns:repeat(2,1fr)}}
 
-.card{break-inside:avoid;margin-bottom:16px;border-radius:20px;overflow:hidden;position:relative;cursor:pointer;background:var(--glass);backdrop-filter:blur(16px);border:1px solid var(--glass-bd);animation:cardIn .6s var(--ease-punch) both;transition:all .4s var(--ease-snap)}
+.card{border-radius:20px;overflow:hidden;position:relative;cursor:pointer;background:var(--glass);backdrop-filter:blur(16px);border:1px solid var(--glass-bd);animation:cardIn .6s var(--ease-punch) both;transition:all .4s var(--ease-snap)}
 @keyframes cardIn{from{opacity:0;transform:translateY(30px) scale(.85)}to{opacity:1;transform:translateY(0) scale(1)}}
 .card:nth-child(1){animation-delay:0ms}.card:nth-child(2){animation-delay:40ms}.card:nth-child(3){animation-delay:80ms}.card:nth-child(4){animation-delay:120ms}.card:nth-child(5){animation-delay:160ms}.card:nth-child(6){animation-delay:200ms}.card:nth-child(7){animation-delay:240ms}.card:nth-child(8){animation-delay:280ms}.card:nth-child(9){animation-delay:320ms}.card:nth-child(10){animation-delay:360ms}.card:nth-child(11){animation-delay:400ms}.card:nth-child(12){animation-delay:440ms}
 
