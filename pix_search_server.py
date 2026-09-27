@@ -230,6 +230,60 @@ def _write_log(level, zh, en=""):
         pass  # 日志本身不能崩
 
 def log_debug(zh, en=""): _write_log("DEBUG", zh, en)
+
+# ----------------------------------------------------------------------
+# DEBUG 模式: 极详细实时日志(独立文件, 逐行 flush, 轮转 10MB×3)
+# 开启: /api/debug/toggle 或设置页开关; 文件 %LOCALAPPDATA%\PixivFavSearch\log\debug.log
+# ----------------------------------------------------------------------
+_DEBUG = {"on": False}          # dict 便于 exe 内全局可变
+_DEBUG_FILE = os.path.join(LOG_DIR, "debug.log")
+_DEBUG_LOCK = threading.Lock()
+_DEBUG_MAX = 10 * 1024 * 1024   # 10MB 轮转
+
+def debug_on():
+    return _DEBUG["on"]
+
+def _dbg(cat, msg, **kw):
+    """DEBUG 实时日志: [时间] [类别] 消息 + 关键字参数。
+    逐行 flush(用户看日志时 tail -f 实时滚动), 异常永不外泄。"""
+    if not _DEBUG["on"]:
+        return
+    try:
+        _now = _dt.datetime.now()
+        _ts = _now.strftime("%H:%M:%S.") + f"{_now.microsecond//1000:03d}"
+        extra = ""
+        if kw:
+            try:
+                extra = " " + json.dumps(kw, ensure_ascii=False, default=str)[:500]
+            except Exception:
+                extra = " " + str(kw)[:300]
+        line = f"[{_ts}] [{cat}] {msg}{extra}" + chr(10)
+        with _DEBUG_LOCK:
+            try:
+                if os.path.exists(_DEBUG_FILE) and os.path.getsize(_DEBUG_FILE) > _DEBUG_MAX:
+                    # 轮转: debug.log → .1 → .2(.3 丢弃)
+                    for i in (2, 1):
+                        src_f = _DEBUG_FILE + (f".{i}" if i > 1 else ".1")
+                        dst_f = _DEBUG_FILE + f".{i+1}"
+                        if os.path.exists(src_f):
+                            try: os.replace(src_f, dst_f)
+                            except OSError: pass
+                    try: os.replace(_DEBUG_FILE, _DEBUG_FILE + ".1")
+                    except OSError: pass
+            except Exception:
+                pass
+            with open(_DEBUG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()   # 实时: 不等缓冲区
+    except Exception:
+        pass
+
+def toggle_debug(on=None):
+    """开关 debug 模式。返回 (当前状态, 日志路径)。"""
+    _DEBUG["on"] = (not _DEBUG["on"]) if on is None else bool(on)
+    if _DEBUG["on"]:
+        _dbg("SYS", f"DEBUG 模式开启 version={VERSION} pid={os.getpid()}")
+    return _DEBUG["on"], _DEBUG_FILE
 def log_info(zh, en=""):  _write_log("INFO",  zh, en)
 def log_warn(zh, en=""):  _write_log("WARN",  zh, en)
 def log_error(zh, en=""): _write_log("ERROR", zh, en)
@@ -690,6 +744,7 @@ def reload_pixiv_if_changed():
             BOOKMARKS = data
             BOOKMARKS_LOAD_TIME = mtime
             print(f"pixiv 数据热更新: {len(BOOKMARKS)} 幅书签")
+            _dbg("RELOAD", f"数据热更新 {len(BOOKMARKS)} 幅")
             log_info(f"收藏数据热更新 {len(BOOKMARKS)} 条 | Bookmark data hot-reloaded: {len(BOOKMARKS)} items")
         except Exception as e:
             print("pixiv 热更新失败:", repr(e))
@@ -709,6 +764,7 @@ def _import_worker():
     同时把 pixiv_export 的 stdout/stderr 逐行转发到日志(DEBUG), 方便诊断卡点。
     """
     global _import_state
+    _dbg("IMPORT", "导入开始")
     log_info("开始导入收藏 | Import bookmarks started")
     import io as _io
     import contextlib as _ctx
@@ -737,8 +793,12 @@ def _import_worker():
                 pass
             msg = "导入失败。Edge 浏览器正在运行导致无法读取 cookie，请先关闭 Edge 浏览器，然后再点导入" + _proxy_hint
             log_error(f"收藏导入失败(code={code}) | Import failed (code={code})")
+        _dbg("IMPORT", f"导入完成 code={code} count={count}")
         _import_state.update({"running": False, "code": code, "msg": msg, "count": count, "t": time.time()})
     except Exception as e:
+        if debug_on():
+            import traceback
+            _dbg("IMPORT-ERR", f"{type(e).__name__}: {e}", trace=traceback.format_exc()[-1200:])
         # 异常时也要把已缓存的子模块输出写入日志
         for _line in _buf.getvalue().splitlines():
             if _line.strip():
@@ -963,6 +1023,7 @@ def start_thumb_prefetch():
         _PREFETCH.update({"running": True, "stop": False, "done": 0, "ok": 0,
                           "fail": 0, "skip": 0, "cur": "", "t_start": time.time(),
                           "last_error": ""})
+        _dbg("PREFETCH", f"预载启动 待下={_PREFETCH['total']}")
         # 手动启动预载时清空失败缓存: 给瞬时失败的图重试机会
         # (limit_ 图走占位图逻辑不受影响)
         global _thumb_fail
@@ -1092,6 +1153,7 @@ def _prefetch_worker():
     finally:
         _PREFETCH["running"] = False
         _PREFETCH["finished_at"] = time.time()
+        _dbg("PREFETCH", f"预载结束 ok={_PREFETCH['ok']} fail={_PREFETCH['fail']} skip={_PREFETCH['skip']}")
         log_info(f"缩略图预载完成: 成功{_PREFETCH['ok']} 失败{_PREFETCH['fail']} 跳过{_PREFETCH['skip']} | "
                  f"Thumb prefetch done: ok={_PREFETCH['ok']} fail={_PREFETCH['fail']} skip={_PREFETCH['skip']}")
 
@@ -1180,8 +1242,13 @@ def thumb_for(item, lang="zh"):
                         if len(data) > 5 * 1024 * 1024:
                             return None
                         f.write(data)
-            return local if os.path.getsize(local) > 500 else None
+            _ok = os.path.getsize(local) > 500
+            if debug_on():
+                _dbg("THUMB", f"{'ok' if _ok else 'small'} pid={pid} url={url[:80]}")
+            return local if _ok else None
         except Exception as e:
+            if debug_on():
+                _dbg("THUMB-ERR", f"pid={pid} {type(e).__name__}: {str(e)[:120]}")
             _mark_thumb_fail(pid)   # 记入失败缓存, 24h 内不再重试(期间用占位图)
             if not hasattr(thumb_for, '_err_logged'):
                 thumb_for._err_logged = set()
@@ -1429,9 +1496,19 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(msg.encode("utf-8"))
 
     def do_GET(self):
+        _t0 = time.time()
         try:
             self._handle_get()
-        except Exception:
+            if debug_on():
+                _dbg("HTTP", f"GET {self.path[:120]} ok={int((time.time()-_t0)*1000)}ms")
+        except Exception as _e:
+            if debug_on():
+                import traceback
+                _es = str(_e)
+                _noise = ("10053" in _es or "10054" in _es or "ConnectionAborted" in type(_e).__name__
+                          or "RemoteDisconnected" in type(_e).__name__ or "ConnectionReset" in type(_e).__name__)
+                if not _noise:
+                    _dbg("HTTP-ERR", f"GET {self.path[:120]} {type(_e).__name__}: {_e}", trace=traceback.format_exc()[-1500:])
             # 畸形请求/异常: 不落 traceback(防搜索词泄露到日志), 统一 400
             try:
                 self._deny(400, "Bad Request (pix_search_server)")
@@ -1621,6 +1698,8 @@ class H(BaseHTTPRequestHandler):
             limit = int(urllib.parse.parse_qs(u.query).get("limit", [200])[0])
             total = len(merged)
             items = merged[offset:offset+limit]
+            if debug_on():
+                _dbg("SEARCH", f"q_len={len(q)} tag={tagf[:20] or '-'} coltag={colt[:16] or '-'} sort={urllib.parse.parse_qs(u.query).get('sort',['new'])[0]} safe={safe_mode} total={total} offset={offset} ret={len(items)}")
             self.send_json(200, {"total": total, "items": items, "offset": offset, "limit": limit})
         elif u.path == "/api/stats":
             """收藏统计: 作者排行/标签排行/年度趋势/R18比例, 供统计面板"""
@@ -1657,6 +1736,21 @@ class H(BaseHTTPRequestHandler):
                 "top_tags": [{"tag": k, "count": v} for k, v in tag_cnt.most_common(50)],
                 "by_year": [{"year": y, "count": c} for y, c in sorted(year_cnt.items())],
             })
+        elif u.path == "/api/debug/status":
+            """DEBUG 模式状态 + 日志尾部(最近 N 行, 供排障)"""
+            n_lines = 50
+            try:
+                n_lines = int(urllib.parse.parse_qs(u.query).get("tail", [50])[0])
+            except Exception:
+                pass
+            tail = ""
+            try:
+                if os.path.exists(_DEBUG_FILE):
+                    with open(_DEBUG_FILE, encoding="utf-8") as f:
+                        tail = "".join(f.readlines()[-n_lines:])
+            except Exception:
+                pass
+            self.send_json(200, {"on": _DEBUG["on"], "log_file": _DEBUG_FILE, "tail": tail})
         elif u.path == "/api/health":
             """健康检查: 数据/缓存/磁盘/端口状态, 供诊断用(只读)"""
             def _dir_ok(d):
@@ -1932,9 +2026,19 @@ class H(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        _t0 = time.time()
         try:
             self._handle_post()
-        except Exception:
+            if debug_on():
+                _dbg("HTTP", f"POST {self.path[:120]} ok={int((time.time()-_t0)*1000)}ms")
+        except Exception as _e:
+            if debug_on():
+                import traceback
+                _es = str(_e)
+                _noise = ("10053" in _es or "10054" in _es or "ConnectionAborted" in type(_e).__name__
+                          or "RemoteDisconnected" in type(_e).__name__ or "ConnectionReset" in type(_e).__name__)
+                if not _noise:
+                    _dbg("HTTP-ERR", f"POST {self.path[:120]} {type(_e).__name__}: {_e}", trace=traceback.format_exc()[-1500:])
             try:
                 self._deny(400, "Bad Request (pix_search_server)")
             except Exception:
@@ -2055,6 +2159,17 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True})
             except Exception as e:
                 return self.send_json(500, {"ok": False, "error": str(e)})
+
+        elif u.path == "/api/debug/toggle" and self.command == "POST":
+            """开关 DEBUG 模式(实时详细日志)。body: {"on": true/false} 或空=切换"""
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                data = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                data = {}
+            on, path = toggle_debug(data.get("on"))
+            log_info(f"DEBUG 模式: {'开启' if on else '关闭'} | Debug mode: {'on' if on else 'off'}")
+            self.send_json(200, {"ok": True, "on": on, "log_file": path})
 
         if u.path == "/api/first-run/check":
             """检查 cookies.json 是否已创建（供前端轮询等待登录完成）"""
@@ -3027,6 +3142,13 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
       <div class="set-row">
         <div><div class="set-label">开启安全模式</div><div class="set-desc">完全隐藏 R18 内容</div></div>
         <div class="tog on" id="safe-tog" onclick="togSafe()"></div>
+      </div>
+    </div>
+    <div class="sec">
+      <h3>🐞 调试模式</h3>
+      <div class="set-row">
+        <div><div class="set-label">详细日志(实时)</div><div class="set-desc" id="debug-desc">排障用: 记录每个请求/下载/异常到 debug.log</div></div>
+        <div class="tog" id="debug-tog" onclick="togDebug(this)"></div>
       </div>
     </div>
     <div class="sec">
@@ -4100,6 +4222,15 @@ function setSortMode(val){
  renderWall();
 }
 
+async function togDebug(el){
+ const on=el.classList.toggle('on');
+ try{
+  const r=await fetch('/api/debug/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:on})});
+  const d=await r.json();
+  const desc=document.getElementById('debug-desc');
+  if(desc)desc.textContent=on?('日志写入: '+d.log_file):'排障用: 记录每个请求/下载/异常到 debug.log';
+ }catch(e){}
+}
 function togOpenMode(el){
  const useBrowser=el.classList.toggle('on');
  setOpenMode(useBrowser?'browser':'inner');
@@ -4323,6 +4454,14 @@ renderWall();renderFavs();renderPresets();updateSliders();
 loadTheme();
 // 恢复链接打开方式开关显示
 (function(){const t=document.getElementById('open-mode-tog');if(t)t.classList.toggle('on',getOpenMode()==='browser');})();
+// 恢复调试模式开关状态
+(async function(){
+ try{
+  const d=await fetch('/api/debug/status').then(r=>r.json());
+  const t=document.getElementById('debug-tog');
+  if(t&&d.on)t.classList.add('on');
+ }catch(e){}
+})();
 loadDraft();
 loadTagFilters();loadColtagOptions();
 changeBgBrightness(100);
@@ -4431,6 +4570,7 @@ if __name__ == "__main__":
     # 命令行直接运行: 前台绑定 0.0.0.0 供局域网访问, 阻塞等待
     srv = start_server(host="0.0.0.0", daemon=False)
     print(f"[OK] Started: http://127.0.0.1:{PORT}/ (whitelist={sorted(ALLOWED_IPS)})")
+    _dbg("SYS", f"服务启动 port={PORT} version={VERSION} python={sys.version.split()[0]}")
     try:
         while srv._serving_thread.is_alive():
             time.sleep(1)
