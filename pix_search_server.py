@@ -2522,6 +2522,9 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
       </div>
 
       <div class="inline-status" id="st2"><span id="st2-txt"></span></div>
+
+      <!-- Nimbus 模式: 不阻塞用户 —— 导入在后台跑, 可先逛界面(完成后自动热更新) -->
+      <button class="lnk" id="btn-early" style="display:none;opacity:0;transition:opacity .6s" onclick="goToMain()">导入在后台进行，先去逛逛 →</button>
     </div>
 
     <!-- 步骤3: 完成 -->
@@ -2620,8 +2623,15 @@ async function startImport(){
     setStatus('st2','err','✗ '+e.message,false);
     return;
   }
+  // Nimbus 不阻塞模式: 5 秒后允许提前进入(导入后台继续, 完成后主界面热更新)
+  setTimeout(()=>{
+    const b=document.getElementById('btn-early');
+    if(b&&document.getElementById('pane2').classList.contains('on')){
+      b.style.display='block';
+      requestAnimationFrame(()=>b.style.opacity='1');
+    }
+  },5000);
   // 轮询进度
-  let last=0, stall=0;
   const iv=setInterval(async()=>{
     try{
       const r=await fetch('/api/import-status');
