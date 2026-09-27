@@ -2150,6 +2150,16 @@ class H(BaseHTTPRequestHandler):
                 log_error(f"首次引导: 导航 WebView2 失败: {e}")
                 return self.send_json(500, {"ok": False, "error": str(e)})
 
+        if u.path == "/api/first-run/resume" and self.command == "POST":
+            """重新运行引导: 清除 skip 标记(下次启动/立即跳转都能回引导页)"""
+            try:
+                _skip_marker = os.path.join(APP_DATA, ".skip_first_run")
+                if os.path.exists(_skip_marker):
+                    os.remove(_skip_marker)
+                return self.send_json(200, {"ok": True})
+            except Exception as e:
+                return self.send_json(500, {"ok": False, "error": str(e)})
+
         if u.path == "/api/first-run/skip" and self.command == "POST":
             """跳过首跑引导(写标记文件, 不再自动弹引导页)"""
             try:
@@ -3215,6 +3225,13 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
     <div class="sec">
       <h3>🔑 Cookie</h3>
       <div class="set-row"><div><div class="set-label">UID 85331620</div><div class="set-desc">17 个 cookie</div></div><button class="btn btn-red">清除并重新登录</button></div>
+    </div>
+    <div class="sec">
+      <h3>🚀 引导</h3>
+      <div class="set-row">
+        <div><div class="set-label">重新运行首次引导</div><div class="set-desc">登录 Pixiv / 导入收藏的向导</div></div>
+        <button class="btn" onclick="rerunFirstRun()">重新运行</button>
+      </div>
     </div>
     <div class="sec">
       <h3>💾 数据</h3>
@@ -4308,6 +4325,10 @@ async function togDebug(el){
   const desc=document.getElementById('debug-desc');
   if(desc)desc.textContent=on?('日志写入: '+d.log_file):'排障用: 记录每个请求/下载/异常到 debug.log';
  }catch(e){}
+}
+async function rerunFirstRun(){
+ try{ await fetch('/api/first-run/resume',{method:'POST'}); }catch(e){}
+ location.href='/first-run';
 }
 function togOpenMode(el){
  const useBrowser=el.classList.toggle('on');
