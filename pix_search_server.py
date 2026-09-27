@@ -3650,7 +3650,10 @@ function filterFromStats(type,val){
  tagFilter='';coltagFilter='';
  currentPage=0;
  statsFilter={type:type,val:decodeURIComponent(val)};
- renderWall();
+ // 关键: 切回搜索页让用户看到筛选结果(之前只渲染了 wall 但人还停在统计页 = "点了没反应")
+ const cur=document.querySelector('.page.active');
+ if(!cur||cur.id!=='pg-search')go('search');
+ else renderWall();
 }
 
 // ===== 图片查看器 =====
