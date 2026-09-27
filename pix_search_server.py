@@ -1311,28 +1311,30 @@ class H(BaseHTTPRequestHandler):
         return False
 
     def _rate_ok(self):
-        """API 限速: 每IP 5秒窗口最多60次 /api/; 图片代理宽松限速(100/5s, 防枚举触发远程下载);
-        首页带 ?key= 的请求也限速(30/5s, 防 key 暴力枚举; 正常访问首页无 key 不受限)。"""
+        """API 限速(按路径类型分桶): /api/ 60次/5s; /thumb/ 300次/5s; ?key= 30次/5s。
+        分桶原因: 一页渲染 200 张缩略图会把共享桶填满, 翻页的 /api/search
+        被 429 吞掉 → 页码在累积但内容不更新 → "点几下没反应然后飞页"。
+        (ip, kind) 各自独立计数, 互不挤占。"""
         ip = self.client_address[0]
         now = time.time()
         if self.path.startswith("/api/"):
-            cap = 60
+            kind, cap = "api", 60
         elif self.path.startswith("/thumb/"):
-            cap = 100
+            kind, cap = "thumb", 300   # 一页200张+翻页余量, 全缓存时毫秒级返回
         elif self.path.startswith("/") and "key=" in self.path:
-            cap = 30  # key 校验端点: 防暴力枚举
+            kind, cap = "key", 30   # key 校验端点: 防暴力枚举
         else:
             return True
+        key = (ip, kind)
         with _RATE_LOCK:
-            t = [x for x in _RATE.get(ip, []) if now - x < 5.0]
-            # 防 _RATE 无限增长: 每 IP 窗口最多 cap 条, 超出即视为超限
+            t = [x for x in _RATE.get(key, []) if now - x < 5.0]
             if len(t) >= cap:
-                _RATE[ip] = t
+                _RATE[key] = t
                 return False
             t.append(now)
-            _RATE[ip] = t
-            # 防 IP 条目无限增长: 超过 200 个 IP 时清理过期条目
-            if len(_RATE) > 200:
+            _RATE[key] = t
+            # 防条目无限增长: 超过 600 个桶时清理过期条目
+            if len(_RATE) > 600:
                 dead = [k for k, v in _RATE.items() if not v or now - v[-1] >= 5.0]
                 for k in dead:
                     _RATE.pop(k, None)
@@ -3379,13 +3381,16 @@ function wallHTML(list){
 }
 
 let _fetchSeq=0;   // 请求序号: 快速翻页时旧响应后到会覆盖新数据, 守卫丢弃过期响应
-async function fetchWorks(){
+let _lastGoodPage=0;   // 最后一次成功渲染的页码(请求失败时回滚, 防页码累积飞页)
+async function fetchWorks(retry=0){
  const seq=++_fetchSeq;
+ const pageAtRequest=currentPage;   // 发请求时的页码
  try{
   const p=new URLSearchParams({mode:'pixiv',q:searchQuery,tag:tagFilter,coltag:coltagFilter,sort:sortMode,offset:currentPage*pageSize,limit:pageSize,safe: safe ? '1' : '0'});
   // 统计面板专用筛选参数
   if(statsFilter){p.set(statsFilter.type,statsFilter.val);}
   const r=await fetch('/api/search?'+p);
+  if(!r.ok){throw new Error('HTTP '+r.status)}
   const d=await r.json();
   if(seq!==_fetchSeq){
    // 过期响应(用户已翻到别的页): 数据丢弃, 但分页 UI 仍按当前页刷新
@@ -3395,8 +3400,22 @@ async function fetchWorks(){
   works=d.items||[];
   totalItems=d.total||0;
   totalPages=Math.max(1,Math.ceil(totalItems/pageSize));
+  _lastGoodPage=currentPage;
   updatePagination();
- }catch(e){console.log('fetchWorks error',e)}
+ }catch(e){
+  console.log('fetchWorks error',e);
+  // 失败重试(最多3次, 间隔递增): 429/瞬时抖动自愈
+  if(retry<3&&seq===_fetchSeq){
+   setTimeout(()=>{if(seq===_fetchSeq)fetchWorks(retry+1)},400*(retry+1));
+   return;
+  }
+  // 重试仍失败且没有更新的请求: 回滚页码到上次成功页(防连点累积飞页)
+  if(seq===_fetchSeq&&currentPage!==_lastGoodPage){
+   console.log('翻页失败, 回滚到第'+(_lastGoodPage+1)+'页');
+   currentPage=_lastGoodPage;
+   updatePagination();
+  }
+ }
 }
 
 async function fetchFavs(){
@@ -4446,7 +4465,7 @@ def start_server(host="127.0.0.1", port=None, daemon=True):
     ThreadingHTTPServer.request_queue_size = 128
     # 线程上限: 防瞬时并发/慢速 DoS 耗尽线程
     import threading as _th
-    _MAX_THREADS = 32
+    _MAX_THREADS = 64   # 缩略图洪峰(200/页)+搜索并发, 32 会饿死 search
     _THREAD_SEM = _th.BoundedSemaphore(_MAX_THREADS)
     _orig_process = ThreadingHTTPServer.process_request
     def _limited_process(self, request, client_address):
