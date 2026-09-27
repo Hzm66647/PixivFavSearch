@@ -2432,7 +2432,9 @@ class H(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
-        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        # same-origin-allow-popups: 允许 window.open 的弹出窗口保持 opener 引用
+        # (纯 same-origin 会让 FF 把跨域导航后的窗口句柄置 null → 无法控制跳转)
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin-allow-popups")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Cache-Control", "no-store")
         if csp:
@@ -2795,7 +2797,7 @@ INDEX = r"""<meta charset=utf-8>
 <title>PixivFavSearch</title>
 <style>
 
-:root{--bg:#000;--glass:rgba(255,255,255,.07);--glass-bd:rgba(255,255,255,.12);--accent:#c77dff;--accent-g:rgba(199,125,255,.5);--txt:#fff;--sub:rgba(255,255,255,.55);--green:#34c759;--ease-power:cubic-bezier(.16,1,.3,1);--ease-punch:cubic-bezier(.22,1.4,.36,1);--ease-snap:cubic-bezier(.34,1.56,.64,1)}
+:root{--bg:#000;--glass:rgba(255,255,255,.07);--glass-bd:rgba(255,255,255,.12);--accent:#c77dff;--accent-rgb:199,125,255;--accent-g:rgba(199,125,255,.5);--txt:#fff;--sub:rgba(255,255,255,.55);--green:#34c759;--ease-power:cubic-bezier(.16,1,.3,1);--ease-punch:cubic-bezier(.22,1.4,.36,1);--ease-snap:cubic-bezier(.34,1.56,.64,1)}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','PingFang SC',sans-serif;background:var(--bg);color:var(--txt);height:100vh;overflow:hidden;-webkit-font-smoothing:antialiased;transition:background .4s}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60% at 15% 25%,rgba(100,50,200,.3) 0%,transparent 55%),radial-gradient(70% 90% at 85% 75%,rgba(180,80,220,.2) 0%,transparent 50%);pointer-events:none;z-index:0;transition:background .4s}
@@ -2807,18 +2809,18 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 
 /* 侧边栏 */
 .sidebar{position:fixed;left:14px;top:50%;transform:translateY(-50%);width:64px;background:var(--glass);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--glass-bd);border-radius:32px;padding:10px 6px;z-index:100;display:flex;flex-direction:column;gap:6px;box-shadow:0 12px 40px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.15);transition:all .4s var(--ease-power)}
-.sidebar:hover{transform:translateY(-50%) scale(1.06);box-shadow:0 20px 60px rgba(0,0,0,.6),0 0 80px color-mix(in srgb,var(--accent) 20%,transparent)}
+.sidebar:hover{transform:translateY(-50%) scale(1.06);box-shadow:0 20px 60px rgba(0,0,0,.6),0 0 80px rgba(var(--accent-rgb),0.20)}
 .sb-item{width:52px;height:52px;border-radius:26px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:22px;color:var(--sub);position:relative;transition:all .35s var(--ease-snap)}
 .sb-item:hover{transform:scale(1.22);color:var(--txt);background:rgba(255,255,255,.08)}
 .sb-item:active{transform:scale(.88)}
-.sb-item.active{background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 70%,#7b2cbf));color:#fff;box-shadow:0 6px 24px var(--accent-g);animation:sbPop .5s var(--ease-punch)}
+.sb-item.active{background:linear-gradient(135deg,var(--accent),#a055e8);color:#fff;box-shadow:0 6px 24px var(--accent-g);animation:sbPop .5s var(--ease-punch)}
 @keyframes sbPop{0%{transform:scale(.75)}40%{transform:scale(1.3)}60%{transform:scale(.9)}80%{transform:scale(1.1)}100%{transform:scale(1)}}
 .sb-tip{position:absolute;left:62px;background:var(--glass);backdrop-filter:blur(20px);border:1px solid var(--glass-bd);padding:8px 14px;border-radius:14px;font-size:13px;white-space:nowrap;opacity:0;transform:translateX(-10px) scale(.8);pointer-events:none;transition:all .3s var(--ease-snap);box-shadow:0 8px 24px rgba(0,0,0,.5)}
 .sb-item:hover .sb-tip{opacity:1;transform:translateX(0) scale(1)}
 
 /* 灵动岛 */
 .island{position:fixed;top:14px;left:50%;transform:translateX(-50%);background:var(--glass);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--glass-bd);border-radius:22px;padding:10px 22px;display:flex;align-items:center;gap:14px;z-index:200;box-shadow:0 10px 40px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.12);transition:all .5s var(--ease-power)}
-.island:hover{padding:10px 28px;box-shadow:0 16px 56px rgba(0,0,0,.6),0 0 80px color-mix(in srgb,var(--accent) 15%,transparent)}
+.island:hover{padding:10px 28px;box-shadow:0 16px 56px rgba(0,0,0,.6),0 0 80px rgba(var(--accent-rgb),0.15)}
 .island-btn{width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,.06);border:none;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:15px;color:var(--txt);transition:all .3s var(--ease-snap)}
 .island-btn:hover{transform:scale(1.25);background:var(--accent);box-shadow:0 6px 20px var(--accent-g)}
 .island-btn:active{transform:scale(.85)}
@@ -2919,7 +2921,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 @keyframes cardIn{from{opacity:0;transform:translateY(30px) scale(.85)}to{opacity:1;transform:translateY(0) scale(1)}}
 .card:nth-child(1){animation-delay:0ms}.card:nth-child(2){animation-delay:40ms}.card:nth-child(3){animation-delay:80ms}.card:nth-child(4){animation-delay:120ms}.card:nth-child(5){animation-delay:160ms}.card:nth-child(6){animation-delay:200ms}.card:nth-child(7){animation-delay:240ms}.card:nth-child(8){animation-delay:280ms}.card:nth-child(9){animation-delay:320ms}.card:nth-child(10){animation-delay:360ms}.card:nth-child(11){animation-delay:400ms}.card:nth-child(12){animation-delay:440ms}
 
-.card:hover{transform:translateY(-8px) scale(1.04);box-shadow:0 20px 48px rgba(0,0,0,.5),0 0 40px color-mix(in srgb,var(--accent) 15%,transparent),inset 0 1px 0 rgba(255,255,255,.2);border-color:rgba(255,255,255,.25)}
+.card:hover{transform:translateY(-8px) scale(1.04);box-shadow:0 20px 48px rgba(0,0,0,.5),0 0 40px rgba(var(--accent-rgb),0.15),inset 0 1px 0 rgba(255,255,255,.2);border-color:rgba(255,255,255,.25)}
 .card:active{transform:scale(.95);transition-duration:.15s}
 .card-img{width:100%;display:block;transition:transform .45s var(--ease-snap);object-fit:cover;max-height:280px}
 .card:hover .card-img{transform:scale(1.06)}
@@ -2947,7 +2949,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .modal-box h3{font-size:16px;margin-bottom:16px;color:var(--accent)}
 .tag-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
 .tag-chip{padding:7px 14px;border-radius:20px;background:rgba(255,255,255,.05);border:1px solid var(--glass-bd);font-size:13px;cursor:pointer;transition:all .25s var(--ease-snap)}
-.tag-chip:hover{background:color-mix(in srgb,var(--accent) 18%,transparent);transform:scale(1.1)}
+.tag-chip:hover{background:rgba(var(--accent-rgb),0.18);transform:scale(1.1)}
 .tag-chip.on{background:var(--accent);color:#1a0a2e;font-weight:600}
 .tag-input{width:100%;padding:12px 16px;border-radius:14px;background:rgba(255,255,255,.04);border:1px solid var(--glass-bd);color:var(--txt);font-size:14px;outline:none;transition:all .25s}
 .tag-input:focus{border-color:var(--accent);background:rgba(255,255,255,.08)}
@@ -2955,7 +2957,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 /* 收藏夹 */
 .fav-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;padding-top:64px}
 .fav-top h2{font-size:21px;font-weight:600}
-.fav-add{padding:10px 20px;border-radius:14px;background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 70%,#7b2cbf));color:#fff;border:none;font-size:14px;font-weight:600;cursor:pointer;transition:all .3s var(--ease-snap);box-shadow:0 4px 20px var(--accent-g)}
+.fav-add{padding:10px 20px;border-radius:14px;background:linear-gradient(135deg,var(--accent),#a055e8);color:#fff;border:none;font-size:14px;font-weight:600;cursor:pointer;transition:all .3s var(--ease-snap);box-shadow:0 4px 20px var(--accent-g)}
 .fav-add:hover{transform:scale(1.1) translateY(-2px);box-shadow:0 8px 28px var(--accent-g)}
 .fav-add:active{transform:scale(.92)}
 .fav-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:20px}
@@ -2989,7 +2991,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .btn:active{transform:scale(.94)}
 .btn-red{border-color:rgba(255,80,80,.3);color:#ff6b6b}
 .btn-red:hover{background:rgba(255,80,80,.15)}
-.btn-primary{background:linear-gradient(135deg,var(--accent),color-mix(in srgb,var(--accent) 70%,#7b2cbf));color:#fff;border:none;font-weight:600}
+.btn-primary{background:linear-gradient(135deg,var(--accent),#a055e8);color:#fff;border:none;font-weight:600}
 .btn-primary:hover{box-shadow:0 8px 24px var(--accent-g)}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-bottom:22px}
 .stat{background:var(--glass);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--glass-bd);border-radius:22px;padding:22px;text-align:center;transition:all .4s var(--ease-snap)}
@@ -3028,9 +3030,11 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .slider-row{padding:8px 0}
 .slider-row .labels{display:flex;justify-content:space-between;font-size:10px;color:var(--sub);margin-bottom:6px}
 .slider-row .labels .rec{color:var(--accent);font-weight:600}
-.val-tag{display:inline-block;padding:2px 8px;border-radius:8px;background:color-mix(in srgb,var(--accent) 20%,transparent);color:var(--accent);font-size:11px;font-weight:600;min-width:32px;text-align:center}
-input[type=range]{-webkit-appearance:none;width:100%;height:5px;border-radius:3px;background:rgba(255,255,255,.08);outline:none}
+.val-tag{display:inline-block;padding:2px 8px;border-radius:8px;background:rgba(var(--accent-rgb),0.20);color:var(--accent);font-size:11px;font-weight:600;min-width:32px;text-align:center}
+input[type=range]{-webkit-appearance:none;-moz-appearance:none;appearance:none;width:100%;height:5px;border-radius:3px;background:rgba(255,255,255,.08);outline:none}
 input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.4);transition:transform .2s var(--ease-snap)}
+
+input[type=range]::-moz-range-thumb{-moz-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.4);transition:transform .2s var(--ease-snap)}
 input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 .rec-tag{color:var(--accent);font-weight:600;font-size:11px}
 .rec-mark{position:absolute;top:20px;width:2px;height:8px;background:var(--accent);transform:translateX(-50%);border-radius:1px;pointer-events:none}
@@ -3055,6 +3059,8 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 ::-webkit-scrollbar-thumb{background:rgba(199,125,255,.45);border-radius:6px;border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-thumb:hover{background:rgba(199,125,255,.85);border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-thumb:active{background:var(--accent);border:2px solid transparent;background-clip:content-box}
+/* Firefox 标准滚动条属性(Chromium 也认) */
+*{scrollbar-width:thin;scrollbar-color:rgba(199,125,255,.5) rgba(255,255,255,.06)}
 
 .pagination{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);display:none;justify-content:center;align-items:center;gap:8px;padding:10px 18px;flex-wrap:wrap;background:var(--glass);backdrop-filter:blur(30px) saturate(180%);border:1px solid var(--glass-bd);border-radius:20px;z-index:150;box-shadow:0 12px 40px rgba(0,0,0,.45)}
 .pagination.show{display:flex}
@@ -3069,6 +3075,8 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 .bg-br-row{padding:8px 0}
 .bg-br-bar{-webkit-appearance:none;width:100%;height:5px;border-radius:3px;background:rgba(255,255,255,.08);outline:none}
 .bg-br-bar::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.4)}
+
+.bg-br-bar::-moz-range-thumb{-moz-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.4)}
 .brightness-overlay{position:fixed;inset:0;background:#000;pointer-events:none;z-index:1;opacity:0;transition:opacity .3s}
 .tag-bar{position:fixed;top:140px;left:50%;transform:translateX(-50%);width:min(600px,92vw);display:flex;align-items:center;gap:10px;z-index:185;opacity:0;pointer-events:none;transition:all .4s var(--ease-power)}
 .tag-bar.open{opacity:1;pointer-events:all}
@@ -3378,11 +3386,35 @@ function openWork(id){
    .catch(()=>{});
   setTimeout(()=>{if(!window._workWinOpened)window.open(url,'_blank');},600);
  }else{
-  // 默认: 系统常用浏览器。走后端(带托盘气泡"点图标返回");
-  // 纯浏览器模式(8897直开)后端没注册回调 → opened:false → 前端直接 window.open
+  // 默认: 系统常用浏览器。
+  // 兼容 Firefox/Chrome 弹窗拦截: window.open 必须在用户手势同步栈内,
+  // fetch 回调后手势已丢会被拦 → 先同步开窗口占住手势, 异步决定用不用
+  const win=window.open('','_blank');   // 同步: 手势内, 不会被拦
+  if(win){
+   win.document.write('<html><body style="background:#111;color:#888;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><p>正在跳转 Pixiv…</p></body></html>');
+  }
+  // 弹窗被完全拦截(返回null): 兜底用 <a target=_blank> 合成点击(部分浏览器放行)
+  if(!win){
+   const a=document.createElement('a');
+   a.href=url;a.target='_blank';a.rel='noopener';
+   document.body.appendChild(a);a.click();a.remove();
+   return;
+  }
   fetch('/api/open-work',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url,mode:'browser'})})
-   .then(r=>r.json()).then(d=>{if(!d||!d.opened)window.open(url,'_blank');})
-   .catch(()=>{window.open(url,'_blank');});
+   .then(r=>r.json()).then(d=>{
+    if(d&&d.opened){
+     // 桌面模式: 后端已用系统浏览器打开, 关掉占位窗口
+     if(win)win.close();
+    }else{
+     // 纯浏览器模式: 占位窗口直接跳转
+     try{if(win)win.location.href=url;else window.open(url,'_blank');}
+     catch(e){window.open(url,'_blank');}   // 句柄被 COOP 置 null 等异常兜底
+    }
+   })
+   .catch(()=>{
+    try{if(win)win.location.href=url;else window.open(url,'_blank');}
+    catch(e){window.open(url,'_blank');}
+   });
  }
 }
 
