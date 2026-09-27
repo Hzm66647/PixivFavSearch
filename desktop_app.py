@@ -71,6 +71,11 @@ def _cookies_exist():
     return os.path.exists(exporter.COOKIE_FILE)
 
 def _is_first_run():
+    # 用户点过"跳过"则不再弹引导页(直到有 cookie)
+    import os as _os
+    _skip = _os.path.join(_os.environ.get("LOCALAPPDATA", ""), "PixivFavSearch", ".skip_first_run")
+    if _os.path.exists(_skip):
+        return False
     return not _cookies_exist()
 
 # ----------------------------------------------------------------------
