@@ -3078,7 +3078,7 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 
 .bg-br-bar::-moz-range-thumb{-moz-appearance:none;width:18px;height:18px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.4)}
 .brightness-overlay{position:fixed;inset:0;background:#000;pointer-events:none;z-index:1;opacity:0;transition:opacity .3s}
-.tag-bar{position:fixed;top:140px;left:50%;transform:translateX(-50%);width:min(600px,92vw);display:flex;align-items:center;gap:10px;z-index:185;opacity:0;pointer-events:none;transition:all .4s var(--ease-power)}
+.tag-bar{position:fixed;top:140px;left:50%;transform:translateX(-50%);width:min(600px,92vw);display:flex;align-items:center;gap:10px;z-index:300;opacity:0;pointer-events:none;transition:all .4s var(--ease-power)}
 .tag-bar.open{opacity:1;pointer-events:all}
 .tag-bar-scroll{flex:1;display:flex;gap:8px;overflow-x:auto;padding:8px 0;scrollbar-width:none}
 .tag-bar-scroll::-webkit-scrollbar{display:none}
@@ -3086,6 +3086,22 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 .tag-pill:hover{border-color:var(--accent);color:var(--txt);transform:scale(1.05)}
 .tag-pill.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 .tag-bar-select select{padding:6px 12px;border-radius:12px;background:var(--glass);backdrop-filter:blur(20px);border:1px solid var(--glass-bd);color:var(--txt);font-size:12px;outline:none;cursor:pointer}
+/* ===== iOS 风自绘下拉(玻璃拟态浮层, 替代原生 select) ===== */
+.dd{position:relative}
+.dd-btn{display:flex;align-items:center;gap:6px;padding:7px 12px;border-radius:12px;background:var(--glass);backdrop-filter:blur(20px) saturate(180%);border:1px solid var(--glass-bd);color:var(--txt);font-size:12px;font-weight:600;cursor:pointer;transition:all .3s var(--ease-snap);font-family:inherit;white-space:nowrap}
+.dd-btn:hover{border-color:var(--accent);transform:translateY(-1px)}
+.dd-btn:active{transform:scale(.96)}
+.dd-btn-ico{font-size:13px}
+.dd-btn-txt{max-width:96px;overflow:hidden;text-overflow:ellipsis}
+.dd-caret{font-size:9px;color:var(--sub);transition:transform .3s var(--ease-punch);margin-left:1px}
+.dd.open .dd-caret{transform:rotate(180deg)}
+.dd-menu{position:absolute;top:calc(100% + 8px);right:0;min-width:168px;background:rgba(22,16,34,.92);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--glass-bd);border-radius:16px;padding:6px;z-index:400;box-shadow:0 20px 56px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.1);opacity:0;transform:translateY(-8px) scale(.96);transform-origin:top right;pointer-events:none;transition:all .3s var(--ease-punch)}
+.dd.open .dd-menu{opacity:1;transform:translateY(0) scale(1);pointer-events:auto}
+.dd-item{display:flex;align-items:center;gap:8px;padding:9px 12px;border-radius:11px;font-size:13px;color:var(--txt);cursor:pointer;transition:background .15s,transform .15s;white-space:nowrap}
+.dd-item:hover{background:rgba(255,255,255,.09);transform:translateX(3px)}
+.dd-item:active{transform:scale(.97)}
+.dd-item::after{content:'✓';margin-left:auto;color:var(--accent);font-weight:700;font-size:12px;opacity:0;transform:scale(.5);transition:all .25s var(--ease-punch)}
+.dd-item.sel::after{opacity:1;transform:scale(1)}
 .tag-bar-select select option{background:#1a1a2e;color:var(--txt)}
 
 </style>
@@ -3214,19 +3230,21 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
   <div class="tag-bar-scroll">
     <span class="tag-pill active" onclick="setTagFilter('',this)">全部</span>
   </div>
-  <div class="tag-bar-select">
-    <select id="sort-select" onchange="setSortMode(this.value)" title="排序方式">
-      <option value="new" selected>🆕 最新收藏</option>
-      <option value="relevance">🎯 相关度</option>
-      <option value="old">📜 最早收藏</option>
-      <option value="author">✍️ 按作者</option>
-      <option value="random">🎲 随机</option>
-    </select>
+  <div class="dd" id="dd-sort">
+    <button class="dd-btn" onclick="ddToggle('sort')" title="排序方式"><span class="dd-btn-ico">🆕</span><span class="dd-btn-txt" id="dd-sort-cur">最新收藏</span><span class="dd-caret">▾</span></button>
+    <div class="dd-menu" id="dd-sort-menu">
+      <div class="dd-item sel" data-val="new" onclick="ddPick('sort','new',this)">🆕 最新收藏</div>
+      <div class="dd-item" data-val="relevance" onclick="ddPick('sort','relevance',this)">🎯 相关度</div>
+      <div class="dd-item" data-val="old" onclick="ddPick('sort','old',this)">📜 最早收藏</div>
+      <div class="dd-item" data-val="author" onclick="ddPick('sort','author',this)">✍️ 按作者</div>
+      <div class="dd-item" data-val="random" onclick="ddPick('sort','random',this)">🎲 随机</div>
+    </div>
   </div>
-  <div class="tag-bar-select">
-    <select id="coltag-select" onchange="setColtagFilter(this.value)">
-      <option value="">全部收藏夹</option>
-    </select>
+  <div class="dd" id="dd-coltag">
+    <button class="dd-btn" onclick="ddToggle('coltag')" title="收藏夹"><span class="dd-btn-ico">📁</span><span class="dd-btn-txt" id="dd-coltag-cur">全部收藏夹</span><span class="dd-caret">▾</span></button>
+    <div class="dd-menu" id="dd-coltag-menu">
+      <div class="dd-item sel" data-val="" onclick="ddPick('coltag','',this)">📁 全部收藏夹</div>
+    </div>
   </div>
 </div>
 <!-- 亮度遮罩 -->
@@ -4251,6 +4269,31 @@ function setColtagFilter(val){
  renderWall();
 }
 
+// ===== iOS 风下拉菜单 =====
+function ddToggle(which){
+ const dd=document.getElementById('dd-'+which);
+ if(!dd)return;
+ const willOpen=!dd.classList.contains('open');
+ document.querySelectorAll('.dd.open').forEach(d=>d.classList.remove('open'));
+ if(willOpen)dd.classList.add('open');
+}
+document.addEventListener('click',e=>{
+ if(!e.target.closest('.dd'))document.querySelectorAll('.dd.open').forEach(d=>d.classList.remove('open'));
+});
+function ddPick(which,val,el){
+ const dd=document.getElementById('dd-'+which);
+ if(dd)dd.classList.remove('open');
+ dd.querySelectorAll('.dd-item').forEach(i=>i.classList.remove('sel'));
+ if(el)el.classList.add('sel');
+ const cur=document.getElementById('dd-'+which+'-cur');
+ const ico=el?el.textContent.trim().split(' ')[0]:'';
+ if(cur)cur.textContent=el?el.textContent.trim().slice(2).trim():val;
+ const btnIco=dd?dd.querySelector('.dd-btn-ico'):null;
+ if(btnIco&&ico)btnIco.textContent=ico;
+ if(which==='sort'){setSortMode(val)}
+ else if(which==='coltag'){setColtagFilter(val)}
+}
+
 function setSortMode(val){
  sortMode=val;
  currentPage=0;
@@ -4274,14 +4317,22 @@ function togOpenMode(el){
 function loadColtagOptions(){
  try{
   fetch('/api/coltags').then(r=>r.json()).then(d=>{
-   const sel=document.getElementById('coltag-select');
-   if(!sel)return;
-   sel.innerHTML='<option value="">全部收藏夹</option>';
-   (d.tags||d.data||[]).forEach(t=>{
-    const opt=document.createElement('option');
-    opt.value=t.tag;
-    opt.textContent=t.tag+' ('+t.count+')';
-    sel.appendChild(opt);
+   const menu=document.getElementById('dd-coltag-menu');
+   if(!menu)return;
+   // 用 DOM API 构建默认项(避免 innerHTML 引号嵌套地狱)
+   menu.innerHTML='';
+   const def=document.createElement('div');
+   def.className='dd-item sel';def.dataset.val='';
+   def.textContent='📁 全部收藏夹';
+   def.onclick=()=>ddPick('coltag','',def);
+   menu.appendChild(def);
+   (d.tags||[]).forEach(t=>{
+    const div=document.createElement('div');
+    div.className='dd-item';
+    div.dataset.val=t.tag;
+    div.textContent='📂 '+t.tag+' ('+t.count+')';
+    div.onclick=()=>ddPick('coltag',t.tag,div);
+    menu.appendChild(div);
    });
   });
  }catch(e){console.log(e)}
