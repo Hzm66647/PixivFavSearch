@@ -17,7 +17,10 @@ python/
 # PyInstaller 构建产物（exe 走 GitHub Release，不进仓库）
 build/
 dist/
+# spec 例外: README 指示用户用 `PyInstaller PixivFavSearch.spec` 编译,
+# 不纳入版本管理会导致克隆者无法构建
 *.spec
+!PixivFavSearch.spec
 
 # 环境/系统文件
 Thumbs.db
