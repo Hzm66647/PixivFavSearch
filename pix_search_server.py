@@ -755,15 +755,22 @@ def reload_pixiv_if_changed():
 # --- 收藏导入/更新(CDP 抓取最新收藏) ---
 _import_state = {"running": False, "code": None, "msg": "", "count": 0, "done": 0, "total": 0, "t": 0.0, "t_start": 0.0}
 
+# 导入进度共享块: exporter 每抓一批回写 done/total, import_status() 实时读取
+_IMPORT_PROG = {"total": 0, "done": 0}
+
 def import_status():
     """返回当前导入状态(供前端轮询)。t 为完成时间戳, 前端用于判断是否新一轮完成。"""
     s = dict(_import_state)
+    # 从 exporter 的实时进度块同步 total/done(导入期间 exporter 持续回写)
+    if s["running"]:
+        s["total"] = _IMPORT_PROG.get("total", 0) or s.get("total", 0)
+        s["done"] = _IMPORT_PROG.get("done", 0) or s.get("done", 0)
     # ETA 计算
     if s["running"] and s.get("total", 0) > 0 and s.get("t_start", 0):
         elapsed = time.time() - s["t_start"]
         rate = s.get("done", 0) / max(0.01, elapsed)
         remaining = max(0, s["total"] - s.get("done", 0))
-        s["eta_s"] = int(remaining / max(0.01, rate))
+        s["eta_s"] = int(remaining / max(0.01, rate)) if rate > 0 else -1
     else:
         s["eta_s"] = -1
     try:
@@ -783,9 +790,16 @@ def _import_worker():
     import io as _io
     import contextlib as _ctx
     _buf = _io.StringIO()
+    # 注入进度回调: exporter 每抓到一批就回写 done, 首次拿到 total
+    _IMPORT_PROG["total"] = 0
+    _IMPORT_PROG["done"] = 0
     try:
+        import pixiv_export as _ex
+        try:
+            _ex.set_progress_callback(_IMPORT_PROG)
+        except Exception:
+            pass
         with _ctx.redirect_stdout(_buf), _ctx.redirect_stderr(_buf):
-            import pixiv_export as _ex
             code = _ex.main()
         # 把子模块的 print 输出逐行写入日志(DEBUG), 便于定位失败阶段
         for _line in _buf.getvalue().splitlines():
@@ -808,7 +822,12 @@ def _import_worker():
             msg = "导入失败。Edge 浏览器正在运行导致无法读取 cookie，请先关闭 Edge 浏览器，然后再点导入" + _proxy_hint
             log_error(f"收藏导入失败(code={code}) | Import failed (code={code})")
         _dbg("IMPORT", f"导入完成 code={code} count={count}")
-        _import_state.update({"running": False, "code": code, "msg": msg, "count": count, "t": time.time()})
+        try:
+            _ex.set_progress_callback(None)
+        except Exception:
+            pass
+        _import_state.update({"running": False, "code": code, "msg": msg, "count": count,
+                              "done": count, "total": count, "t": time.time()})
     except Exception as e:
         if debug_on():
             import traceback
@@ -824,7 +843,10 @@ def start_import():
     """启动导入任务。已在跑则返回 False。"""
     if _import_state["running"]:
         return False
-    _import_state.update({"running": True, "code": None, "msg": "导入中…", "count": 0, "t": 0.0})
+    _import_state.update({"running": True, "code": None, "msg": "导入中…", "count": 0,
+                          "done": 0, "total": 0, "t": 0.0, "t_start": time.time()})
+    _IMPORT_PROG["total"] = 0
+    _IMPORT_PROG["done"] = 0
     import threading as _thr
     _thr.Thread(target=_import_worker, daemon=True).start()
     return True
@@ -2766,7 +2788,17 @@ async function startImport(){
       const r=await fetch('/api/import-status');
       const s=await r.json();
       if(s.cur)lbl.textContent=s.cur;
-      if(s.count>0){num.textContent=s.count+' 幅';fill.style.width=Math.min(95,s.count/20)+'%'}
+      if(s.total>0){
+        // 真实进度: 已导入/总数 + 百分比 + ETA
+        const pct=Math.min(100,Math.floor(s.done/s.total*100));
+        const eta=(s.eta_s>=0)?(' · 剩余 ~'+s.eta_s+' 秒'):'';
+        num.textContent=s.done.toLocaleString()+' / '+s.total.toLocaleString()+' 幅';
+        fill.style.width=pct+'%';
+        lbl.textContent='导入中 '+pct+'%'+eta;
+      }else if(s.count>0){
+        num.textContent=s.count+' 幅';
+        fill.style.width=Math.min(95,s.count/20)+'%';
+      }
       if(!s.running){
         clearInterval(iv);
         if(s.code===0){
@@ -3998,7 +4030,16 @@ async function doImport(){
        setTimeout(()=>{b.style.width='0%';b.textContent=''},8000);
       }
      }else{
-      if(islandTxt)islandTxt.innerHTML='<b>导入中…</b> '+secs+'秒';
+      // 实时进度: 已导入 X 幅 / 共 Y 幅 · Z% · 剩余 ~M 秒
+      if(sd.total>0){
+       const pct=Math.min(100,Math.floor(sd.done/sd.total*100));
+       const eta=(sd.eta_s>=0)?(' · 剩余 ~'+sd.eta_s+' 秒'):'';
+       b.style.width=pct+'%';
+       b.textContent='📥 '+sd.done.toLocaleString()+' / '+sd.total.toLocaleString()+' 幅 · '+pct+'%'+eta;
+       if(islandTxt)islandTxt.innerHTML='<b>导入中</b> '+sd.done.toLocaleString()+'/'+sd.total.toLocaleString()+' · '+pct+'%';
+      }else{
+       if(islandTxt)islandTxt.innerHTML='<b>导入中…</b> '+secs+'秒';
+      }
      }
     }catch(e){clearInterval(poll);b.textContent='❌ 网络错误';}
    },1000);

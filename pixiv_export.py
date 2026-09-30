@@ -226,6 +226,42 @@ def save_cookies(cookies):
 # ----------------------------------------------------------------------
 # 原有导入逻辑（保持不变）
 # ----------------------------------------------------------------------
+
+# 进度回调: 由 server 层注入({"total":N,"done":M}), 供前端显示实时进度
+_PROGRESS_CB = None
+
+def set_progress_callback(cb):
+    """注入进度字典(可变对象, 由本模块回写)。传 None 关闭。"""
+    global _PROGRESS_CB
+    _PROGRESS_CB = cb
+
+def _fetch_total_bookmarks(uid, cookie_header, proxy_url):
+    """取用户收藏总数(公开/私密合计), 作为进度百分比的分母。
+    Pixiv 的 bookmarks API 不返回总数, 改从用户主页 HTML 里抽。取不到返回 0。"""
+    try:
+        import urllib.request as _ur, re as _re, gzip as _gz, io as _io
+        _opener = urllib.request.build_opener(urllib.request.ProxyHandler(
+            {"http": proxy_url, "https": proxy_url})) if proxy_url else urllib.request.build_opener()
+        req = _ur.Request(f"https://www.pixiv.net/users/{uid}",
+                          headers={"Cookie": cookie_header,
+                                   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                                   "Accept-Encoding": "gzip"})
+        with _opener.open(req, timeout=20) as resp:
+            raw = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                raw = _gz.decompress(raw)
+            html = raw.decode("utf-8", "ignore")
+        # 形如 "bookmarks":{"total":8465} 或 收藏数文本
+        m = _re.search(r'"bookmarkCount"\s*:\s*(\d+)', html) or \
+            _re.search(r'bookmarks[^{]*\{[^}]*"total"\s*:\s*(\d+)', html)
+        if m:
+            n = int(m.group(1))
+            _log("main", f"[progress] 收藏总数={n}")
+            return n
+    except Exception as e:
+        _log("main", f"[progress] 取总数失败(不影响导入): {e}")
+    return 0
+
 def main():
     _log("main", "=== Import Start ===")
     
@@ -294,6 +330,12 @@ def main():
                     break
                 body = d.get("body") or {}
                 works = body.get("works") or []
+                # 进度上报: 让上层(服务器)能显示"已导入 X / 共 Y 幅"
+                # Pixiv 收藏 API 不返回总数, 用用户主页的 total 作为预估上限
+                if _PROGRESS_CB and not _PROGRESS_CB.get("total"):
+                    _PROGRESS_CB["total"] = _fetch_total_bookmarks(uid, cookie_header, proxy_url)
+                if _PROGRESS_CB:
+                    _PROGRESS_CB["done"] = len(all_items)
                 # 顺路收集收藏标签映射 (bookmarkData.id -> tags)
                 btags = body.get("bookmarkTags") or {}
                 if isinstance(btags, dict):
