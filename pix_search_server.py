@@ -678,12 +678,14 @@ def _load_pixiv_data():
     return json.load(open(path, encoding="utf-8")), os.path.getmtime(path)
 
 BOOKMARKS, BOOKMARKS_LOAD_TIME = _load_pixiv_data()
-if BOOKMARKS_LOAD_TIME == 0.0:
-    _data_src = "no-data"
-elif not os.path.exists(DATA):
-    _data_src = "demo"
-else:
-    _data_src = "user"
+
+def get_data_src():
+    """动态判断当前数据源: 导入后 bookmarks.json 出现要从 demo 切到 user"""
+    if not os.path.exists(DATA) or os.path.getsize(DATA) < 100:
+        return "demo"
+    return "user"
+
+_data_src = get_data_src()  # 初始值(兼容旧引用)
 import threading as _t
 PIXIV_LOCK = _t.Lock()
 # 预计算每幅的可检索映射:
@@ -751,11 +753,23 @@ def reload_pixiv_if_changed():
             log_error(f"收藏数据热更新失败: {repr(e)} | Bookmark hot-reload failed: {repr(e)}")
 
 # --- 收藏导入/更新(CDP 抓取最新收藏) ---
-_import_state = {"running": False, "code": None, "msg": "", "count": 0, "t": 0.0}
+_import_state = {"running": False, "code": None, "msg": "", "count": 0, "done": 0, "total": 0, "t": 0.0, "t_start": 0.0}
 
 def import_status():
     """返回当前导入状态(供前端轮询)。t 为完成时间戳, 前端用于判断是否新一轮完成。"""
     s = dict(_import_state)
+    # ETA 计算
+    if s["running"] and s.get("total", 0) > 0 and s.get("t_start", 0):
+        elapsed = time.time() - s["t_start"]
+        rate = s.get("done", 0) / max(0.01, elapsed)
+        remaining = max(0, s["total"] - s.get("done", 0))
+        s["eta_s"] = int(remaining / max(0.01, rate))
+    else:
+        s["eta_s"] = -1
+    try:
+        s["cached"] = sum(1 for f in os.listdir(THUMB) if f.endswith(".jpg"))
+    except Exception:
+        s["cached"] = -1
     return s
 
 def _import_worker():
@@ -1165,7 +1179,7 @@ def thumb_for(item, lang="zh"):
     """返回本地缩略图路径(不存在则下载, 受并发信号量限制避免占满线程池)。
     demo 数据(未导入收藏)直接返回本地 SVG 占位图。lang 参数只在 demo 模式生效(控制 SVG 占位文字语言)。"""
     # demo 模式: 不尝试下载, 直接返回本地占位图
-    if _data_src == "demo":
+    if get_data_src() == "demo":
         pid = str(item["id"])
         svg = demo_thumb_svg(item, lang)
         _demo_dir = os.path.join(OUT, "demo_thumbs")
@@ -1543,7 +1557,7 @@ class H(BaseHTTPRequestHandler):
                 self._sec_headers()
                 self.end_headers()
                 return
-            self.send_html(INDEX.replace("__DATASRC__", _data_src))
+            self.send_html(INDEX.replace("__DATASRC__", get_data_src()))
         elif u.path == "/api/search":
             mode = urllib.parse.parse_qs(u.query).get("mode", ["pixiv"])[0].strip()
             q = urllib.parse.parse_qs(u.query).get("q", [""])[0].strip()
@@ -3582,24 +3596,19 @@ function go(targetPage){
  const next=document.getElementById('pg-'+targetPage);
  if(!next)return;
  if(cur===next)return;
- // 防卡死: 先把上一轮切换的残留全部清干净(exit 残留会让页面永久透明)
+ // 防卡死: 清残留(但保留 exit 动画在旧页上继续播放)
  if(_goTimer){clearTimeout(_goTimer);_goTimer=null;}
- document.querySelectorAll('.page.exit').forEach(p=>p.classList.remove('exit'));
- // 清掉历史遗留的内联 opacity(上次快速切换可能留下)
- document.querySelectorAll('.page').forEach(p=>p.style.opacity='');
- if(cur){
-  // 旧页瞬移退出(关 transition 再移除 active, 避免渐隐期盖住新页)
-  cur.style.transition='none';
-  cur.classList.remove('active');
-  void cur.offsetWidth;
-  cur.style.transition='';
- }
- // 新页: 先关 transition 瞬移到起点(20px/透明), 强制 reflow, 再开 transition 播放入场动画
- // (旧页不再做 exit 动画: exit 淡出会与新页视觉重叠 → "卡在一半"的观感)
- next.style.transition='none';
+ document.querySelectorAll('.page').forEach(p=>{p.style.opacity='';p.style.transform='';});
+ // 旧页加 exit → CSS 自动播向左滑出(不瞬移, 看动画)
+ if(cur&&cur!==next){cur.classList.remove('active');cur.classList.add('exit');}
+ // 新页: 浏览器已默认在 .page 起点(translateX(40px)/opacity:0),
+ // 加 active → CSS transition 自动播入场动画, 不需要 reflow hack
  next.classList.add('active');
- void next.offsetWidth;
- next.style.transition='';
+ // 500ms 后清掉 exit(动画播完)
+ _goTimer=setTimeout(()=>{
+  document.querySelectorAll('.page.exit').forEach(p=>p.classList.remove('exit'));
+  _goTimer=null;
+ },550);
  document.querySelectorAll('.sb-item').forEach((s,i)=>{
   const isActive=(navPage==='search'&&i===0)||(navPage==='fav'&&i===1)||(navPage==='stats'&&i===2)||(navPage==='settings'&&i===3);
   if(s.classList.contains('active')!==isActive){
