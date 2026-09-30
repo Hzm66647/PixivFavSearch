@@ -2821,7 +2821,7 @@ INDEX = r"""<meta charset=utf-8>
 <title>PixivFavSearch</title>
 <style>
 
-:root{--bg:#000;--glass:rgba(255,255,255,.07);--glass-bd:rgba(255,255,255,.12);--accent:#c77dff;--accent-rgb:199,125,255;--accent-g:rgba(199,125,255,.5);--txt:#fff;--sub:rgba(255,255,255,.55);--green:#34c759;--ease-power:cubic-bezier(.16,1,.3,1);--ease-punch:cubic-bezier(.22,1.4,.36,1);--ease-snap:cubic-bezier(.34,1.56,.64,1)}
+:root{--bg:#000;--glass:rgba(255,255,255,.07);--glass-bd:rgba(255,255,255,.12);--accent:#c77dff;--accent-rgb:199,125,255;--accent-g:rgba(199,125,255,.5);--txt:#fff;--sub:rgba(255,255,255,.55);--green:#34c759;--ease-power:cubic-bezier(.16,1,.3,1);--ease-punch:cubic-bezier(.22,1.4,.36,1);--ease-snap:cubic-bezier(.34,1.56,.64,1);--ease-page:cubic-bezier(.25,.1,.25,1)}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','PingFang SC',sans-serif;background:var(--bg);color:var(--txt);height:100vh;overflow:hidden;-webkit-font-smoothing:antialiased;transition:background .4s}
 body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60% at 15% 25%,rgba(100,50,200,.3) 0%,transparent 55%),radial-gradient(70% 90% at 85% 75%,rgba(180,80,220,.2) 0%,transparent 50%);pointer-events:none;z-index:0;transition:background .4s}
@@ -2838,6 +2838,10 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 .sb-item:hover{transform:scale(1.22);color:var(--txt);background:rgba(255,255,255,.08)}
 .sb-item:active{transform:scale(.88)}
 .sb-item.active{background:linear-gradient(135deg,var(--accent),#a055e8);color:#fff;box-shadow:0 6px 24px var(--accent-g);animation:sbPop .5s var(--ease-punch)}
+/* 过渡期间降低背景模糊负担，动画结束后恢复 */
+body.transitioning .sidebar,
+body.transitioning .island,
+body.transitioning .search-float{backdrop-filter:blur(10px) saturate(120%);transition:backdrop-filter .15s}
 @keyframes sbPop{0%{transform:scale(.75)}40%{transform:scale(1.3)}60%{transform:scale(.9)}80%{transform:scale(1.1)}100%{transform:scale(1)}}
 .sb-tip{position:absolute;left:62px;background:var(--glass);backdrop-filter:blur(20px);border:1px solid var(--glass-bd);padding:8px 14px;border-radius:14px;font-size:13px;white-space:nowrap;opacity:0;transform:translateX(-10px) scale(.8);pointer-events:none;transition:all .3s var(--ease-snap);box-shadow:0 8px 24px rgba(0,0,0,.5)}
 .sb-item:hover .sb-tip{opacity:1;transform:translateX(0) scale(1)}
@@ -2926,7 +2930,7 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(80% 60
 
 /* 主内容 */
 .main{position:fixed;top:0;left:92px;right:0;bottom:0;overflow:hidden;padding:24px 32px}
-.page{position:absolute;top:0;left:0;right:0;bottom:0;padding:24px 32px;overflow-y:auto;opacity:0;transform:translateX(20px);transition:opacity .4s var(--ease-power),transform .4s var(--ease-power);pointer-events:none}
+.page{position:absolute;top:0;left:0;right:0;bottom:0;padding:24px 32px;overflow-y:auto;opacity:0;transform:translateX(20px);transition:opacity .3s var(--ease-page),transform .3s var(--ease-page);pointer-events:none;will-change:opacity,transform;backface-visibility:hidden}
 .page.active{opacity:1;transform:translateX(0);pointer-events:auto;z-index:2}
 .page.exit{opacity:0;transform:translateX(-20px);pointer-events:none;z-index:1}
 
@@ -3596,19 +3600,24 @@ function go(targetPage){
  const next=document.getElementById('pg-'+targetPage);
  if(!next)return;
  if(cur===next)return;
- // 防卡死: 清残留(但保留 exit 动画在旧页上继续播放)
  if(_goTimer){clearTimeout(_goTimer);_goTimer=null;}
+ pageTransitioning=true;
+ document.body.classList.add('transitioning');
  document.querySelectorAll('.page').forEach(p=>{p.style.opacity='';p.style.transform='';});
- // 旧页加 exit → CSS 自动播向左滑出(不瞬移, 看动画)
+ // 旧页加 exit → CSS 自动播向左滑出
  if(cur&&cur!==next){cur.classList.remove('active');cur.classList.add('exit');}
- // 新页: 浏览器已默认在 .page 起点(translateX(40px)/opacity:0),
- // 加 active → CSS transition 自动播入场动画, 不需要 reflow hack
+ // 新页加 active → CSS transition 播入场动画
  next.classList.add('active');
- // 500ms 后清掉 exit(动画播完)
+ // 300ms 后清掉 exit + 恢复渲染 + 渲染内容
  _goTimer=setTimeout(()=>{
   document.querySelectorAll('.page.exit').forEach(p=>p.classList.remove('exit'));
+  document.body.classList.remove('transitioning');
+  pageTransitioning=false;
   _goTimer=null;
- },550);
+  // 动画结束后再渲染内容（避免渲染抢占动画帧）
+  renderForPage(targetPage);
+ },320);
+ // 侧边栏高亮
  document.querySelectorAll('.sb-item').forEach((s,i)=>{
   const isActive=(navPage==='search'&&i===0)||(navPage==='fav'&&i===1)||(navPage==='stats'&&i===2)||(navPage==='settings'&&i===3);
   if(s.classList.contains('active')!==isActive){
@@ -3620,19 +3629,16 @@ function go(targetPage){
    }
   }
  });
- pageTransitioning=true;
- _goTimer=setTimeout(()=>{
-  document.querySelectorAll('.page.exit').forEach(p=>p.classList.remove('exit'));
-  pageTransitioning=false;
-  _goTimer=null;
- },400);
+}
+
+function renderForPage(page){
+ if(page==='search'){currentPage=0;renderWall();}
+ else if(page==='fav')renderFavs();
+ else if(page==='fav-inner')openFav(window.currentFavIdx);
+ else if(page==='stats')renderStats();
  // 分页条只在搜索页显示
  const pagEl=document.getElementById('pagination');
- if(pagEl)pagEl.classList.toggle('show', targetPage==='search');
- if(targetPage==='search'){currentPage=0;renderWall();}
- else if(targetPage==='fav')renderFavs();
- else if(targetPage==='fav-inner')openFav(window.currentFavIdx);
- else if(targetPage==='stats')renderStats();
+ if(pagEl)pagEl.classList.toggle('show', page==='search');
 }
 
 // ===== 统计面板 =====
