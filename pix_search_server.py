@@ -3,7 +3,7 @@
 输入标题关键词 -> 列出匹配作品(标题/作者/链接/缩略图)
 缩略图按需下载并缓存到 data/thumbs/
 """
-VERSION = "1.3.0"
+VERSION = "1.3.5"
 import time as _time_mod
 _START_TS = _time_mod.time()  # 启动时间戳(健康检查 uptime 用)
 UPDATE_CHECK_URL = "https://api.github.com/repos/Hzm66647/PixivFavSearch/releases/latest"
@@ -2194,18 +2194,6 @@ class H(BaseHTTPRequestHandler):
             on, path = toggle_debug(data.get("on"))
             log_info(f"DEBUG 模式: {'开启' if on else '关闭'} | Debug mode: {'on' if on else 'off'}")
             self.send_json(200, {"ok": True, "on": on, "log_file": path})
-
-        if u.path == "/api/first-run/check":
-            """检查 cookies.json 是否已创建（供前端轮询等待登录完成）"""
-            import pixiv_export as _pe
-            if os.path.exists(_pe.COOKIE_FILE):
-                try:
-                    _c = json.load(open(_pe.COOKIE_FILE, "r", encoding="utf-8"))
-                    uid = _pe._detect_uid(_c)
-                    return self.send_json(200, {"ok": True, "ready": True, "uid": uid, "count": len(_c)})
-                except Exception:
-                    pass
-            return self.send_json(200, {"ok": True, "ready": False})
 
         if u.path == "/api/open-work":
             """前端跳转 pixiv: 通知 desktop_app 开新 WebView 窗口(关掉即回主应用)。
