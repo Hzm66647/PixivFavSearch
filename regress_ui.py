@@ -62,6 +62,15 @@ chk("分页条元素", 'id="pagination"' in html)
 for ep in ["/api/search", "/api/import", "/api/import-status", "/api/stats"]:
     chk(f"前端引用 {ep}", ep in html)
 
+
+# ---------- 导入进度可见性(本轮修复) ----------
+chk("前端用 sd.total (真实总数)", "sd.total" in html)
+chk("前端用 sd.done (已导入)", "sd.done" in html)
+chk("前端用 sd.eta_s (剩余秒)", "sd.eta_s" in html)
+chk("进度文案 共 Y 幅", "幅 · '+" in html or "幅 · " in html)
+chk("灵动岛显示进度", "导入中</b> '+sd.done" in html or "导入中</b> " in html)
+chk("首跑向导去硬编码 /20", "Math.min(95,s.count/20)" not in html or "s.total>0" in html)
+
 # ---------- 汇总 ----------
 print("=" * 62)
 print(f"{'检查项':<44} 结果")
