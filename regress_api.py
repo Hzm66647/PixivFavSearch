@@ -234,6 +234,51 @@ ok, detail = _chk_card_resample()
 chk("原图档缩略图已重采样到卡片尺寸", ok, detail)
 
 
+def _chk_no_corrupt():
+    """缓存里不能有被截断的图。
+
+    血泪来源: 早期版本在重采样失败时仍把原文件落盘, 于是网络中断下载到的
+    残图(头部完整、像素缺失)被永久当成有效缓存 —— 卡片碎图, 而且因为它是
+    未缩放的巨图(实测 7 个: 2560×3712 / 6.8MB)还会让上面的尺寸断言爆红。
+    检测用尾部标记(JPEG FFD9 / PNG IEND), 比全解码快得多。
+    """
+    import os as _os
+    appdata = _os.path.join(_os.environ.get("LOCALAPPDATA", ""), "PixivFavSearch")
+    th = _os.path.join(appdata, "data", "thumbs")
+    if not _os.path.isdir(th):
+        return True, "无缩略图目录"
+    bad = []
+    checked = 0
+    try:
+        for f in _os.listdir(th):
+            if not f.lower().endswith((".jpg", ".png")):
+                continue
+            checked += 1
+            p = _os.path.join(th, f)
+            try:
+                sz = _os.path.getsize(p)
+                if sz < 16:
+                    continue
+                with open(p, "rb") as fh:
+                    head = fh.read(8)
+                    fh.seek(max(0, sz - 32))
+                    tail = fh.read()
+                if head[:3] == b"\xff\xd8\xff":
+                    if b"\xff\xd9" not in tail[-16:]:
+                        bad.append(f)
+                elif head[:8] == bytes([137, 80, 78, 71, 13, 10, 26, 10]):
+                    if b"IEND" not in tail:
+                        bad.append(f)
+            except Exception:
+                continue
+    except Exception as e:
+        return False, f"扫描异常 {e}"
+    return (not bad), f"检查{checked}个 截断{len(bad)}个{(' ' + str(bad[:3])) if bad else ''}"
+
+ok, detail = _chk_no_corrupt()
+chk("缓存无截断残图", ok, detail)
+
+
 def _chk_cache_naming():
     """缓存文件名必须带档位后缀, 否则换档位会误用旧分辨率的图。"""
     import os as _os

@@ -677,7 +677,7 @@ def _pximg_proxies():
     # 纯 SOCKS 环境回退
     try:
         h, p = _SOCKS_FALLBACK
-        s = socket.create_connection((h, p), timeout=0.6)
+        s = pysocket.create_connection((h, p), timeout=0.6)
         try:
             s.close()
         except Exception:
@@ -1019,6 +1019,141 @@ _thumb_fail = {}          # pid -> 失败时间戳
 _thumb_fail_loaded = False
 _THUMB_FAIL_TTL = 86400   # 24h 后允许重试(作品可能解除限制)
 
+# ----------------------------------------------------------------------
+# 网络熔断 (circuit breaker)
+#
+# 为什么需要: 在无代理 / 代理未启动的机器上(测试机、新用户), i.pximg.net
+# 的 DNS 在国内会被污染到不可达 IP, TCP 直接超时。实测: 单张图要 210s
+# (候选 5 个 × 30s 超时 + API 调用 20s), 并发只有 8, 于是 200 张卡片
+# 要等 1.5 小时、整页永远是一片灰块 —— 用户以为程序坏了。
+#
+# 做法: 连续 N 次网络级失败就"开路"(open), 一段时间内不再发网络请求,
+# 直接返回占位图, 让界面保持可用; 冷却结束后自动"半开"探测一次,
+# 成功即闭合, 恢复正常下载。
+# ----------------------------------------------------------------------
+_NET_LOCK = threading.Lock()
+_NET = {
+    "fails": 0,        # 连续网络级失败次数
+    "open_until": 0.0, # 开路截止时间(单调时钟)
+    "reason": "",      # 最后一次失败原因(给界面显示)
+    "opened_at": 0.0,  # 本次开路时间
+}
+_NET_FAIL_THRESHOLD = 4     # 连续失败几次就开路
+_NET_COOLDOWN = 90.0        # 开路后冷却秒数
+# 代理配置错误(如占位地址 127.0.0.1:9)导致的失败明显是配置问题而非网络波动,
+# 阈值降到 2 次, 免得白等 4 轮。
+_NET_FAIL_THRESHOLD_BADCFG = 2
+
+def _proxy_reachable(pr, timeout=1.2):
+    """判断代理字典指向的端口是否真的在听。用于区分「代理配错/没开」与「网络波动」。"""
+    if not pr:
+        return False
+    try:
+        u = urllib.parse.urlparse(pr.get("https") or pr.get("http") or "")
+        if not u.hostname or not u.port:
+            return False
+        s = pysocket.create_connection((u.hostname, u.port), timeout=timeout)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+def net_can_try():
+    """熔断器是否允许发起网络请求。开路期间直接返回 False, 调用方应走占位图。"""
+    with _NET_LOCK:
+        if _NET["open_until"] and time.monotonic() < _NET["open_until"]:
+            return False
+        return True
+
+# 快速可达性探测的结果缓存。
+# 为什么要探测: urllib 的 timeout 是「每次 socket 操作」的上限, 不是总时长。
+# i.pximg.net 被 DNS 污染时会解析出多个不可达地址(实测拿到 2 个), 逐个
+# 各等一轮, 于是"单张图"实测要 53~210s。与其让每张卡片都去撞墙, 不如先花
+# 2 秒确认"根本连不上", 然后立刻走占位图。
+_NET_PROBE = {"ts": 0.0, "ok": True}
+_NET_PROBE_TTL_OK = 30.0     # 通的时候缓存久一点, 少探测
+_NET_PROBE_TTL_BAD = 8.0     # 不通时短一点, 用户开好代理后能较快自动恢复
+
+def _probe_target():
+    """返回该探测的对象: 配了代理就探代理端口, 否则探 i.pximg.net。"""
+    try:
+        pr = _pximg_proxies()
+        if pr:
+            u = urllib.parse.urlparse(pr.get("https") or pr.get("http") or "")
+            if u.hostname and u.port:
+                return (u.hostname, int(u.port))
+        return ("i.pximg.net", 443)
+    except Exception:
+        return None
+
+def net_reachable(force=False):
+    """2 秒快速判断网络是否可用(带缓存)。不可达时调用方应立即走占位图。"""
+    now = time.monotonic()
+    ttl = _NET_PROBE_TTL_OK if _NET_PROBE["ok"] else _NET_PROBE_TTL_BAD
+    if not force and (now - _NET_PROBE["ts"]) < ttl:
+        return _NET_PROBE["ok"]
+    tgt = _probe_target()
+    if not tgt:
+        return True   # 判断不了就别拦, 交给真实下载去试
+    ok = False
+    try:
+        _s = pysocket.create_connection(tgt, timeout=2.0)
+        try:
+            _s.close()
+        except Exception:
+            pass
+        ok = True
+    except Exception:
+        ok = False
+    _NET_PROBE["ts"], _NET_PROBE["ok"] = now, ok
+    return ok
+
+def net_report(ok, reason=""):
+    """上报一次网络结果。ok=False 且达到阈值 → 开路。"""
+    global _NET
+    with _NET_LOCK:
+        if ok:
+            if _NET["fails"] or _NET["open_until"]:
+                _dbg("NET", f"网络恢复, 熔断闭合 (之前失败 {_NET['fails']} 次: {_NET['reason']})")
+            _NET["fails"] = 0
+            _NET["open_until"] = 0.0
+            _NET["reason"] = ""
+            _NET["opened_at"] = 0.0
+            return
+        _NET["fails"] += 1
+        _NET["reason"] = str(reason)[:180]
+        thr = _NET_FAIL_THRESHOLD
+        pr = _pximg_proxies()
+        proxy_bad = bool(pr) and not _proxy_reachable(pr)
+        if not pr:
+            # 完全没有代理可用: 国内直连基本必失败, 立即开路, 不必等满阈值
+            thr = 2
+        elif proxy_bad:
+            thr = _NET_FAIL_THRESHOLD_BADCFG
+        if _NET["fails"] >= thr and not _NET["open_until"]:
+            _NET["open_until"] = time.monotonic() + _NET_COOLDOWN
+            _NET["opened_at"] = time.monotonic()
+            why = ("未检测到可用代理" if not pr
+                   else f"代理 {pr.get('https') or pr.get('http')} 无法连接" if proxy_bad
+                   else "网络连续失败")
+            _NET["reason"] = why
+            log_info(f"网络熔断开路: {why} (连续失败 {_NET['fails']} 次, 冷却 {int(_NET_COOLDOWN)}s) | "
+                     f"Network circuit opened: {why}")
+
+def net_status():
+    """给 /api/health 与界面用的熔断状态。"""
+    with _NET_LOCK:
+        now = time.monotonic()
+        opened = bool(_NET["open_until"]) and now < _NET["open_until"]
+        return {
+            "open": opened,
+            "retry_in": round(max(0.0, _NET["open_until"] - now), 1) if opened else 0,
+            "fails": _NET["fails"],
+            "reason": _NET["reason"],
+            "has_proxy": bool(_pximg_proxies()),
+            "reachable": bool(_NET_PROBE["ok"]),
+        }
+
 def _load_thumb_fail():
     global _thumb_fail, _thumb_fail_loaded
     if _thumb_fail_loaded:
@@ -1047,26 +1182,59 @@ def _mark_thumb_fail(pid):
         except Exception:
             pass
 
-def _make_placeholder_thumb(pid, title=""):
+def _make_placeholder_thumb(pid, title="", kind="gone"):
     """为永久拿不到图的作品(limit_/已删除)生成本地 SVG 占位图。
-    带"已失效"标识和作品ID, 比纯色块友好; 生成一次永久复用。"""
+    带"已失效"标识和作品ID, 比纯色块友好; 生成一次永久复用。
+
+    kind="gone"   作品已失效(默认, 缓存复用)
+    kind="net"    网络不可用(不缓存, 网络恢复后应能拿到真图)
+    """
     pid = str(pid)
-    local = os.path.join(THUMB, pid + ".svg")
-    if os.path.exists(local):
-        return local
+    if kind == "net":
+        # 网络型占位图不落盘: 它只是"现在拿不到", 不是"这图没了"。
+        # 落盘会让网络恢复后依然显示旧占位图。
+        local = os.path.join(THUMB, pid + ".netsvg")
+    else:
+        local = os.path.join(THUMB, pid + ".svg")
+        if os.path.exists(local):
+            return local
     try:
         t = (title or "")[:18].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600">'
-               '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
-               '<stop offset="0" stop-color="#2a2440"/><stop offset="1" stop-color="#171226"/>'
-               '</linearGradient></defs>'
-               '<rect width="600" height="600" fill="url(#g)"/>'
-               '<circle cx="300" cy="262" r="74" fill="none" stroke="#5c5478" stroke-width="10"/>'
-               '<line x1="248" y1="314" x2="352" y2="210" stroke="#5c5478" stroke-width="10" stroke-linecap="round"/>'
-               '<text x="300" y="392" text-anchor="middle" fill="#8a80a8" font-size="30" font-family="sans-serif">作品已失效</text>'
-               '<text x="300" y="436" text-anchor="middle" fill="#5c5478" font-size="22" font-family="sans-serif">ID ' + pid + '</text>'
-               '<text x="300" y="480" text-anchor="middle" fill="#453d60" font-size="18" font-family="sans-serif">' + t + '</text>'
-               '</svg>')
+        if kind == "net":
+            # 网络不可用: 用醒目的警示配色, 明确告诉用户"不是图没了, 是连不上"
+            svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600">'
+                   '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+                   '<stop offset="0" stop-color="#3a2a1a"/><stop offset="1" stop-color="#1f1710"/>'
+                   '</linearGradient></defs>'
+                   '<rect width="600" height="600" fill="url(#g)"/>'
+                   '<path d="M180 250 L420 250 M300 250 L300 200" stroke="#c9a227" stroke-width="12" stroke-linecap="round" fill="none"/>'
+                   '<circle cx="300" cy="300" r="26" fill="#c9a227"/>'
+                   '<text x="300" y="410" text-anchor="middle" fill="#c9a227" font-size="30" font-family="sans-serif">网络不可用</text>'
+                   '<text x="300" y="452" text-anchor="middle" fill="#8a7a4a" font-size="20" font-family="sans-serif">请检查代理设置</text>'
+                   '<text x="300" y="500" text-anchor="middle" fill="#5c5478" font-size="18" font-family="sans-serif">ID ' + pid + '</text>'
+                   '</svg>')
+        else:
+            svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600">'
+                   '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+                   '<stop offset="0" stop-color="#2a2440"/><stop offset="1" stop-color="#171226"/>'
+                   '</linearGradient></defs>'
+                   '<rect width="600" height="600" fill="url(#g)"/>'
+                   '<circle cx="300" cy="262" r="74" fill="none" stroke="#5c5478" stroke-width="10"/>'
+                   '<line x1="248" y1="314" x2="352" y2="210" stroke="#5c5478" stroke-width="10" stroke-linecap="round"/>'
+                   '<text x="300" y="392" text-anchor="middle" fill="#8a80a8" font-size="30" font-family="sans-serif">作品已失效</text>'
+                   '<text x="300" y="436" text-anchor="middle" fill="#5c5478" font-size="22" font-family="sans-serif">ID ' + pid + '</text>'
+                   '<text x="300" y="480" text-anchor="middle" fill="#453d60" font-size="18" font-family="sans-serif">' + t + '</text>'
+                   '</svg>')
+        if kind == "net":
+            # 网络占位图单独用 .netsvg 后缀: 既不会被当成真图缓存
+            # ({pid}_{quality}.jpg), 也不会被当成"作品已失效"的永久占位
+            # ({pid}.svg)。网络恢复后走正常下载路径时顺手删掉它。
+            try:
+                with open(local, "w", encoding="utf-8") as f:
+                    f.write(svg)
+            except Exception:
+                pass
+            return local
         with open(local, "w", encoding="utf-8") as f:
             f.write(svg)
         return local
@@ -1124,6 +1292,8 @@ def _thumb_cached(pid):
     except Exception:
         pass
     # 占位图: {pid}.svg (无档位概念, 生成一次永久复用)
+    # 注意: 不含 .netsvg(网络不可用的临时占位), 那不是"已有缓存",
+    # 否则网络恢复后会一直被认为已缓存而不去下载。
     try:
         svg = os.path.join(THUMB, str(pid) + ".svg")
         if os.path.exists(svg) and os.path.getsize(svg) > 100:
@@ -1285,7 +1455,19 @@ def thumb_for(item, lang="zh"):
     _timeout = 30 if THUMB_QUALITY == "original" else 12
     _maxbytes = 12 * 1024 * 1024 if THUMB_QUALITY == "original" else 5 * 1024 * 1024
     _candidates = _quality_url_variants(url, THUMB_QUALITY)
-    # 并发限制: 同时最多 3 个下载, 防止 200 张卡片请求占满服务线程
+    # 熔断检查: 已知网络不通时不要再去撞墙。测试机(无代理)上如果每张仍
+    # 跑满 5 候选 × 30s, 200 张卡片要等一个半小时, 用户只看到一片灰。
+    # net_reachable() 先花最多 2 秒确认连不连得上, 连不上立刻走占位图。
+    if not net_can_try() or not net_reachable():
+        return _make_placeholder_thumb(pid, item.get("title", ""), kind="net")
+    # 候选太多会成倍放大等待时间: 5 个候选在"域不可达"时要串行等 5 轮超时。
+    # 实测无代理环境下这正是 210s 的来源。
+    # 串行重试只保留前 2 个候选(格式回退: jpg → png), 其余留给下次。
+    if len(_candidates) > 2:
+        _candidates = _candidates[:2]
+    # 网络真正不可达时, 第 1 个候选就会耗尽整个超时; 与其让每个候选
+    # 各等一轮, 不如一次判定。探测超时取较小值, 连通后再用完整超时下载。
+    _probe_timeout = 6
     with THUMB_SEM:
         # 二次检查(可能在排队期间已下载)
         if os.path.exists(local) and os.path.getsize(local) > 500:
@@ -1311,7 +1493,9 @@ def thumb_for(item, lang="zh"):
                         "Referer": "https://www.pixiv.net/",
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
                     })
-                    with opener.open(req, timeout=_timeout) as r:
+                    # 网络可疑时用短探测超时快速收敛(详见 thumb_for 同名注释)
+                    _t = 6 if net_status()["fails"] > 0 else _timeout
+                    with opener.open(req, timeout=_t) as r:
                         data = r.read(_maxbytes + 1)
                     if not data or len(data) > _maxbytes:
                         _last_err = "too big / empty"
@@ -1323,6 +1507,22 @@ def thumb_for(item, lang="zh"):
                     if not (data[:3] == b"\xff\xd8\xff" or data[:8] == _PNG_SIG
                             or data[:6] in (b"GIF87a", b"GIF89a") or data[:4] == b"RIFF"):
                         _last_err = "not an image (magic mismatch)"
+                        continue
+                    # 完整性校验: 魔数只保证"开头像图片"。网络中断会让下载得到
+                    # 截断的图 —— 头部完整(能读出尺寸)、像素数据缺失(PIL load 报
+                    # truncated)。这种残图一旦落盘就会被永久当成有效缓存, 而且
+                    # 因为重采样必然失败, 它会以未缩放的巨图形态留在缓存里
+                    # (实测抓到 7 个: 2560×3712 的 6.8MB 残缺 PNG)。
+                    # load() 会强制全量解码, 是唯一可靠的完整性检测(约 0.05s)。
+                    try:
+                        import io as _io
+                        from PIL import Image as _Img
+                        with _Img.open(_io.BytesIO(data)) as _im:
+                            _im.load()
+                    except Exception as _ve:
+                        _last_err = f"corrupt download: {type(_ve).__name__}"
+                        if debug_on():
+                            _dbg("THUMB-CORRUPT", f"pid={pid} 截断/损坏, 丢弃并重试: {str(_ve)[:70]}")
                         continue
                     # 先写临时文件, 重采样后再原子改名到 local。
                     # 直接写 local 会有窗口期: 别的线程(6并发预载)会读到
@@ -1344,12 +1544,28 @@ def thumb_for(item, lang="zh"):
                                 os.replace(_tmp, local)
                         except Exception:
                             pass
+                    # 成功下载 → 通知熔断器网络已恢复(会自动闭合),
+                    # 并清掉此前留下的"网络不可用"临时占位图
+                    net_report(True)
+                    try:
+                        _np = os.path.join(THUMB, pid + ".netsvg")
+                        if os.path.exists(_np):
+                            os.remove(_np)
+                    except Exception:
+                        pass
                     return local
                 except Exception as _e:
                     _last_err = _e
                     continue
             # 全部候选失败
-            raise (_last_err or RuntimeError("no candidate url"))
+            # 全部候选失败。
+            # ⚠️ _last_err 常常是字符串(如 "too big / empty"、"corrupt download"),
+            # 而 "raise 字符串" 在 Python 3 会抛 TypeError("exceptions must derive
+            # from BaseException") —— 真正的失败原因被吃掉, 还害得熔断器把它
+            # 当成网络故障误触发(实测 26 次)。所以这里统一包成 RuntimeError。
+            if isinstance(_last_err, BaseException):
+                raise _last_err
+            raise RuntimeError(str(_last_err or "no candidate url"))
         except Exception as e:
             if debug_on():
                 _dbg("THUMB-ERR", f"pid={pid} {type(e).__name__}: {str(e)[:120]}")
@@ -1366,6 +1582,27 @@ def thumb_for(item, lang="zh"):
                 if ("timed out" in _es or "URLError" in type(e).__name__
                         or "Connection" in type(e).__name__ or "Remote" in type(e).__name__):
                     _transient = True
+            # 熔断器只统计"真的是网络故障"的错误。
+            # 用 type() 精确匹配而非字符串包含: 程序内部异常(如 TypeError)
+            # 消息里也可能带 "Connection" 字样, 误算进去会让熔断平白开合
+            # (实测这类误触发发生过 26 次)。
+            # ⚠️ HTTPError 是 URLError 的子类! 必须先判 HTTPError, 否则 404
+            # 这类"作品已失效"会被当成网络故障, 上百个死链能把熔断一直打开。
+            # 注意: 本模块导入的是 `socket as pysocket`, 没有裸 `socket` 这个名字,
+            # 误用会静默 NameError —— 只用标准异常类做判断, 避免这个坑。
+            if isinstance(e, urllib.error.HTTPError):
+                _is_net_err = e.code in (429, 500, 502, 503, 504)
+            else:
+                _is_net_err = isinstance(e, (urllib.error.URLError, TimeoutError,
+                                             ConnectionError, ConnectionResetError,
+                                             ConnectionAbortedError))
+            if _is_net_err:
+                net_report(False, f"{type(e).__name__}: {str(e)[:120]}")
+                # 网络级失败 → 强制重探, 让"连不上"的判断尽快生效,
+                # 避免后续每张卡片都要撞一次墙
+                net_reachable(force=True)
+            elif not _transient:
+                net_report(True)  # 明确的 HTTP 拒绝(404/403) = 网络是通的
             if _transient:
                 # 瞬时失败: 不写入失败缓存, 下次访问会自然重试
                 if debug_on():
@@ -1381,6 +1618,10 @@ def thumb_for(item, lang="zh"):
             return None
 # pixiv API 获取缩略图 URL (缓存)
 _thumb_url_cache = {}
+# 负缓存(拿不到 URL 的作品)带 TTL: 以前把 None 永久缓存, 网络恢复后
+# 依然返回 None, 该作品永远看不到图。
+_thumb_url_neg = {}
+_THUMB_URL_NEG_TTL = 600   # 10 分钟后允许重新尝试
 def viewer_img_for(item):
     """查看器大图: 按当前预览档位下载(与缩略图同一套提示, 但独立缓存目录)。
     原图档会拿到无损原图(1~5MB, 可能 png); 低档位则用 600/1200 压缩版。
@@ -1439,9 +1680,25 @@ def viewer_img_for(item):
     return thumb_for(item)
 
 def _fetch_thumb_url_from_api(pid):
-    """从 pixiv API 获取作品缩略图 URL"""
-    if pid in _thumb_url_cache:
-        return _thumb_url_cache[pid]
+    """从 pixiv API 获取作品缩略图 URL。
+
+    ⚠️ 熔断: 网络不通时这里要 10~20s(urllib 的 timeout 是「每次 socket 操作」,
+    而 DNS 会返回多个 A/AAAA 记录, 逐个各等一轮 → 实测 20.1s)。
+    不检查熔断的话, 200 张卡片光是这一步就要等很久。
+    """
+    if not net_can_try():
+        return None
+    if not net_reachable():
+        return None
+    # 负缓存带 TTL: 以前把 None 永久写进缓存, 网络恢复后依然一直返回 None,
+    # 该作品就永远拿不到图了。
+    _hit = _thumb_url_cache.get(pid)
+    if _hit:
+        return _hit
+    if _hit is None and pid in _thumb_url_cache:
+        _neg_ts = _thumb_url_neg.get(pid, 0)
+        if time.time() - _neg_ts < _THUMB_URL_NEG_TTL:
+            return None
     try:
         api_url = f"https://www.pixiv.net/ajax/illust/{pid}?lang=zh"
         req = urllib.request.Request(api_url, headers={
@@ -1450,7 +1707,8 @@ def _fetch_thumb_url_from_api(pid):
         })
         proxies = _pximg_proxies()
         opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies)) if proxies else urllib.request.build_opener()
-        with opener.open(req, timeout=10) as resp:
+        _t = 5 if net_status()["fails"] > 0 else 10
+        with opener.open(req, timeout=_t) as resp:
             data = json.loads(resp.read())
         body = data.get("body", {})
         # 优先使用高清图 (regular > small > thumb)
@@ -1462,11 +1720,13 @@ def _fetch_thumb_url_from_api(pid):
         # 提升缩略图分辨率
         url = url.replace("250x250_80_a2", "480x480_80_a2")
         if url and "i.pximg.net" in url:
+            net_report(True)
             _thumb_url_cache[pid] = url
             return url
-    except:
-        pass
+    except Exception as _e:
+        net_report(False, f"api: {type(_e).__name__}: {str(_e)[:100]}")
     _thumb_url_cache[pid] = None
+    _thumb_url_neg[pid] = time.time()
     return None
 
 # ========== 局域网访问安全(白名单 + Host校验 + 访问令牌 + 限速) ==========
@@ -1563,25 +1823,125 @@ def _store_resampled(tmp_path, final_path):
     未缩放的巨图(实测抓到这个竞态: 缓存里出现过 1536px 文件)。
     做法是先在同目录写 .part, 重采样后 os.replace 原子改名 ——
     最终路径要么不存在, 要么已是重采样后的版本。
+
+    ⚠️ 关键：重采样失败时**绝不落盘**。
+    以前这里失败也会把原文件 os.replace 到最终路径, 于是"下载被截断"的
+    残图(头部完整、像素缺失)被永久留在缓存里, 而且是未缩放的巨图形态
+    (实测抓到 7 个: 2560×3712 的 6.8MB 残缺 PNG, 卡片直接碎图)。
+    宁可这次没有缓存、下次重试, 也不要把坏图钉死在缓存里。
     """
     try:
         _did, _dim = _resample_for_card(tmp_path)
+    except Exception:
+        _did, _dim = False, None
+    if not _did:
+        # 没成功重采样就不入库。可能是: 图本来就小(无需缩放, 见下) 或 解码失败。
+        # 两者都要用 load() 区分清楚, 否则会把"本来就小"的好图误删。
+        _keep = False
         try:
-            os.replace(tmp_path, final_path)
+            from PIL import Image as _Img
+            with _Img.open(tmp_path) as _im:
+                _im.load()
+                # 真的解码成功且尺寸本来就合规 → 保留(例如 544×670 的 PNG)
+                if max(_im.size) <= (THUMB_CARD_MAX + 40):
+                    _keep = True
         except Exception:
-            # 改名失败(跨卷/占用): 回退为复制
-            import shutil as _sh
+            _keep = False
+        if not _keep:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            return False, None
+    # 走到这里: 要么已重采样成功, 要么是尺寸本来就合规的完整图
+    try:
+        os.replace(tmp_path, final_path)
+    except Exception:
+        # 改名失败(跨卷/占用): 回退为复制
+        import shutil as _sh
+        try:
             _sh.copyfile(tmp_path, final_path)
             try: os.remove(tmp_path)
             except Exception: pass
-        return _did, _dim
-    except Exception:
-        try:
-            if not os.path.exists(final_path):
-                os.replace(tmp_path, final_path)
         except Exception:
-            pass
-        return False, None
+            return False, None
+    return _did, _dim
+
+def _thumb_complete(path):
+    """廉价判断图片文件是否完整(未被截断)。返回 True/False。
+
+    为什么不用体积: 截断的文件可能很小(实测 175KB 的残图), 体积筛不出来。
+    为什么不用 load(): 全解码 6400 个文件太慢。
+    做法: 读文件尾部标记 —— JPEG 必须以 FFD9 结束, PNG 必须以 IEND 结束。
+    这是格式定义的结束标志, 缺失即表示传输中断。只需 seek 到末尾读几字节。
+    """
+    try:
+        sz = os.path.getsize(path)
+        if sz < 16:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(8)
+            f.seek(max(0, sz - 32))
+            tail = f.read()
+        # JPEG: 尾部必须是 EOI(FFD9), 可能带少量填充, 在最后 16 字节内找
+        if head[:3] == b"\xff\xd8\xff":
+            return b"\xff\xd9" in tail[-16:]
+        # PNG: 必须以 IEND 块结束
+        if head[:8] == bytes([137, 80, 78, 71, 13, 10, 26, 10]):
+            return b"IEND" in tail
+        # GIF: 尾部是 0x3B
+        if head[:6] in (b"GIF87a", b"GIF89a"):
+            return tail[-1:] == b"\x3b"
+        return True   # 其它格式不做判断
+    except Exception:
+        return True   # 判断不了就别动它
+
+def _purge_corrupt_thumbs(full=True):
+    """把缓存里"读不完整"的图移到归档目录(不删除, 可回滚)。
+
+    来源: 早期版本在重采样失败时仍会把原文件落盘, 于是下载被截断的残图
+    (头部完整能读出尺寸、像素数据缺失)被永久当成有效缓存 —— 卡片碎图,
+    而且因为它是未缩放的巨图(实测 2560×3712 / 6.8MB), 还会被回归断言抓到。
+    已修复落盘路径, 这里负责清掉历史遗留。
+
+    检查策略(两段式, 兼顾速度与准确):
+      1. 尾部标记: 读末尾几字节判断 FFD9 / IEND —— 覆盖所有尺寸的截断
+      2. 体积可疑(>400KB)的再做 load() 全解码, 抓"尾部完好但数据损坏"的情况
+    """
+    try:
+        dst = os.path.join(OUT, "_corrupt_thumbs")
+        names = [f for f in os.listdir(THUMB) if f.lower().endswith((".jpg", ".png"))]
+        bad = []
+        for f in names:
+            p = os.path.join(THUMB, f)
+            try:
+                if not _thumb_complete(p):
+                    bad.append(f)
+                    continue
+                # 第二段: 体积异常的再全解码确认
+                if os.path.getsize(p) > 400 * 1024:
+                    from PIL import Image as _Img
+                    with _Img.open(p) as _im:
+                        _im.load()
+            except Exception:
+                bad.append(f)
+        if not bad:
+            return 0
+        os.makedirs(dst, exist_ok=True)
+        moved = 0
+        for f in bad:
+            try:
+                os.replace(os.path.join(THUMB, f), os.path.join(dst, f))
+                moved += 1
+            except Exception:
+                pass
+        if moved:
+            log_info(f"清理损坏缩略图: 归档 {moved} 个到 data/_corrupt_thumbs/ | "
+                     f"Archived {moved} corrupt thumbs")
+        return moved
+    except Exception:
+        return 0
 
 def _purge_stale_parts():
     """清理崩溃/中断留下的 .part 临时文件(它们永远不会被当成缓存命中)。"""
@@ -1713,6 +2073,9 @@ def _startup_thumb_migration():
         p = _purge_stale_parts()
         if p:
             _dbg("THUMB-MIGRATE", f"清理残留 .part 临时文件 {p} 个")
+        c = _purge_corrupt_thumbs()
+        if c:
+            _dbg("THUMB-MIGRATE", f"归档损坏缩略图 {c} 个 → data/_corrupt_thumbs/")
     except Exception:
         pass
 
@@ -2206,6 +2569,8 @@ class H(BaseHTTPRequestHandler):
                 "disk": {"free_gb": disk_free_gb},
                 "backup": {"files": n_backups},
                 "import": dict(_import_state),
+                # 网络熔断状态: 无代理/代理没开时界面要能提示用户
+                "net": net_status(),
             })
         elif u.path == "/api/version":
             # 返回当前版本 + 是否有新版本(启动时后台查过 GitHub)
@@ -2386,7 +2751,7 @@ class H(BaseHTTPRequestHandler):
                 pass
             with open(local, "rb") as f:
                 body = f.read()
-            is_svg = local.endswith(".svg")
+            is_svg = local.endswith(".svg") or local.endswith(".netsvg")
             ctype = "image/svg+xml" if is_svg else "image/jpeg"
             if not is_svg:
                 # 按文件真实内容判 Content-Type, 而不是按扩展名。
@@ -2546,7 +2911,10 @@ class H(BaseHTTPRequestHandler):
             log_info(f"预览清晰度切换为 {q} | Thumb quality set to {q}")
             # 切换档位后已缓存的旧清晰度文件与新档位不符 → 可选清空
             removed = 0
-            if body.get("clear"):
+            # clear 必须严格是布尔真。之前用宽松真值, 传字符串 "yes"
+            # 也会触发清空(实测误删 7620 个缓存文件) —— 这种破坏性操作的
+            # 入参不能靠 Python 的真值语义兜底。
+            if body.get("clear") is True:
                 try:
                     for f in os.listdir(THUMB):
                         if f.lower().endswith((".jpg", ".png")):
@@ -4496,8 +4864,39 @@ document.addEventListener('DOMContentLoaded',function(){
    const sf=document.getElementById('search-p');
    if(sf&&!sf.contains(e.target))hideSearchHistory();
   });
- }
-});
+  }
+  // 网络熔断提示: 无代理/代理没开时, 卡片会全是占位图。不告诉用户原因的话,
+  // 只会以为"这软件坏了"。定时轮询 /api/health 的 net 字段并显示横幅。
+  checkNetHint();
+  setInterval(checkNetHint, 15000);
+  });
+
+  // ===== 网络状态横幅 =====
+  async function checkNetHint(){
+  try{
+  const r=await fetch('/api/health');
+  if(!r.ok)return;
+  const h=await r.json();
+  const net=h.net||{};
+  let el=document.getElementById('net-banner');
+  const bad=net.open||(net.has_proxy===false);
+  if(!bad){ if(el)el.style.display='none'; return; }
+  if(!el){
+  el=document.createElement('div');
+  el.id='net-banner';
+  el.style.cssText='position:fixed;left:50%;transform:translateX(-50%);top:14px;z-index:9998;'
+   +'background:linear-gradient(90deg,#7a5c12,#5c4410);color:#ffe9a8;padding:10px 18px;border-radius:12px;'
+   +'font-size:13px;box-shadow:0 6px 22px rgba(0,0,0,.45);border:1px solid rgba(255,220,120,.28);'
+   +'max-width:min(680px,92vw);line-height:1.55;';
+  document.body.appendChild(el);
+  }
+  const why=net.reason||(net.has_proxy===false?'未检测到可用代理':'网络不可用');
+  const tip=net.open?`<br><span style="opacity:.85">已暂停下载, ${net.retry_in}s 后自动重试</span>`:'';
+  el.innerHTML='⚠️ <b>图片暂时无法下载</b> —— '+why
+  +'<br><span style="opacity:.85">缩略图需要能访问 i.pximg.net。请在设置里填好代理(如 http://127.0.0.1:10808)后重试。</span>'+tip;
+  el.style.display='block';
+  }catch(e){}
+  }
 
 // ===== 搜索历史 (localStorage, 最近 20 条) =====
 const SH_KEY='pfs_search_history';
