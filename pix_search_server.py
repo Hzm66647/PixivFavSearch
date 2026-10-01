@@ -651,8 +651,40 @@ def fuzzy_roman_match(query_rom, title_rom):
     return False
 
 # 代理 + pximg 下载需 Referer 头
-pysocks.set_default_proxy(pysocks.SOCKS5, "127.0.0.1", 10808)
-pysocket.socket = pysocks.socksocket
+#
+# ⚠️ 这里曾有 pysocket.socket = pysocks.socksocket 的全局 socket 劫持(v1.0.0 遗留),
+# 现已移除。原因: 它把全进程的 socket 都换成 SOCKS5 直连 10808, 而我们的
+# 下载代码又通过 urllib.request.getproxies() 读到系统代理(同样是 10808),
+# 于是 HTTP CONNECT 走 10808 → 底层 socket 再走 SOCKS 10808 = 双重代理,
+# 请求永远打不通(实测: 移除前 12s 超时, 移除后 1.4s 成功)。
+# 走代理的功能由 urllib 的 ProxyHandler 承担, 无需在 socket 层再做一次。
+#
+# 回退: 系统未配代理但本机有 SOCKS 时(纯 SOCKS 环境), 显式走 socks5。
+_SOCKS_FALLBACK = ("127.0.0.1", 10808)
+
+def _pximg_proxies():
+    """返回 pximg 下载应使用的代理字典。
+
+    优先系统代理(HTTP CONNECT, 与 curl -x http://… 行为一致);
+    系统没配但本机 SOCKS 端口在听 → 回退到 socks5(需 PySocks)。
+    """
+    try:
+        pr = urllib.request.getproxies()
+        if pr and (pr.get("https") or pr.get("http")):
+            return pr
+    except Exception:
+        pass
+    # 纯 SOCKS 环境回退
+    try:
+        h, p = _SOCKS_FALLBACK
+        s = socket.create_connection((h, p), timeout=0.6)
+        try:
+            s.close()
+        except Exception:
+            pass
+        return {"http": f"socks5h://{h}:{p}", "https": f"socks5h://{h}:{p}"}
+    except Exception:
+        return {}
 
 def norm_tags(tags):
     out = []
@@ -1263,8 +1295,9 @@ def thumb_for(item, lang="zh"):
             class NoRedirect(urllib.request.HTTPRedirectHandler):
                 def redirect_request(self, *a, **k):
                     return None
-            # 走系统代理 (v2rayN 等)
-            proxies = urllib.request.getproxies()
+            # 走系统代理 (v2rayN 等) —— 注意: 绝不能在 socket 层再做一次代理,
+            # 否则与这里的 ProxyHandler 叠加成双重代理, 请求永远打不通
+            proxies = _pximg_proxies()
             if proxies:
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), NoRedirect)
             else:
@@ -1282,6 +1315,14 @@ def thumb_for(item, lang="zh"):
                         data = r.read(_maxbytes + 1)
                     if not data or len(data) > _maxbytes:
                         _last_err = "too big / empty"
+                        continue
+                    # 魔数校验: 拒绝非图片内容。代理/网关在出错时会返回
+                    # HTTP 200 + HTML 错误页(1260B 那种), 若不校验就会被当成
+                    # 图片永久缓存(大小 >500B 即判定"有效缓存"), 该作品永久碎图。
+                    _PNG_SIG = bytes([137, 80, 78, 71, 13, 10, 26, 10])
+                    if not (data[:3] == b"\xff\xd8\xff" or data[:8] == _PNG_SIG
+                            or data[:6] in (b"GIF87a", b"GIF89a") or data[:4] == b"RIFF"):
+                        _last_err = "not an image (magic mismatch)"
                         continue
                     # 先写临时文件, 重采样后再原子改名到 local。
                     # 直接写 local 会有窗口期: 别的线程(6并发预载)会读到
@@ -1312,15 +1353,32 @@ def thumb_for(item, lang="zh"):
         except Exception as e:
             if debug_on():
                 _dbg("THUMB-ERR", f"pid={pid} {type(e).__name__}: {str(e)[:120]}")
-            _mark_thumb_fail(pid)   # 记入失败缓存, 24h 内不再重试(期间用占位图)
+            # 关键: 区分「确定性失败」与「瞬时失败」。
+            # 只有 404/403 这种"这张图确实没了"才值得锁 24h;
+            # 超时/连接错误/429 限速/5xx 都是瞬时的, 锁死会让
+            # 整页图集体变成占位图(实测: 一次限速事件制造了 159 条假失败,
+            # 其中抽查 5/6 张其实能正常下载)。
+            _transient = True
+            if isinstance(e, urllib.error.HTTPError):
+                _transient = e.code not in (404, 403, 410)
+            else:
+                _es = str(e)
+                if ("timed out" in _es or "URLError" in type(e).__name__
+                        or "Connection" in type(e).__name__ or "Remote" in type(e).__name__):
+                    _transient = True
+            if _transient:
+                # 瞬时失败: 不写入失败缓存, 下次访问会自然重试
+                if debug_on():
+                    _dbg("THUMB-TRANSIENT", f"pid={pid} 瞬时失败不锁: {type(e).__name__}")
+            else:
+                _mark_thumb_fail(pid)   # 确定性失败: 24h 内用占位图
             if not hasattr(thumb_for, '_err_logged'):
                 thumb_for._err_logged = set()
             err_key = type(e).__name__
             if err_key not in thumb_for._err_logged:
                 thumb_for._err_logged.add(err_key)
-                _log(f"缩略图下载失败: {e} | Thumb download failed: {e}")
+                log_info(f"缩略图下载失败: {e} | Thumb download failed: {e}")
             return None
-
 # pixiv API 获取缩略图 URL (缓存)
 _thumb_url_cache = {}
 def viewer_img_for(item):
@@ -1351,7 +1409,7 @@ def viewer_img_for(item):
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *a, **k):
                 return None
-        proxies = urllib.request.getproxies()
+        proxies = _pximg_proxies()
         opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), NoRedirect) if proxies \
             else urllib.request.build_opener(NoRedirect)
         with THUMB_SEM:
@@ -1390,7 +1448,7 @@ def _fetch_thumb_url_from_api(pid):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
             "Referer": "https://www.pixiv.net/",
         })
-        proxies = urllib.request.getproxies()
+        proxies = _pximg_proxies()
         opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies)) if proxies else urllib.request.build_opener()
         with opener.open(req, timeout=10) as resp:
             data = json.loads(resp.read())
@@ -1560,7 +1618,9 @@ def _purge_legacy_thumbs():
                 moved += 1
             except Exception:
                 pass
-        _log(f"归档历史缩略图 {moved} 个(无档位后缀) → {dst}")
+        _log_info_safe = globals().get("log_info")
+        if _log_info_safe:
+            _log_info_safe(f"归档历史缩略图 {moved} 个(无档位后缀) → {dst}")
         return moved
     except Exception:
         return 0
@@ -2328,6 +2388,20 @@ class H(BaseHTTPRequestHandler):
                 body = f.read()
             is_svg = local.endswith(".svg")
             ctype = "image/svg+xml" if is_svg else "image/jpeg"
+            if not is_svg:
+                # 按文件真实内容判 Content-Type, 而不是按扩展名。
+                # 原图是 PNG 时重采样可能失败, 缓存里会是 "PNG 数据 + .jpg 后缀";
+                # 若报 image/jpeg, 浏览器会判为碎图
+                # (实测抓到 133008140_original.jpg 里其实是 PNG 数据)。
+                try:
+                    with open(local, "rb") as _fh:
+                        _hd = _fh.read(8)
+                    if _hd[:8] == bytes([137, 80, 78, 71, 13, 10, 26, 10]):
+                        ctype = "image/png"
+                    elif _hd[:3] == b"GIF":
+                        ctype = "image/gif"
+                except Exception:
+                    pass
             if is_svg:
                 # 占位图(SVG): 可能被真图替换(重试成功后), 不 immutable,
                 # 每次用 ETag 验证, 内容变了浏览器自动拉新
@@ -4124,6 +4198,20 @@ function updatePagination(){
  if(prevBtn)prevBtn.disabled=currentPage<=0;
  if(nextBtn)nextBtn.disabled=currentPage>=totalPages-1;
  if(lastBtn)lastBtn.disabled=currentPage>=totalPages-1;
+ // 灵动岛显示收藏总数。
+ // 之前只有 refreshAll() 会写它, 而那里写的是"缩略图缓存张数" —
+ // 既语义不对(缓存数≠收藏数), 首页加载时又根本不会调用, 于是永远停在 0。
+ updateIslandCount();
+}
+
+function updateIslandCount(){
+ try{
+  const cnt=document.getElementById('island-count');
+  if(!cnt)return;
+  const n=(typeof totalItems==='number'&&totalItems>0)?totalItems
+          :((typeof works!=='undefined'&&works)?works.length:0);
+  cnt.textContent=n.toLocaleString();
+ }catch(e){}
 }
 
 function goPage(page){
@@ -4376,12 +4464,8 @@ async function refreshAll(){
    img.src=base+'?v='+Date.now();
   }
  });
- // 灵动岛计数也更新
- try{
-  const st=await fetch('/api/thumb-prefetch/status').then(r=>r.json());
-  const cnt=document.getElementById('island-count');
-  if(cnt)cnt.textContent=(st.cached>=0?st.cached:0).toLocaleString();
- }catch(e){}
+ // 灵动岛计数也更新(用收藏总数, 不是缓存张数)
+ updateIslandCount();
 }
 
 function togSearch(){

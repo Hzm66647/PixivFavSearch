@@ -263,16 +263,27 @@ def _fetch_total_bookmarks(uid, cookie_header, proxy_url):
     return 0
 
 def main():
+    """导入入口: 临时把 DNS 改成"域名交代理远端解析", 结束后必定恢复。
+
+    覆盖是【进程级】的, 而 main() 在桌面版里由后台线程调用。之前覆盖后
+    从不恢复 → 进程内所有后续 DNS 解析都被改成直通, 服务端下载缩略图时
+    连代理都走不通(解析出真实 IP 直连 → 超时), 实测造成整批图片变占位图。
+    """
     _log("main", "=== Import Start ===")
-    
-    # 0. DNS 污染防护: 本地 DNS 可能把 www.pixiv.net 解析到假 IP, 交给代理后 TLS 握手
-    #    直接 EOF。让 getaddrinfo 不做本地解析, 域名原样交给代理远端解析
-    #    (等价 curl --socks5-hostname / HTTP CONNECT 的域名转发)。
     _orig_gai = socket.getaddrinfo
+
     def _remote_gai(host, port, *a, **kw):
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, port))]
+
     socket.getaddrinfo = _remote_gai
-    
+    try:
+        return _main_impl()
+    finally:
+        socket.getaddrinfo = _orig_gai
+        _log("main", "=== Import End (DNS restored) ===")
+
+
+def _main_impl():
     # 1. Load saved cookies
     if not os.path.exists(COOKIE_FILE):
         _log("main", "ERROR: No saved cookies found.")
