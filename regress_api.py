@@ -174,6 +174,28 @@ def _chk_import_fields():
 ok, detail = _chk_import_fields()
 chk(ok, detail)
 
+
+# ---------- 本轮: 预览清晰度 API ----------
+def _chk_tq():
+    import urllib.request, json as _j
+    d = _j.loads(urllib.request.urlopen(BASE + "/api/thumb-quality", timeout=10).read())
+    pk = set((d.get("presets") or {}).keys())
+    want = {"fast", "normal", "high", "original"}
+    ok = want.issubset(pk) and d.get("quality") in want
+    return ok, f"thumb-quality quality={d.get('quality')} presets={sorted(pk)}"
+
+ok, detail = _chk_tq()
+chk(ok, detail)
+
+def _chk_settings_tq():
+    import urllib.request, json as _j
+    d = _j.loads(urllib.request.urlopen(BASE + "/api/settings", timeout=10).read())
+    ok = "thumb_quality" in d and "thumb_presets" in d
+    return ok, f"settings 含 thumb_quality={d.get('thumb_quality')}"
+
+ok, detail = _chk_settings_tq()
+chk(ok, detail)
+
 # ---------- 汇总 ----------
 print("=" * 60)
 print(f"{'检查项':<44} 结果")

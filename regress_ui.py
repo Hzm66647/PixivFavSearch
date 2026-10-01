@@ -91,6 +91,29 @@ chk("导入完成读 new_count", "sd.new_count" in html)
 chk("导入完成刷新统计", "renderStats()" in html)
 chk("导入面板 CSS 样式", ".imp-panel{" in html)
 
+
+# ---------- 撤销栈(本轮) ----------
+chk("撤销栈变量 undoStack", "let undoStack=[]" in html)
+chk("快照函数 snapState", "function snapState()" in html)
+chk("入栈函数 pushUndo", "function pushUndo()" in html)
+chk("恢复函数 restoreState", "async function restoreState(st)" in html)
+chk("撤销入口 doUndo", "function doUndo()" in html)
+chk("撤销提示 updateUndoHint", "function updateUndoHint()" in html)
+chk("撤销 Toast", "function toastUndo(" in html)
+chk("Ctrl+Z 接 doUndo", "e.preventDefault();doUndo();return;" in html)
+chk("侧键接 doUndo", "_sideBtnHandled=Date.now();" in html and "doUndo();" in html)
+chk("入栈点 >= 8 个", html.count("pushUndo();") >= 8)
+chk("撤销按钮 DOM", 'id="undo-hint"' in html)
+chk("撤销 Toast CSS", ".undo-toast{" in html)
+
+# ---------- 预览清晰度(本轮) ----------
+chk("清晰度网格 DOM", 'id="tq-grid"' in html)
+chk("清晰度 tqLoad", "async function tqLoad()" in html)
+chk("清晰度 tqRender", "function tqRender()" in html)
+chk("清晰度 tqApply", "async function tqApply(" in html)
+chk("清晰度 CSS", ".tq-item{" in html)
+chk("启动加载 tqLoad", "tqLoad();" in html)
+
 # ---------- 汇总 ----------
 print("=" * 62)
 print(f"{'检查项':<44} 结果")

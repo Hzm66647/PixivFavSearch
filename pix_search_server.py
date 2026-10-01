@@ -1240,20 +1240,17 @@ def thumb_for(item, lang="zh"):
         url = _fetch_thumb_url_from_api(pid)
         if not url:
             return None
-    # 提升缩略图分辨率 (250x250 → 480x480)
-    # 预载优先 250 原图(0.26s/张, 比 600x600 快 2.7 倍, 缩略图场景够用);
-    # 查看器大图走前端 origUrl 1200 替换, 不依赖这里。
-    # (600x600 保留在回退链: 250 失败时尝试)
+    # 按清晰度档位取候选 URL, 失败依次回退 (fast=250 / normal=600 / high=1200 / original=原图)
+    # 原图最大 5MB+, 单张超时放宽到 30s
+    _timeout = 30 if THUMB_QUALITY == "original" else 12
+    _maxbytes = 12 * 1024 * 1024 if THUMB_QUALITY == "original" else 5 * 1024 * 1024
+    _candidates = _quality_url_variants(url, THUMB_QUALITY)
     # 并发限制: 同时最多 3 个下载, 防止 200 张卡片请求占满服务线程
     with THUMB_SEM:
         # 二次检查(可能在排队期间已下载)
         if os.path.exists(local) and os.path.getsize(local) > 500:
             return local
         try:
-            req = urllib.request.Request(url, headers={
-                "Referer": "https://www.pixiv.net/",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
-            })
             # 禁重定向: 防 SSRF 跳内网
             class NoRedirect(urllib.request.HTTPRedirectHandler):
                 def redirect_request(self, *a, **k):
@@ -1264,29 +1261,28 @@ def thumb_for(item, lang="zh"):
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), NoRedirect)
             else:
                 opener = urllib.request.build_opener(NoRedirect)
-            try:
-                with opener.open(req, timeout=12) as r, open(local, "wb") as f:
-                    data = r.read(5 * 1024 * 1024 + 1)
-                    if len(data) > 5 * 1024 * 1024:
-                        return None
-                    f.write(data)
-            except urllib.error.HTTPError:
-                # 600x600 失败(如老图无此尺寸) → 回退原始 250x250 URL 再试一次
-                orig_url = (item.get("url", "") or "").replace("custom-thumb", "custom-thumb")
-                if orig_url and orig_url != url:
-                    req2 = urllib.request.Request(orig_url, headers={
+            _last_err = None
+            for _cu in _candidates:
+                if not _cu:
+                    continue
+                try:
+                    req = urllib.request.Request(_cu, headers={
                         "Referer": "https://www.pixiv.net/",
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
                     })
-                    with opener.open(req2, timeout=12) as r, open(local, "wb") as f:
-                        data = r.read(5 * 1024 * 1024 + 1)
-                        if len(data) > 5 * 1024 * 1024:
-                            return None
+                    with opener.open(req, timeout=_timeout) as r:
+                        data = r.read(_maxbytes + 1)
+                    if not data or len(data) > _maxbytes:
+                        _last_err = "too big / empty"
+                        continue
+                    with open(local, "wb") as f:
                         f.write(data)
-            _ok = os.path.getsize(local) > 500
-            if debug_on():
-                _dbg("THUMB", f"{'ok' if _ok else 'small'} pid={pid} url={url[:80]}")
-            return local if _ok else None
+                    return local
+                except Exception as _e:
+                    _last_err = _e
+                    continue
+            # 全部候选失败
+            raise (_last_err or RuntimeError("no candidate url"))
         except Exception as e:
             if debug_on():
                 _dbg("THUMB-ERR", f"pid={pid} {type(e).__name__}: {str(e)[:120]}")
@@ -1301,6 +1297,63 @@ def thumb_for(item, lang="zh"):
 
 # pixiv API 获取缩略图 URL (缓存)
 _thumb_url_cache = {}
+def viewer_img_for(item):
+    """查看器大图: 按当前预览档位下载(与缩略图同一套提示, 但独立缓存目录)。
+    原图档会拿到无损原图(1~5MB, 可能 png); 低档位则用 600/1200 压缩版。
+    失败时回退到普通缩略图, 保证查看器不空窗。
+    """
+    pid = str(item.get("id"))
+    base_dir = os.path.join(APP_DATA, "viewer")
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+    except Exception:
+        pass
+    # 缓存文件带档位名: 换档位不会误用旧图
+    for ext in (".png", ".jpg"):
+        p = os.path.join(base_dir, f"{pid}_{THUMB_QUALITY}{ext}")
+        if os.path.exists(p) and os.path.getsize(p) > 500:
+            return p
+    url = item.get("url", "")
+    if not url or "i.pximg.net" not in url:
+        url = _fetch_thumb_url_from_api(pid)
+    if not url:
+        return thumb_for(item)
+    _timeout = 30 if THUMB_QUALITY == "original" else 15
+    _maxbytes = 14 * 1024 * 1024 if THUMB_QUALITY == "original" else 6 * 1024 * 1024
+    cands = _quality_url_variants(url, THUMB_QUALITY)
+    try:
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        proxies = urllib.request.getproxies()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies), NoRedirect) if proxies \
+            else urllib.request.build_opener(NoRedirect)
+        with THUMB_SEM:
+            for cu in cands:
+                if not cu:
+                    continue
+                try:
+                    req = urllib.request.Request(cu, headers={
+                        "Referer": "https://www.pixiv.net/",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120",
+                    })
+                    with opener.open(req, timeout=_timeout) as r:
+                        data = r.read(_maxbytes + 1)
+                    if not data or len(data) > _maxbytes:
+                        continue
+                    # 按magic判断真实格式, 避免 png 存成 .jpg
+                    ext = ".png" if data[:4] == b"\x89PNG" else ".jpg"
+                    p = os.path.join(base_dir, f"{pid}_{THUMB_QUALITY}{ext}")
+                    with open(p, "wb") as f:
+                        f.write(data)
+                    return p
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    # 全部失败 → 退回普通缩略图(至少能看到内容)
+    return thumb_for(item)
+
 def _fetch_thumb_url_from_api(pid):
     """从 pixiv API 获取作品缩略图 URL"""
     if pid in _thumb_url_cache:
@@ -1348,6 +1401,101 @@ ACCESS_KEY = "qLCzN68J-767zrEl"
 
 # 缩略图下载域名白名单: 代理只允许拉取这些域名下的图, 防数据文件被篡改时 SSRF。
 THUMB_ALLOW_HOSTS = ("pximg.net",)
+
+# ============ 预览清晰度档位 ============
+# 探测实测(2026-10-01, 同一作品):
+#   250x250 原样    16 KB   ← 现状
+#   c/600x600/      238 KB
+#   c/1200x1200/    310 KB
+#   img-original/   1.0 MB (jpg) / 5.1 MB (png)  ← 真原图
+# 说明: 只有 img-original 是无损原图; c/1200x1200 是压缩过的 1200 长边版本。
+#      原图 jpg/png 两种格式都要试(pixiv 两种都存在), 先 jpg 后 png。
+THUMB_PRESETS = {
+    # key: (显示名, URL变换函数, 说明)
+    "fast":     {"label": "省流 (250px)",   "desc": "最快, 导入最省时间",           "size": "~16 KB"},
+    "normal":   {"label": "标准 (600px)",   "desc": "默认, 清晰度与速度平衡",        "size": "~240 KB"},
+    "high":     {"label": "高清 (1200px)",  "desc": "较清晰, 导入稍慢",             "size": "~310 KB"},
+    "original": {"label": "原图 (无损)",     "desc": "最高清, 直接取作品原图, 导入最慢", "size": "1~5 MB"},
+}
+THUMB_QUALITY = "normal"        # 运行时档位(由设置写入)
+_THUMB_QUALITY_FILE = os.path.join(APP_DATA, "thumb_quality.json")
+
+def _thumb_quality_load():
+    """启动时读回上次选的档位。"""
+    global THUMB_QUALITY
+    try:
+        if os.path.exists(_THUMB_QUALITY_FILE):
+            q = (json.load(open(_THUMB_QUALITY_FILE, encoding="utf-8")) or {}).get("quality")
+            if q in THUMB_PRESETS:
+                THUMB_QUALITY = q
+    except Exception:
+        pass
+    return THUMB_QUALITY
+
+def _thumb_quality_save(q):
+    global THUMB_QUALITY
+    if q not in THUMB_PRESETS:
+        return False
+    THUMB_QUALITY = q
+    try:
+        os.makedirs(APP_DATA, exist_ok=True)
+        json.dump({"quality": q}, open(_THUMB_QUALITY_FILE, "w", encoding="utf-8"))
+    except Exception:
+        pass
+    return True
+
+def _split_pximg_url(url):
+    """把 pximg URL 拆成 (目录部分, 文件名主干, 扩展名)。
+    例: https://i.pximg.net/c/250x250_80_a2/img-master/img/2026/08/01/00/06/56/147861698_p0_square1200.jpg
+        -> ("img-master/img/2026/08/01/00/06/56", "147861698_p0_square1200", "jpg")
+    """
+    try:
+        after = url.split("pximg.net/", 1)[1]
+        # 去掉尺寸前缀 c/xxx/
+        if after.startswith("c/"):
+            after = after.split("/", 2)[2]
+        dirpart, fname = after.rsplit("/", 1)
+        if "." in fname:
+            stem, ext = fname.rsplit(".", 1)
+        else:
+            stem, ext = fname, "jpg"
+        return dirpart, stem, ext
+    except Exception:
+        return None, None, None
+
+def _quality_url_variants(url, quality):
+    """按档位返回候选 URL 列表(按优先级, 失败依次回退)。"""
+    if not url or "i.pximg.net" not in url:
+        return [url] if url else []
+    dirpart, stem, ext = _split_pximg_url(url)
+    if not dirpart:
+        return [url]
+    # 作品ID_页码 (如 147861698_p0): 去掉 _square1200 / _custom1200 等后缀
+    base = stem.rsplit("_", 1)[0] if "_" in stem else stem
+    pid_p = base                    # 例 147861698_p0
+    base_url = f"https://i.pximg.net/{dirpart}"
+    # 原图目录: dirpart 形如 "img-master/img/2026/08/..." 或 "custom-thumb/img/...",
+    # 原图在 "img-original/img/2026/08/..." → 取 "img/" 之后的路径重新拼接
+    _rest = dirpart.split("img/", 1)[1] if "img/" in dirpart else dirpart
+    orig_base = f"https://i.pximg.net/img-original/img/{_rest}"
+    if quality == "fast":
+        return [url]                                     # 原样 250
+    if quality == "normal":
+        return [f"https://i.pximg.net/c/600x600/{dirpart}/{stem}.{ext}", url]
+    if quality == "high":
+        return [f"https://i.pximg.net/c/1200x1200/{dirpart}/{stem}.{ext}",
+                f"https://i.pximg.net/c/1200x1200/{dirpart}/{base}_master1200.jpg",
+                f"https://i.pximg.net/c/600x600/{dirpart}/{stem}.{ext}", url]
+    if quality == "original":
+        # 原图: img-original/img/ 下, 同名 jpg / png 都试
+        return [f"{orig_base}/{pid_p}.jpg",
+                f"{orig_base}/{pid_p}.png",
+                f"https://i.pximg.net/c/1200x1200/{dirpart}/{base}_master1200.jpg",
+                f"https://i.pximg.net/c/1200x1200/{dirpart}/{stem}.{ext}",
+                url]
+    return [url]
+
+_thumb_quality_load()
 
 # API 限速: 每 IP 每 5 秒最多 60 次 /api/ 请求(图片代理不限, 浏览器并发拉图不误伤)
 _RATE = {}
@@ -1886,9 +2034,19 @@ class H(BaseHTTPRequestHandler):
             return self.send_json(200, p)
 
         elif u.path == "/api/settings":
-            # 返回当前配置(proxy 等)
+            # 返回当前配置(proxy 等) + 预览清晰度档位
             cfg = load_config()
-            self.send_json(200, {"proxy": cfg.get("proxy", "http://127.0.0.1:10808")})
+            self.send_json(200, {
+                "proxy": cfg.get("proxy", "http://127.0.0.1:10808"),
+                "thumb_quality": THUMB_QUALITY,
+                "thumb_presets": {k: {"label": v["label"], "desc": v["desc"], "size": v["size"]}
+                                  for k, v in THUMB_PRESETS.items()},
+            })
+        elif u.path == "/api/thumb-quality":
+            # GET: 读取当前档位与可选档位(写入走 _handle_post)
+            self.send_json(200, {"quality": THUMB_QUALITY,
+                                 "presets": {k: {"label": v["label"], "desc": v["desc"],
+                                                 "size": v["size"]} for k, v in THUMB_PRESETS.items()}})
         elif u.path == "/api/settings/draft":
             # 返回草稿设置
             draft = _get_draft_settings()
@@ -1939,6 +2097,43 @@ class H(BaseHTTPRequestHandler):
                 self.send_json(200, st)
         elif u.path == "/api/import-status":
             self.send_json(200, import_status())
+        elif u.path.startswith("/viewer-img/"):
+            # 查看器大图: 按当前预览档位取图(与缩略图共用同一套 URL 逻辑)
+            pid = os.path.basename(u.path)
+            it = next((x for x in BOOKMARKS if str(x["id"]) == pid), None)
+            if not it:
+                return self.send_error(404)
+            local = viewer_img_for(it)
+            if not local:
+                return self.send_error(404)
+            try:
+                mtime = int(os.path.getmtime(local))
+                ims = self.headers.get("If-Modified-Since")
+                if ims:
+                    import email.utils as _eu
+                    try:
+                        ims_ts = int(_eu.mktime_tz(_eu.parsedate_tz(ims)))
+                        if mtime <= ims_ts:
+                            self.send_response(304)
+                            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+                            self.end_headers()
+                            return
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                with open(local, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                _ct = "image/png" if local.lower().endswith(".png") else "image/jpeg"
+                self.send_header("Content-Type", _ct)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                return self.send_error(404)
         elif u.path.startswith("/thumb/"):
             pid = os.path.basename(u.path)
             it = next((x for x in BOOKMARKS if str(x["id"])==pid), None)
@@ -2103,6 +2298,33 @@ class H(BaseHTTPRequestHandler):
             self._deny(429, "Too Many Requests (pix_search_server)")
             return
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/api/thumb-quality":
+            """预览清晰度档位写入: {quality: fast|normal|high|original, clear: bool}"""
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            q = body.get("quality")
+            if not _thumb_quality_save(q):
+                return self.send_json(400, {"ok": False, "error": f"未知档位: {q}"})
+            log_info(f"预览清晰度切换为 {q} | Thumb quality set to {q}")
+            # 切换档位后已缓存的旧清晰度文件与新档位不符 → 可选清空
+            removed = 0
+            if body.get("clear"):
+                try:
+                    for f in os.listdir(THUMB):
+                        if f.lower().endswith((".jpg", ".png")):
+                            try:
+                                os.remove(os.path.join(THUMB, f)); removed += 1
+                            except Exception:
+                                pass
+                    log_info(f"已清空 {removed} 张旧清晰度缓存 | Cleared {removed} cached thumbs")
+                except Exception as e:
+                    log_error(f"清空缩略图缓存失败: {e}")
+                _thumb_url_cache.clear()
+            return self.send_json(200, {"ok": True, "quality": THUMB_QUALITY, "removed": removed})
+
         if u.path == "/api/first-run/edge":
             """从 Edge CDP 抓取 Pixiv cookie。
             新机器上 Edge 默认不开调试端口 → 先自动用调试端口拉起
@@ -2962,6 +3184,26 @@ body.transitioning .search-float{backdrop-filter:blur(10px) saturate(120%);trans
 /* 进度条 */
 .progress{position:fixed;top:0;left:0;height:3px;background:linear-gradient(90deg,var(--accent),#e0aaff);width:0;z-index:9999;transition:width .3s;box-shadow:0 0 20px var(--accent-g)}
 .progress.active{width:100%;transition:width 8s ease-out}
+/* ===== 预览清晰度选择器 ===== */
+.tq-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.tq-item{position:relative;padding:12px 14px;border-radius:14px;border:2px solid var(--glass-bd);background:rgba(255,255,255,.04);cursor:pointer;transition:all .28s var(--ease-snap)}
+.tq-item:hover{transform:translateY(-3px);border-color:rgba(var(--accent-rgb),.5);box-shadow:0 10px 26px rgba(0,0,0,.35)}
+.tq-item.on{border-color:var(--accent);background:rgba(var(--accent-rgb),.14);box-shadow:0 0 28px rgba(var(--accent-rgb),.22)}
+.tq-item .tq-t{font-size:14px;font-weight:700;color:var(--txt);display:flex;align-items:center;gap:6px}
+.tq-item.on .tq-t::after{content:'✓';margin-left:auto;color:var(--accent);font-size:16px}
+.tq-item .tq-d{font-size:11.5px;color:var(--sub);margin-top:5px;line-height:1.45}
+.tq-item .tq-s{font-size:11px;color:var(--accent);margin-top:6px;font-variant-numeric:tabular-nums}
+.tq-note{margin-top:12px;font-size:12px;color:var(--sub);line-height:1.6;padding:10px 12px;border-radius:12px;background:rgba(255,255,255,.035);border-left:3px solid var(--accent);display:none}
+.tq-note.show{display:block}
+.tq-actions{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap}
+.tq-btn{padding:9px 16px;border-radius:12px;border:1px solid var(--glass-bd);background:var(--accent);color:#fff;font-size:13px;cursor:pointer;transition:all .25s var(--ease-snap)}
+.tq-btn:hover{transform:translateY(-2px);box-shadow:0 8px 22px var(--accent-g)}
+.tq-btn.ghost{background:rgba(255,255,255,.06);color:var(--txt)}
+/* ===== 撤销提示 ===== */
+.undo-toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(14px);background:var(--glass);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--glass-bd);border-radius:14px;padding:11px 22px;font-size:13px;color:var(--txt);z-index:9500;opacity:0;pointer-events:none;transition:opacity .28s var(--ease-page),transform .28s var(--ease-page);box-shadow:0 14px 44px rgba(0,0,0,.55)}
+.undo-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+#undo-hint{display:none;align-items:center;gap:4px;font-size:11px;color:var(--accent);padding:3px 9px;border-radius:10px;background:rgba(var(--accent-rgb),.13);cursor:pointer;user-select:none;transition:all .25s var(--ease-snap)}
+#undo-hint:hover{background:rgba(var(--accent-rgb),.28);transform:scale(1.06)}
 /* 导入状态悬浮面板: 顶部 3px 细条看不清, 这个才是用户实际读的界面 */
 .imp-panel{position:fixed;top:64px;left:50%;transform:translateX(-50%) translateY(-16px);min-width:340px;max-width:min(560px,92vw);background:var(--glass);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--glass-bd);border-radius:18px;padding:16px 20px;z-index:9000;box-shadow:0 18px 60px rgba(0,0,0,.6);opacity:0;pointer-events:none;transition:opacity .3s var(--ease-page),transform .3s var(--ease-page)}
 .imp-panel.show{opacity:1;transform:translateX(-50%) translateY(0);pointer-events:auto}
@@ -3199,6 +3441,7 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 <div class="island">
   <button class="island-btn" onclick="togSearch()">🔍</button>
   <span class="island-txt"><b>PixivFavSearch</b> · <span id="island-count">0</span> 幅</span>
+  <span id="undo-hint" onclick="doUndo()" title="可撤销操作"></span>
   <button class="island-btn" id="refresh-btn" onclick="refreshAll()" title="刷新 (F5)">🔄</button>
   <button class="island-btn" onclick="doImport()">📥</button>
   <button class="island-btn" onclick="togTheme()" title="主题 & 动效">🎨</button>
@@ -3247,6 +3490,20 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
       <div class="stat"><div class="stat-v">8,237</div><div class="stat-l">收藏作品</div></div>
       <div class="stat"><div class="stat-v">12</div><div class="stat-l">收藏夹</div></div>
       <div class="stat"><div class="stat-v">v1.0</div><div class="stat-l">版本</div></div>
+    </div>
+    <div class="sec">
+      <h3>✨ 预览清晰度</h3>
+      <div class="set-row" style="display:block">
+        <div style="margin-bottom:12px"><div class="set-label">预览图分辨率</div>
+          <div class="set-desc" id="tq-desc">选择卡片与查看器使用的图片清晰度。档位越高越清晰，但首次浏览下载越慢。</div>
+        </div>
+        <div class="tq-grid" id="tq-grid"></div>
+        <div class="tq-note" id="tq-note"></div>
+        <div class="tq-actions">
+          <button class="tq-btn" id="tq-apply" onclick="tqApply()">应用并清空旧缓存</button>
+          <button class="tq-btn ghost" onclick="tqApply(false)">仅切换(保留缓存)</button>
+        </div>
+      </div>
     </div>
     <div class="sec">
       <h3>🛡️ 安全模式</h3>
@@ -3468,6 +3725,95 @@ let pageSize=200;
 let totalPages=0;
 let totalItems=0;
 
+/* ============ 撤销历史栈 ============
+   语义: 撤销键 = "回到上一个操作前的状态", 不管刚才在干什么。
+   记录所有会改变画面结果的状态: 页面/搜索/标签/收藏夹/排序/安全模式/页码/统计筛选。
+   与浏览器的"后退"无关 —— 这是应用级状态快照栈。 */
+const UNDO_MAX=60;
+let undoStack=[];
+let _restoring=false;      // 恢复期间抑制入栈, 防自我循环
+
+function snapState(){
+ return {
+  page:(document.querySelector('.page.active')||{}).id||'pg-search',
+  searchQuery:searchQuery,
+  tagFilter:tagFilter,
+  coltagFilter:coltagFilter,
+  sortMode:sortMode,
+  safe:safe,
+  currentPage:currentPage,
+  statsFilter:statsFilter?{type:statsFilter.type,val:statsFilter.val}:null,
+  searchOpen:!!(document.getElementById('search-p')||{}).classList?.contains('open'),
+  scrollTop:(function(){const e=currentScrollEl();return e?e.scrollTop:0;})()
+ };
+}
+// 入栈: 任何状态变更"之前"调用。去重相邻同状态。
+function pushUndo(){
+ if(_restoring)return;
+ const prev=undoStack[undoStack.length-1];
+ const cur=snapState();
+ if(prev && JSON.stringify(prev)===JSON.stringify(cur))return;
+ undoStack.push(cur);
+ if(undoStack.length>UNDO_MAX)undoStack.shift();
+ updateUndoHint();
+}
+async function restoreState(st){
+ _restoring=true;
+ try{
+  searchQuery=st.searchQuery; tagFilter=st.tagFilter; coltagFilter=st.coltagFilter;
+  sortMode=st.sortMode; safe=st.safe; statsFilter=st.statsFilter;
+  currentPage=st.currentPage||0;
+  // 同步搜索框内容
+  const inp=document.querySelector('.search-float input');
+  if(inp)inp.value=searchQuery||'';
+  // 同步筛选 UI 文案(标签/收藏夹/排序下拉)
+  if(typeof syncFilterLabels==='function')syncFilterLabels();
+  // 切页
+  const target=(st.page||'pg-search').replace(/^pg-/,'');
+  const curPg=document.querySelector('.page.active');
+  if(!curPg||curPg.id!==('pg-'+target)){ go(target); await new Promise(r=>setTimeout(r,340)); }
+  await renderWall();
+  if(target==='fav'&&typeof renderFavs==='function')await renderFavs();
+  if(target==='stats'&&typeof renderStats==='function')await renderStats();
+  // 恢复滚动位置
+  const el=currentScrollEl();
+  if(el&&st.scrollTop)el.scrollTop=st.scrollTop;
+ }finally{
+  setTimeout(()=>{_restoring=false;},60);
+ }
+}
+function doUndo(){
+ if(!undoStack.length){
+  toastUndo('已经是最初状态了');
+  return;
+ }
+ const st=undoStack.pop();
+ const cur=snapState();
+ restoreState(st).then(()=>{
+  updateUndoHint();
+  toastUndo('已撤销'+(undoStack.length?` · 还可撤销 ${undoStack.length} 步`:' · 已回到最初'));
+ });
+ updateUndoHint();
+}
+function updateUndoHint(){
+ const n=undoStack.length;
+ const el=document.getElementById('undo-hint');
+ if(el){
+  el.textContent=n?`↶ ${n}`:'';
+  el.style.display=n?'flex':'none';
+  el.title=n?`可撤销 ${n} 步 (Ctrl+Z)`:'无可撤销操作';
+ }
+}
+function toastUndo(msg){
+ let t=document.getElementById('undo-toast');
+ if(!t){
+  t=document.createElement('div');t.id='undo-toast';t.className='undo-toast';
+  document.body.appendChild(t);
+ }
+ t.textContent=msg;t.classList.add('show');
+ clearTimeout(t._tm);t._tm=setTimeout(()=>t.classList.remove('show'),1800);
+}
+
 const fxState={lightTrail:true,magnetic:true,tilt3d:true,ripple:true,breathing:true,particles:true,aurora:true,waves:true,grid:false,nebula:false,contour:false};
 const fxIntensity={lightTrail:60,magnetic:50,tilt3d:70,ripple:80,breathing:50,particles:60,aurora:50,waves:40};
 
@@ -3613,6 +3959,8 @@ function updatePagination(){
 function goPage(page){
  if(page<0)page=0;
  if(page>=totalPages)page=totalPages-1;
+ if(page===currentPage)return;
+ pushUndo();          // 翻页也是状态变更, 可撤销
  currentPage=page;
  renderWall();
  // 翻页后回顶: 不然停留在旧滚动位置, 新页内容看着和旧页一样, 像没翻
@@ -3659,6 +4007,7 @@ function go(targetPage){
  const next=document.getElementById('pg-'+targetPage);
  if(!next)return;
  if(cur===next)return;
+ pushUndo();          // 切页 = 状态变更, 可撤销(侧边栏切换也能撤回)
  if(_goTimer){clearTimeout(_goTimer);_goTimer=null;}
  pageTransitioning=true;
  document.body.classList.add('transitioning');
@@ -3752,6 +4101,7 @@ async function renderStats(){
 // 统计跳转: 专用精确筛选(不走搜索框模糊匹配)
 // type: 'author' | 'year' | 'tag';  val: 已 encodeURIComponent 的值
 function filterFromStats(type,val){
+ pushUndo();
  // 清掉搜索词, 走专用参数
  searchQuery='';
  const input=document.querySelector('.search-float input');
@@ -3784,9 +4134,9 @@ function showViewerItem(){
  const img=document.getElementById('viewer-img');
  const info=document.getElementById('viewer-info');
  const cnt=document.getElementById('viewer-count');
- // 大图: origUrl 是 250x250 缩略图, 替换成大图尺寸路径
- let big=(w.origUrl||'').replace('/c/250x250_80_a2/','/c/1200x1200/');
- if(!big)big='/thumb/'+w.id;
+ // 大图: 按当前预览档位取图。原来的硬编码 1200 无法体现"原图"档。
+ // 通过后端 /api/viewer-url 统一下发(与缩略图档位共用同一套 URL 逻辑)。
+ let big='/viewer-img/'+w.id;
  if(img){img.src=big;img.onerror=function(){this.onerror=null;this.src='/thumb/'+w.id;};}
  if(info)info.innerHTML='<div class="vt">'+(w.title||'').replace(/</g,'&lt;')+'</div><div class="va">'+(w.userName||'').replace(/</g,'&lt;')+' · '+(w.pageCount||1)+'P</div>';
  if(cnt)cnt.textContent=(viewerIdx+1)+' / '+viewerList.length;
@@ -3884,7 +4234,7 @@ document.addEventListener('DOMContentLoaded',function(){
    _searchDebounce=setTimeout(()=>renderWall(),250);
   });
   input.addEventListener('keydown',function(e){
-   if(e.key==='Enter'){searchQuery=this.value.trim();if(searchQuery)statsFilter=null;renderWall();addSearchHistory(searchQuery);hideSearchHistory();}
+   if(e.key==='Enter'){pushUndo();searchQuery=this.value.trim();if(searchQuery)statsFilter=null;currentPage=0;renderWall();addSearchHistory(searchQuery);hideSearchHistory();}
   });
   // ---- 搜索历史: 聚焦显示 / 失焦隐藏 / ↑↓选择 / 点击回填 ----
   input.addEventListener('focus',function(){showSearchHistory();});
@@ -3937,19 +4287,20 @@ function hideSearchHistory(){const box=document.getElementById('search-history')
 
 // 侧键撤回(X1/X2): 必须在 mousedown 阶段 preventDefault ——
 // WebView2 在 mousedown 时触发原生历史后退, 等 mouseup 早就导航走了。
+// 语义: 应用级撤销(回到上一操作前状态), 不是浏览器后退。
 let _sideBtnHandled=0;   // 时间戳: mousedown 处理过, 300ms 内 mouseup 不重复触发
 document.addEventListener('mousedown',e=>{
  if(e.button===3||e.button===4){
   e.preventDefault();   // 挡掉 WebView2 原生后退/前进
   e.stopPropagation();
   _sideBtnHandled=Date.now();
-  goBack();
+  doUndo();
  }
 },{capture:true});
 // mouseup 兜底(仅当 mousedown 被别的层吃掉时才生效)
 document.addEventListener('mouseup',e=>{
  if((e.button===3||e.button===4)&&Date.now()-_sideBtnHandled>300){
-  goBack();
+  doUndo();
  }
 });
 
@@ -3963,7 +4314,7 @@ document.addEventListener('mousemove',e=>{
  const dx=e.clientX-mouseGestureStart.x;
  const dy=e.clientY-mouseGestureStart.y;
  if(Math.sqrt(dx*dx+dy*dy)>80){
-  goBack();
+  doUndo();
   mouseGestureStart=null;
  }
 });
@@ -3993,17 +4344,21 @@ document.addEventListener('keydown',e=>{
   if(e.key==='ArrowRight'){viewerNav(1);return;}
  }
  if(e.key==='Escape')goBack();
- // 撤回/后退键: Ctrl+Z / Alt+← / Backspace(非输入态)
- // 之前只实现了鼠标侧键 X1/X2, 键盘完全没接
+ // 撤销键(应用级状态回退): Ctrl+Z / Alt+← / Backspace / 鼠标侧键后键
+ // 语义 = "回到上一个操作前的状态"(导航/搜索/筛选/翻页/排序/安全模式),
+ // 不是浏览器后退。之前只做了鼠标侧键且语义是页面返回, 已纠正。
  const _tag0=document.activeElement&&document.activeElement.tagName;
  const _inInput0=(_tag0==='INPUT'||_tag0==='TEXTAREA'||_tag0==='SELECT'||
                   (document.activeElement&&document.activeElement.isContentEditable));
  if((e.ctrlKey||e.metaKey)&&(e.key==='z'||e.key==='Z')&&!_inInput0){
-  e.preventDefault();goBack();return;
+  e.preventDefault();doUndo();return;
  }
- if(e.altKey&&e.key==='ArrowLeft'){e.preventDefault();goBack();return;}
+ if((e.ctrlKey||e.metaKey)&&e.shiftKey&&(e.key==='z'||e.key==='Z')&&!_inInput0){
+  e.preventDefault();doUndo();return;
+ }
+ if(e.altKey&&e.key==='ArrowLeft'){e.preventDefault();doUndo();return;}
  if(e.key==='Backspace'&&!_inInput0){
-  e.preventDefault();goBack();return;
+  e.preventDefault();doUndo();return;
  }
  // Ctrl+F / Ctrl+K: 聚焦搜索框(没打开则先打开)
  if((e.ctrlKey||e.metaKey)&&(e.key==='f'||e.key==='k')){
@@ -4177,6 +4532,7 @@ function showTags(id){document.getElementById('tag-modal').classList.add('open')
 document.getElementById('tag-modal').addEventListener('click',function(e){if(e.target===this)this.classList.remove('open')});
 
 function togSafe(){
+ pushUndo();
  safe=!safe;
  document.getElementById('safe-tog').classList.toggle('on',safe);
  document.getElementById('safe-dot').classList.toggle('on',safe);
@@ -4413,6 +4769,8 @@ setTimeout(async()=>{
    startPrefetchPolling();
   }
  }catch(e){}
+ tqLoad();          // 载入预览清晰度档位
+ updateUndoHint();  // 初始化撤销提示
 },2000);
 
 function loadTagFilters(){
@@ -4433,6 +4791,7 @@ function loadTagFilters(){
 }
 
 function setTagFilter(tag,el){
+ pushUndo();
  tagFilter=tag;
  statsFilter=null;   // 手动选标签时清掉统计筛选
  document.querySelectorAll('.tag-pill').forEach(p=>p.classList.remove('active'));
@@ -4442,6 +4801,7 @@ function setTagFilter(tag,el){
 }
 
 function setColtagFilter(val){
+ pushUndo();
  coltagFilter=val;
  statsFilter=null;   // 手动选收藏夹时清掉统计筛选
  currentPage=0;
@@ -4474,9 +4834,56 @@ function ddPick(which,val,el){
 }
 
 function setSortMode(val){
+ pushUndo();
  sortMode=val;
  currentPage=0;
  renderWall();
+}
+
+/* ===== 预览清晰度设置 ===== */
+let tqCurrent='normal', tqPicked='normal', tqPresets={};
+async function tqLoad(){
+ try{
+  const d=await fetch('/api/thumb-quality').then(r=>r.json());
+  tqCurrent=d.quality||'normal'; tqPicked=tqCurrent; tqPresets=d.presets||{};
+  tqRender();
+ }catch(e){}
+}
+function tqRender(){
+ const g=document.getElementById('tq-grid');if(!g)return;
+ g.innerHTML=Object.entries(tqPresets).map(([k,v])=>`
+  <div class="tq-item${k===tqPicked?' on':''}" onclick="tqPick('${k}')">
+    <div class="tq-t">${v.label}</div>
+    <div class="tq-d">${v.desc}</div>
+    <div class="tq-s">约 ${v.size}/张</div>
+  </div>`).join('');
+ const n=document.getElementById('tq-note');
+ if(n&&tqPicked!==tqCurrent){
+  n.classList.add('show');
+  n.innerHTML=tqPicked==='original'
+   ? '⚠️ <b>原图档最清晰</b>：单张 1~5 MB，是标准档的 5~20 倍。首次浏览/预载会明显变慢（实测单张 3~9 秒），但图片为无损原图。切换后旧缓存与新档位不符，建议点「应用并清空旧缓存」。'
+   : tqPicked==='fast'
+   ? '⚡ <b>省流档</b>：单张仅 13~16 KB，最快，但卡片会明显偏模糊。适合流量紧张或只想快速翻找时使用。'
+   : '切换后新图按新档位下载；旧缓存不受影响（点「应用并清空旧缓存」可一并清掉重下）。';
+ } else if(n){ n.classList.remove('show'); }
+}
+function tqPick(k){ tqPicked=k; tqRender(); }
+async function tqApply(clear=true){
+ try{
+  const r=await fetch('/api/thumb-quality',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({quality:tqPicked,clear:!!clear})});
+  const d=await r.json();
+  if(d.ok){
+   tqCurrent=d.quality;
+   toastUndo(clear?`已切换为「${(tqPresets[d.quality]||{}).label||d.quality}」，清空 ${d.removed} 张旧缓存`
+                  :`已切换为「${(tqPresets[d.quality]||{}).label||d.quality}」(保留旧缓存)`);
+   tqRender();
+   // 清空缓存后重渲染, 让新档位立刻生效
+   if(clear){ if(typeof updatePagination==='function'){} }
+  }else{
+   toastUndo('切换失败: '+(d.error||'未知错误'));
+  }
+ }catch(e){ toastUndo('切换失败: '+e.message); }
 }
 
 async function togDebug(el){
