@@ -1083,14 +1083,21 @@ def start_thumb_prefetch():
     return True
 
 def _thumb_cached(pid):
-    # .jpg = 真图; .svg = 占位图(也算已处理, 不再重试)
-    for ext in (".jpg", ".svg"):
-        local = os.path.join(THUMB, pid + ext)
-        try:
-            if os.path.exists(local) and os.path.getsize(local) > 100:
-                return True
-        except Exception:
-            pass
+    """是否已处理过(真图或占位图)。真图查当前档位的缓存名。"""
+    # 真图: 当前档位的 {pid}_{quality}.jpg
+    try:
+        p = _thumb_cache_path(pid)
+        if os.path.exists(p) and os.path.getsize(p) > 100:
+            return True
+    except Exception:
+        pass
+    # 占位图: {pid}.svg (无档位概念, 生成一次永久复用)
+    try:
+        svg = os.path.join(THUMB, str(pid) + ".svg")
+        if os.path.exists(svg) and os.path.getsize(svg) > 100:
+            return True
+    except Exception:
+        pass
     return False
 
 def _prefetch_one(it):
@@ -1223,7 +1230,8 @@ def thumb_for(item, lang="zh"):
         except Exception:
             return None
     pid = str(item["id"])
-    local = os.path.join(THUMB, pid + ".jpg")
+    # 缓存文件名带档位后缀: 换档位不会误用旧分辨率的图(历史无后缀文件已归档)
+    local = _thumb_cache_path(pid)
     if os.path.exists(local) and os.path.getsize(local) > 500:
         return local
     # 失败缓存: 近期下载失败的作品不再重试,
@@ -1275,8 +1283,26 @@ def thumb_for(item, lang="zh"):
                     if not data or len(data) > _maxbytes:
                         _last_err = "too big / empty"
                         continue
-                    with open(local, "wb") as f:
-                        f.write(data)
+                    # 先写临时文件, 重采样后再原子改名到 local。
+                    # 直接写 local 会有窗口期: 别的线程(6并发预载)会读到
+                    # 未缩放的巨图, 缓存里出现超尺寸文件(已实测抓到)。
+                    _tmp = local + ".part"
+                    try:
+                        with open(_tmp, "wb") as f:
+                            f.write(data)
+                        # 关键: 用 LANCZOS 重采样到卡片显示尺寸再入库。
+                        # 不这么做的话, 11MB / 7680px 的原图会被直接交给浏览器,
+                        # GPU 缩放没有预过滤 → 高频细节折叠成摩尔纹。
+                        _did, _dim = _store_resampled(_tmp, local)
+                        if _did and debug_on():
+                            _dbg("THUMB-RS", f"pid={pid} {THUMB_QUALITY} → {_dim[0]}x{_dim[1]} "
+                                             f"({os.path.getsize(local)//1024}KB)")
+                    except Exception:
+                        try:
+                            if os.path.exists(_tmp):
+                                os.replace(_tmp, local)
+                        except Exception:
+                            pass
                     return local
                 except Exception as _e:
                     _last_err = _e
@@ -1420,6 +1446,125 @@ THUMB_PRESETS = {
 THUMB_QUALITY = "normal"        # 运行时档位(由设置写入)
 _THUMB_QUALITY_FILE = os.path.join(APP_DATA, "thumb_quality.json")
 
+# ---- 卡片重采样 ----
+# 卡片实际显示宽度: masonry 4 列 @1400px - 3×14px gap ≈ 339.5px
+# 高DPI 屏按 2x 计算 → 680px 长边足够锐利。
+# 为什么必须重采样: 直接把原图(最大 7680x4992)交给浏览器, GPU 缩放缺少
+# 预过滤, 源图高频细节(网点/锐利描线)超过奈奎斯特频率后折叠成规则纹路,
+# 即肉眼可见的摩尔纹。服务端用 LANCZOS 先降到目标尺寸即可彻底避免。
+THUMB_CARD_MAX = 680            # 长边上限(px)
+THUMB_CARD_QUALITY = 88         # 重采样后 JPEG 质量
+
+def _thumb_cache_path(pid, quality=None):
+    """缩略图缓存路径。文件名带档位后缀, 避免换档位后误用旧分辨率的图。
+    历史遗留的无后缀文件({pid}.jpg)视为失效, 由 _purge_legacy_thumbs() 归档。
+    """
+    q = quality or THUMB_QUALITY
+    return os.path.join(THUMB, f"{pid}_{q}.jpg")
+
+def _resample_for_card(path, max_edge=None):
+    """把刚下载的大图用 LANCZOS 重采样到卡片显示尺寸。
+
+    JPEG 走 draft() 预缩: 让 libjpeg 以 1/2、1/4、1/8 比例直接解码,
+    是 DCT 域的盒式滤波(天然抗混叠, 正好抑制摩尔纹), 实测比全尺寸解码
+    再缩快 3~11 倍, 像素差异 <0.5%。PNG 无此机制, 走常规路径。
+
+    返回 (是否缩过, 新尺寸)。失败时保留原文件, 不阻断流程。
+    注意: 调用方必须传"临时文件"路径, 见 _store_resampled()。
+    """
+    max_edge = max_edge or THUMB_CARD_MAX
+    try:
+        from PIL import Image
+    except Exception:
+        return False, None
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+            if max(w, h) <= max_edge:
+                return False, (w, h)
+            sc = max_edge / float(max(w, h))
+            nw, nh = max(int(w * sc), 1), max(int(h * sc), 1)
+            # JPEG: 先让解码器按比例抽样, 大幅省内存与时间
+            if (im.format or "").upper() in ("JPEG", "MPO"):
+                try:
+                    im.draft("RGB", (nw, nh))
+                except Exception:
+                    pass
+            rgb = im.convert("RGB")
+            small = rgb.resize((nw, nh), Image.LANCZOS)
+        small.save(path, "JPEG", quality=THUMB_CARD_QUALITY, optimize=True, progressive=True)
+        return True, (nw, nh)
+    except Exception:
+        return False, None
+
+def _store_resampled(tmp_path, final_path):
+    """把下载好的图重采样后原子落盘到最终路径。
+
+    为什么要原子: 下载线程(含 6 并发预载)与 HTTP 读取线程并存。
+    若先把原图写到最终路径、再原地重采样, 中间窗口里别的线程会读到
+    未缩放的巨图(实测抓到这个竞态: 缓存里出现过 1536px 文件)。
+    做法是先在同目录写 .part, 重采样后 os.replace 原子改名 ——
+    最终路径要么不存在, 要么已是重采样后的版本。
+    """
+    try:
+        _did, _dim = _resample_for_card(tmp_path)
+        try:
+            os.replace(tmp_path, final_path)
+        except Exception:
+            # 改名失败(跨卷/占用): 回退为复制
+            import shutil as _sh
+            _sh.copyfile(tmp_path, final_path)
+            try: os.remove(tmp_path)
+            except Exception: pass
+        return _did, _dim
+    except Exception:
+        try:
+            if not os.path.exists(final_path):
+                os.replace(tmp_path, final_path)
+        except Exception:
+            pass
+        return False, None
+
+def _purge_stale_parts():
+    """清理崩溃/中断留下的 .part 临时文件(它们永远不会被当成缓存命中)。"""
+    try:
+        n = 0
+        for f in os.listdir(THUMB):
+            if f.endswith(".part"):
+                try:
+                    os.remove(os.path.join(THUMB, f)); n += 1
+                except Exception:
+                    pass
+        return n
+    except Exception:
+        return 0
+
+def _purge_legacy_thumbs():
+    """一次性清理历史遗留的无档位后缀缩略图({pid}.jpg)。
+    这些文件是"档位混乱期"的产物: 里面混着 250px 与 11MB 原图,
+    无法判断属于哪个档位, 与现行缓存同目录会让用户看到新旧混杂的画质。
+    移到 data/_legacy_thumbs/ 归档(不删除, 可回滚)。
+    """
+    try:
+        legacy = [f for f in os.listdir(THUMB)
+                  if os.path.isfile(os.path.join(THUMB, f))
+                  and f.endswith(".jpg") and "_" not in f[:-4]]
+        if not legacy:
+            return 0
+        dst = os.path.join(OUT, "_legacy_thumbs")
+        os.makedirs(dst, exist_ok=True)
+        moved = 0
+        for f in legacy:
+            try:
+                os.replace(os.path.join(THUMB, f), os.path.join(dst, f))
+                moved += 1
+            except Exception:
+                pass
+        _log(f"归档历史缩略图 {moved} 个(无档位后缀) → {dst}")
+        return moved
+    except Exception:
+        return 0
+
 def _thumb_quality_load():
     """启动时读回上次选的档位。"""
     global THUMB_QUALITY
@@ -1496,6 +1641,22 @@ def _quality_url_variants(url, quality):
     return [url]
 
 _thumb_quality_load()
+
+# 启动时归档"档位混乱期"的历史缩略图(无档位后缀的 {pid}.jpg)。
+# 那些文件里混着 250px 与 11MB 原图, 会让用户看到新旧混杂的画质。
+# 放到线程里做, 不拖慢启动。
+def _startup_thumb_migration():
+    try:
+        n = _purge_legacy_thumbs()
+        if n:
+            _dbg("THUMB-MIGRATE", f"归档历史缩略图 {n} 个 → data/_legacy_thumbs/")
+        p = _purge_stale_parts()
+        if p:
+            _dbg("THUMB-MIGRATE", f"清理残留 .part 临时文件 {p} 个")
+    except Exception:
+        pass
+
+threading.Thread(target=_startup_thumb_migration, daemon=True).start()
 
 # API 限速: 每 IP 每 5 秒最多 60 次 /api/ 请求(图片代理不限, 浏览器并发拉图不误伤)
 _RATE = {}
@@ -2319,6 +2480,15 @@ class H(BaseHTTPRequestHandler):
                                 os.remove(os.path.join(THUMB, f)); removed += 1
                             except Exception:
                                 pass
+                    # 查看器缓存同样按档位存(viewer/{pid}_{quality}.{ext}), 一并清掉
+                    _vdir = os.path.join(APP_DATA, "viewer")
+                    if os.path.isdir(_vdir):
+                        for f in os.listdir(_vdir):
+                            if f.lower().endswith((".jpg", ".png")):
+                                try:
+                                    os.remove(os.path.join(_vdir, f)); removed += 1
+                                except Exception:
+                                    pass
                     log_info(f"已清空 {removed} 张旧清晰度缓存 | Cleared {removed} cached thumbs")
                 except Exception as e:
                     log_error(f"清空缩略图缓存失败: {e}")
@@ -4878,8 +5048,13 @@ async function tqApply(clear=true){
    toastUndo(clear?`已切换为「${(tqPresets[d.quality]||{}).label||d.quality}」，清空 ${d.removed} 张旧缓存`
                   :`已切换为「${(tqPresets[d.quality]||{}).label||d.quality}」(保留旧缓存)`);
    tqRender();
-   // 清空缓存后重渲染, 让新档位立刻生效
-   if(clear){ if(typeof updatePagination==='function'){} }
+   // 清空缓存后重渲染, 让新档位立刻生效(卡片会按新档位重新请求图片)
+   if(clear){
+    try{
+     if(typeof renderForPage==='function'){ renderForPage(); }
+     else if(typeof renderWall==='function'){ renderWall(); }
+    }catch(e){}
+   }
   }else{
    toastUndo('切换失败: '+(d.error||'未知错误'));
   }

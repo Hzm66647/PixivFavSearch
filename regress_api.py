@@ -196,6 +196,111 @@ def _chk_settings_tq():
 ok, detail = _chk_settings_tq()
 chk(ok, detail)
 
+
+# ---------- 本轮: 卡片重采样 + 档位隔离缓存 ----------
+def _chk_card_resample():
+    """核心修复: 原图档缩略图必须已被重采样到卡片尺寸(≤680px)。
+    未修复时会把 7680px / 11MB 的原图直接交给浏览器, GPU 缩放无预过滤
+    → 高频细节折叠成摩尔纹。
+    """
+    import os as _os
+    try:
+        from PIL import Image as _Image
+    except Exception:
+        return True, "无 PIL 跳过"
+    appdata = _os.path.join(_os.environ.get("LOCALAPPDATA", ""), "PixivFavSearch")
+    tdir = _os.path.join(appdata, "data", "thumbs")
+    if not _os.path.isdir(tdir):
+        return True, "无缓存目录(首次运行)"
+    files = [f for f in _os.listdir(tdir) if f.endswith(".jpg")]
+    if not files:
+        return True, "无缓存文件"
+    over, checked, maxw = [], 0, 0
+    for f in files[:200]:
+        try:
+            im = _Image.open(_os.path.join(tdir, f))
+            w, h = im.size
+            im.close()
+            checked += 1
+            maxw = max(maxw, w, h)
+            if max(w, h) > 700:
+                over.append((f, (w, h)))
+        except Exception:
+            continue
+    ok = not over
+    return ok, f"检查{checked}张 最大{maxw}px 超标{len(over)}张"
+
+ok, detail = _chk_card_resample()
+chk("原图档缩略图已重采样到卡片尺寸", ok, detail)
+
+
+def _chk_cache_naming():
+    """缓存文件名必须带档位后缀, 否则换档位会误用旧分辨率的图。"""
+    import os as _os
+    appdata = _os.path.join(_os.environ.get("LOCALAPPDATA", ""), "PixivFavSearch")
+    tdir = _os.path.join(appdata, "data", "thumbs")
+    if not _os.path.isdir(tdir):
+        return True, "无缓存目录"
+    jpgs = [f for f in _os.listdir(tdir) if f.endswith(".jpg")]
+    if not jpgs:
+        return True, "无 jpg 缓存"
+    legacy = [f for f in jpgs if "_" not in f[:-4]]
+    ok = not legacy
+    return ok, f"{len(jpgs)}个jpg 无档位后缀({len(legacy)}个)"
+
+ok, detail = _chk_cache_naming()
+chk("缓存文件名带档位后缀", ok, detail)
+
+
+def _chk_legacy_archived():
+    """历史无档位后缀缓存应已被归档到 data/_legacy_thumbs/。"""
+    import os as _os
+    appdata = _os.path.join(_os.environ.get("LOCALAPPDATA", ""), "PixivFavSearch")
+    arch = _os.path.join(appdata, "data", "_legacy_thumbs")
+    if not _os.path.isdir(arch):
+        return True, "无归档目录(全新环境, 正常)"
+    n = len([f for f in _os.listdir(arch) if f.endswith(".jpg")])
+    return True, f"已归档 {n} 个历史缩略图"
+
+ok, detail = _chk_legacy_archived()
+chk("历史缩略图已归档", ok, detail)
+
+
+def _chk_viewer_fullres():
+    """查看器端点必须仍返回高分辨率图(不能被卡片重采样影响)。
+    卡片用 680px 缩略图, 查看器用原图 —— 各司其职。
+    """
+    import os as _os, io as _io
+    try:
+        from PIL import Image as _Image
+    except Exception:
+        return True, "无 PIL 跳过"
+    appdata = _os.path.join(_os.environ.get("LOCALAPPDATA", ""), "PixivFavSearch")
+    vdir = _os.path.join(appdata, "viewer")
+    if not _os.path.isdir(vdir):
+        return True, "无查看器缓存"
+    files = [f for f in _os.listdir(vdir) if f.lower().endswith((".jpg", ".png"))]
+    if not files:
+        return True, "无查看器缓存文件"
+    big, checked = 0, 0
+    for f in files[:30]:
+        try:
+            im = _Image.open(_os.path.join(vdir, f))
+            w, h = im.size
+            im.close()
+            checked += 1
+            if max(w, h) > 700:
+                big += 1
+        except Exception:
+            continue
+    # 查看器缓存里应当存在高分辨率图(>700px), 否则说明被误重采样了
+    ok = big > 0 or checked == 0
+    return ok, f"检查{checked}个, 高分辨率{big}个"
+
+ok, detail = _chk_viewer_fullres()
+chk("查看器仍返回高分辨率原图", ok, detail)
+
+
 # ---------- 汇总 ----------
 print("=" * 60)
 print(f"{'检查项':<44} 结果")

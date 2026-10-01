@@ -59,7 +59,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # numpy/scipy/matplotlib: 项目运行时不使用(仅本地分析脚本用), 排除以免体积无谓膨胀
+    excludes=['numpy', 'scipy', 'matplotlib', 'pandas'],
     noarchive=False,
     optimize=0,
 )
