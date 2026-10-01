@@ -753,7 +753,8 @@ def reload_pixiv_if_changed():
             log_error(f"收藏数据热更新失败: {repr(e)} | Bookmark hot-reload failed: {repr(e)}")
 
 # --- 收藏导入/更新(CDP 抓取最新收藏) ---
-_import_state = {"running": False, "code": None, "msg": "", "count": 0, "done": 0, "total": 0, "t": 0.0, "t_start": 0.0}
+_import_state = {"running": False, "code": None, "msg": "", "count": 0, "done": 0, "total": 0,
+                 "cur": "", "new_count": -1, "t": 0.0, "t_start": 0.0}
 
 # 导入进度共享块: exporter 每抓一批回写 done/total, import_status() 实时读取
 _IMPORT_PROG = {"total": 0, "done": 0}
@@ -761,10 +762,12 @@ _IMPORT_PROG = {"total": 0, "done": 0}
 def import_status():
     """返回当前导入状态(供前端轮询)。t 为完成时间戳, 前端用于判断是否新一轮完成。"""
     s = dict(_import_state)
-    # 从 exporter 的实时进度块同步 total/done(导入期间 exporter 持续回写)
+    # 从 exporter 的实时进度块同步 total/done/cur(导入期间 exporter 持续回写)
     if s["running"]:
         s["total"] = _IMPORT_PROG.get("total", 0) or s.get("total", 0)
         s["done"] = _IMPORT_PROG.get("done", 0) or s.get("done", 0)
+        if _IMPORT_PROG.get("cur"):
+            s["cur"] = _IMPORT_PROG["cur"]
     # ETA 计算
     if s["running"] and s.get("total", 0) > 0 and s.get("t_start", 0):
         elapsed = time.time() - s["t_start"]
@@ -822,12 +825,14 @@ def _import_worker():
             msg = "导入失败。Edge 浏览器正在运行导致无法读取 cookie，请先关闭 Edge 浏览器，然后再点导入" + _proxy_hint
             log_error(f"收藏导入失败(code={code}) | Import failed (code={code})")
         _dbg("IMPORT", f"导入完成 code={code} count={count}")
+        # 本次新增条数(exporter 回写): 0 = 没有新收藏
+        _new = int(_IMPORT_PROG.get("new_count", -1))
         try:
             _ex.set_progress_callback(None)
         except Exception:
             pass
         _import_state.update({"running": False, "code": code, "msg": msg, "count": count,
-                              "done": count, "total": count, "t": time.time()})
+                              "done": count, "total": count, "new_count": _new, "t": time.time()})
     except Exception as e:
         if debug_on():
             import traceback
@@ -2957,6 +2962,27 @@ body.transitioning .search-float{backdrop-filter:blur(10px) saturate(120%);trans
 /* 进度条 */
 .progress{position:fixed;top:0;left:0;height:3px;background:linear-gradient(90deg,var(--accent),#e0aaff);width:0;z-index:9999;transition:width .3s;box-shadow:0 0 20px var(--accent-g)}
 .progress.active{width:100%;transition:width 8s ease-out}
+/* 导入状态悬浮面板: 顶部 3px 细条看不清, 这个才是用户实际读的界面 */
+.imp-panel{position:fixed;top:64px;left:50%;transform:translateX(-50%) translateY(-16px);min-width:340px;max-width:min(560px,92vw);background:var(--glass);backdrop-filter:blur(40px) saturate(180%);border:1px solid var(--glass-bd);border-radius:18px;padding:16px 20px;z-index:9000;box-shadow:0 18px 60px rgba(0,0,0,.6);opacity:0;pointer-events:none;transition:opacity .3s var(--ease-page),transform .3s var(--ease-page)}
+.imp-panel.show{opacity:1;transform:translateX(-50%) translateY(0);pointer-events:auto}
+.imp-panel.done{border-color:rgba(80,220,140,.55);box-shadow:0 18px 60px rgba(0,0,0,.6),0 0 40px rgba(80,220,140,.25)}
+.imp-panel.err{border-color:rgba(255,90,90,.55);box-shadow:0 18px 60px rgba(0,0,0,.6),0 0 40px rgba(255,90,90,.25)}
+.imp-head{display:flex;align-items:center;gap:10px;font-size:14px;color:var(--txt);margin-bottom:10px;font-weight:600}
+.imp-spin{width:15px;height:15px;border:2px solid rgba(255,255,255,.18);border-top-color:var(--accent);border-radius:50%;animation:impSpin .8s linear infinite;flex:none}
+@keyframes impSpin{to{transform:rotate(360deg)}}
+.imp-panel.done .imp-spin{border:none;animation:none;width:auto;height:auto}
+.imp-panel.done .imp-spin::before{content:'✅';font-size:15px}
+.imp-panel.err .imp-spin{border:none;animation:none;width:auto;height:auto}
+.imp-panel.err .imp-spin::before{content:'❌';font-size:15px}
+.imp-num{font-size:22px;font-weight:700;color:var(--txt);letter-spacing:.5px;font-variant-numeric:tabular-nums}
+.imp-num small{font-size:13px;font-weight:400;color:var(--sub)}
+.imp-track{height:8px;border-radius:4px;background:rgba(255,255,255,.09);overflow:hidden;margin:10px 0 8px}
+.imp-fill{height:100%;width:0%;border-radius:4px;background:linear-gradient(90deg,var(--accent),#e0aaff);transition:width .4s var(--ease-page)}
+.imp-sub{display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--sub);line-height:1.5}
+.imp-sub .imp-eta{white-space:nowrap;color:var(--accent)}
+.imp-actions{display:flex;gap:8px;margin-top:12px}
+.imp-actions button{flex:1;padding:9px 12px;border-radius:12px;border:1px solid var(--glass-bd);background:rgba(255,255,255,.06);color:var(--txt);font-size:13px;cursor:pointer;transition:all .25s var(--ease-snap)}
+.imp-actions button:hover{background:var(--accent);transform:translateY(-1px)}
 
 /* 卡片 */
 /* 行优先网格: 从左往右一行行往下(pixiv 官方样式), 翻页不跳动 */
@@ -3155,6 +3181,19 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 </style>
 <div class="safe-dot" id="safe-dot"><span class="dot"></span>安全模式</div>
 <div class="progress" id="prog"></div>
+<!-- 导入状态面板: 顶部 3px 细条看不清, 用这个显式告知进度/结果 -->
+<div class="imp-panel" id="imp-panel">
+  <div class="imp-head"><span class="imp-spin"></span><span id="imp-title">准备导入…</span></div>
+  <div class="imp-num" id="imp-num">—</div>
+  <div class="imp-track"><div class="imp-fill" id="imp-fill"></div></div>
+  <div class="imp-sub">
+    <span id="imp-stage">正在连接 Pixiv…</span>
+    <span class="imp-eta" id="imp-eta"></span>
+  </div>
+  <div class="imp-actions" id="imp-actions" style="display:none">
+    <button onclick="impPanelClose()">知道了</button>
+  </div>
+</div>
 
 <!-- 灵动岛 -->
 <div class="island">
@@ -3954,6 +3993,18 @@ document.addEventListener('keydown',e=>{
   if(e.key==='ArrowRight'){viewerNav(1);return;}
  }
  if(e.key==='Escape')goBack();
+ // 撤回/后退键: Ctrl+Z / Alt+← / Backspace(非输入态)
+ // 之前只实现了鼠标侧键 X1/X2, 键盘完全没接
+ const _tag0=document.activeElement&&document.activeElement.tagName;
+ const _inInput0=(_tag0==='INPUT'||_tag0==='TEXTAREA'||_tag0==='SELECT'||
+                  (document.activeElement&&document.activeElement.isContentEditable));
+ if((e.ctrlKey||e.metaKey)&&(e.key==='z'||e.key==='Z')&&!_inInput0){
+  e.preventDefault();goBack();return;
+ }
+ if(e.altKey&&e.key==='ArrowLeft'){e.preventDefault();goBack();return;}
+ if(e.key==='Backspace'&&!_inInput0){
+  e.preventDefault();goBack();return;
+ }
  // Ctrl+F / Ctrl+K: 聚焦搜索框(没打开则先打开)
  if((e.ctrlKey||e.metaKey)&&(e.key==='f'||e.key==='k')){
   e.preventDefault();
@@ -3963,10 +4014,18 @@ document.addEventListener('keydown',e=>{
   if(inp){inp.focus();inp.select();}
   return;
  }
+ // Home / End / PageUp / PageDown: 滚动。
+ // 注意: body 是 height:100vh;overflow:hidden, window 根本不滚动,
+ // 真正滚动的是当前页 .page (overflow-y:auto)。之前调 window.scrollTo 永远无效。
+ const _sc=currentScrollEl();
+ if(e.key==='Home'){e.preventDefault();if(_sc)_sc.scrollTo({top:0,behavior:'smooth'});return;}
+ if(e.key==='End'){e.preventDefault();if(_sc)_sc.scrollTo({top:_sc.scrollHeight,behavior:'smooth'});return;}
  // 非输入状态下的翻页快捷键: ←/→
  const tag=document.activeElement&&document.activeElement.tagName;
  const inInput=tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT';
  if(!inInput){
+  if(e.key==='PageDown'){e.preventDefault();goPage(currentPage+1);return;}
+  if(e.key==='PageUp'){e.preventDefault();goPage(currentPage-1);return;}
   const cur=document.querySelector('.page.active');
   if(cur&&cur.id==='pg-search'){
    if(e.key==='ArrowLeft'&&currentPage>0)goPage(currentPage-1);
@@ -3980,6 +4039,16 @@ document.addEventListener('keydown',e=>{
  }
 });
 
+function currentScrollEl(){
+ // 真正可滚动的容器: 当前激活页 .page (body/window 都是 overflow:hidden)
+ const pg=document.querySelector('.page.active');
+ if(pg&&pg.scrollHeight>pg.clientHeight+4)return pg;
+ // 兜底: 主题面板/其它滚动容器
+ const tp=document.querySelector('.theme-panel.open');
+ if(tp&&tp.scrollHeight>tp.clientHeight+4)return tp;
+ return pg||document.scrollingElement||document.documentElement;
+}
+
 function goBack(){
  const cur=document.querySelector('.page.active');
  if(cur&&cur.id==='pg-fav-inner'){go('fav');return;}
@@ -3990,18 +4059,62 @@ function goBack(){
  if(searchP&&searchP.classList.contains('open')){togSearch();}
 }
 
+// ===== 导入状态面板: 显式展示进度与结果, 结束时明确提醒 =====
+const _impP=()=>document.getElementById('imp-panel');
+function impPanelOpen(){
+ const p=_impP();if(!p)return;
+ p.classList.remove('done','err');p.classList.add('show');
+ const t=document.getElementById('imp-actions');if(t)t.style.display='none';
+ const f=document.getElementById('imp-fill');if(f)f.style.width='0%';
+ impPanelSet('准备导入…','—','正在连接 Pixiv…','');
+}
+function impPanelSet(title,num,stage,eta){
+ const e=id=>document.getElementById(id);
+ if(e('imp-title'))e('imp-title').textContent=title;
+ if(e('imp-num'))e('imp-num').textContent=num;
+ if(e('imp-stage'))e('imp-stage').textContent=stage;
+ if(e('imp-eta'))e('imp-eta').textContent=eta||'';
+}
+function impPanelProgress(done,total,stage,etaS){
+ const pct=total>0?Math.min(100,Math.floor(done/total*100)):0;
+ const f=document.getElementById('imp-fill');
+ if(f)f.style.width=pct+'%';
+ const num=total>0
+  ?`${done.toLocaleString()} <small>/ ${total.toLocaleString()} 幅 · ${pct}%</small>`
+  :`${done.toLocaleString()} <small>幅</small>`;
+ const eta=(etaS>=0)?`剩余 ~${etaS} 秒`:'正在估算…';
+ impPanelSet('正在导入收藏',num,stage||'正在抓取…',eta);
+}
+function impPanelDone(count,isNew){
+ const p=_impP();if(!p)return;
+ p.classList.remove('err');p.classList.add('show','done');
+ const f=document.getElementById('imp-fill');if(f)f.style.width='100%';
+ impPanelSet('导入完成',`${count.toLocaleString()} <small>幅</small>`,
+   isNew===0?'没有新收藏（已是最新）':'收藏已更新，正在刷新画面…','');
+ const a=document.getElementById('imp-actions');if(a)a.style.display='flex';
+ // 结束后自动收起(留足时间让用户看到)
+ setTimeout(()=>{const q=_impP();if(q&&q.classList.contains('done'))impPanelClose();},9000);
+}
+function impPanelErr(msg){
+ const p=_impP();if(!p)return;
+ p.classList.remove('done');p.classList.add('show','err');
+ impPanelSet('导入失败','—',msg||'未知错误','');
+ const a=document.getElementById('imp-actions');if(a)a.style.display='flex';
+}
+function impPanelClose(){const p=_impP();if(p)p.classList.remove('show','done','err');}
+
 async function doImport(){
  const b=document.getElementById('prog');
  const islandTxt=document.querySelector('.island-txt');
  b.classList.add('active');
- b.textContent='⏳ 正在连接…';
+ b.textContent='';
  if(islandTxt)islandTxt.innerHTML='<b>导入中…</b>';
+ impPanelOpen();
  try{
   const r=await fetch('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source:'pixiv'})});
   const d=await r.json();
   if(d.ok && d.started){
-   b.textContent='📥 导入中…';
-   let secs=0;
+   let secs=0,lastDone=-1,stall=0;
    const poll=setInterval(async()=>{
     secs++;
     try{
@@ -4009,13 +4122,12 @@ async function doImport(){
      const sd=await sr.json();
      if(!sd.running){
       clearInterval(poll);
-      b.classList.remove('active');
+      b.classList.remove('active');b.style.width='0%';
       if(sd.code===0){
-       b.textContent='✅ 共 '+sd.count+' 幅';
        if(islandTxt)islandTxt.innerHTML='<b>PixivFavSearch</b> · '+sd.count+' 幅';
-       setTimeout(()=>{b.style.width='0%';b.textContent=''},3000);
+       impPanelDone(sd.count, sd.new_count);
        await fetchWorks();renderWall();await fetchFavs();renderFavs();
-       // 导入成功 → 自动启动缩略图全量预载(最新→最旧)
+       if(typeof renderStats==='function')renderStats();
        try{
         await fetch('/api/thumb-prefetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
         const pb=document.getElementById('prefetch-btn');
@@ -4025,33 +4137,39 @@ async function doImport(){
         startPrefetchPolling();
        }catch(e){}
       }else{
-       b.textContent='❌ '+(sd.msg||'失败');
        if(islandTxt)islandTxt.innerHTML='<b>PixivFavSearch</b>';
-       setTimeout(()=>{b.style.width='0%';b.textContent=''},8000);
+       impPanelErr(sd.msg||'导入失败');
       }
      }else{
-      // 实时进度: 已导入 X 幅 / 共 Y 幅 · Z% · 剩余 ~M 秒
+      // 真实进度(后端已打通 total/done/eta_s/cur)
       if(sd.total>0){
-       const pct=Math.min(100,Math.floor(sd.done/sd.total*100));
-       const eta=(sd.eta_s>=0)?(' · 剩余 ~'+sd.eta_s+' 秒'):'';
-       b.style.width=pct+'%';
-       b.textContent='📥 '+sd.done.toLocaleString()+' / '+sd.total.toLocaleString()+' 幅 · '+pct+'%'+eta;
-       if(islandTxt)islandTxt.innerHTML='<b>导入中</b> '+sd.done.toLocaleString()+'/'+sd.total.toLocaleString()+' · '+pct+'%';
+       impPanelProgress(sd.done,sd.total,sd.cur,sd.eta_s);
+       b.style.width=Math.min(100,Math.floor(sd.done/sd.total*100))+'%';
+       if(islandTxt)islandTxt.innerHTML='<b>导入中</b> '+sd.done.toLocaleString()+'/'+sd.total.toLocaleString();
       }else{
+       impPanelSet('正在导入收藏','—',sd.cur||'正在连接 Pixiv 并读取登录态…',`已用 ${secs} 秒`);
        if(islandTxt)islandTxt.innerHTML='<b>导入中…</b> '+secs+'秒';
       }
+      // 卡住检测: 90 秒无进展则提示
+      if(sd.done===lastDone){stall++;}else{stall=0;lastDone=sd.done;}
+      if(stall===90){
+       impPanelSet('正在导入收藏',
+         sd.total>0?`${sd.done.toLocaleString()} <small>/ ${sd.total.toLocaleString()} 幅</small>`:'—',
+         '较慢…pixiv 可能限速，仍在继续，请勿关闭窗口','');
+      }
      }
-    }catch(e){clearInterval(poll);b.textContent='❌ 网络错误';}
+    }catch(e){
+     clearInterval(poll);
+     impPanelErr('网络中断: '+e.message);
+    }
    },1000);
   }else{
    b.classList.remove('active');
-   b.textContent='❌ '+(d.error||'启动失败');
-   setTimeout(()=>{b.style.width='0%';b.textContent=''},5000);
+   impPanelErr(d.error||'启动失败（可能已有导入在进行）');
   }
  }catch(e){
   b.classList.remove('active');
-  b.textContent='❌ 网络错误';
-  setTimeout(()=>{b.style.width='0%';b.textContent=''},5000);
+  impPanelErr('请求失败: '+e.message);
  }
 }
 

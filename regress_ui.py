@@ -71,6 +71,26 @@ chk("进度文案 共 Y 幅", "幅 · '+" in html or "幅 · " in html)
 chk("灵动岛显示进度", "导入中</b> '+sd.done" in html or "导入中</b> " in html)
 chk("首跑向导去硬编码 /20", "Math.min(95,s.count/20)" not in html or "s.total>0" in html)
 
+
+# ---------- 本轮修复: 键盘 / 导入面板 / 托盘路径 ----------
+chk("Home/End 用 currentScrollEl(非 window)", "currentScrollEl()" in html and "window.scrollTo({top:0" not in html)
+chk("currentScrollEl 函数已定义", "function currentScrollEl()" in html)
+chk("撤回键 Ctrl+Z", "e.key==='z'" in html)
+chk("撤回键 Alt+Left", "e.altKey&&e.key==='ArrowLeft'" in html)
+chk("撤回键 Backspace", "e.key==='Backspace'" in html)
+chk("导入面板 HTML 存在", 'id="imp-panel"' in html)
+chk("导入面板 进度条", 'id="imp-fill"' in html)
+chk("导入面板 阶段文案", 'id="imp-stage"' in html)
+chk("导入面板 结果提醒", "impPanelDone(" in html)
+chk("导入面板 失败提醒", "impPanelErr(" in html)
+chk("导入面板 关闭按钮", "function impPanelClose()" in html)
+chk("导入面板 卡住提示", "stall===90" in html)
+chk("导入面板 自动收起(9s)", "},9000)" in html)
+chk("导入进度读 sd.cur", "sd.cur" in html)
+chk("导入完成读 new_count", "sd.new_count" in html)
+chk("导入完成刷新统计", "renderStats()" in html)
+chk("导入面板 CSS 样式", ".imp-panel{" in html)
+
 # ---------- 汇总 ----------
 print("=" * 62)
 print(f"{'检查项':<44} 结果")

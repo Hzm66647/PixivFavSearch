@@ -180,14 +180,39 @@ def _on_toggle(icon, item):
         _update_menu()
 
 def _on_export(icon, item):
-    """导出收藏"""
+    """导出收藏。
+
+    必须走 server.start_import() 统一入口, 不能直接调 exporter.main():
+    直接调会绕过 _import_state(前端一直显示"导入中…")、
+    绕过 _IMPORT_PROG 进度回调(看不到进度)、
+    绕过 reload_pixiv_if_changed()(导入完新作品不刷新)。
+    """
     def run():
         try:
-            code = exporter.main()
-            if code == 0 and _tray_icon:
-                _tray_icon.notify("导出完成！", "PixivFavSearch")
-            elif _tray_icon:
-                _tray_icon.notify("导出失败，请检查日志", "PixivFavSearch")
+            if not server.start_import():
+                if _tray_icon:
+                    _tray_icon.notify("已有导入在进行中", "PixivFavSearch")
+                return
+            # 等待导入线程结束(轮询状态), 再根据结果提示
+            import time as _t
+            for _ in range(1800):          # 最多等 30 分钟
+                _t.sleep(1)
+                st = server.import_status()
+                if not st.get("running"):
+                    break
+            else:
+                if _tray_icon:
+                    _tray_icon.notify("导入超时, 请查看日志", "PixivFavSearch")
+                return
+            st = server.import_status()
+            if st.get("code") == 0:
+                _n = st.get("new_count", -1)
+                _tail = f"新增 {_n} 条" if _n > 0 else ("没有新收藏" if _n == 0 else "已更新")
+                if _tray_icon:
+                    _tray_icon.notify(f"导入完成！共 {st.get('count', 0)} 幅 · {_tail}", "PixivFavSearch")
+            else:
+                if _tray_icon:
+                    _tray_icon.notify(f"导入失败: {st.get('msg', '请检查日志')}", "PixivFavSearch")
         except Exception as e:
             if _tray_icon:
                 _tray_icon.notify(f"导出失败: {e}", "PixivFavSearch")

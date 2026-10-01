@@ -297,11 +297,41 @@ def main():
     # 3. Fetch bookmarks
     cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
     
+    # 2.5 增量导入: 读取已有数据, 建立 bookmarkId 集合 / 最新 bookmarkId / 作品id 索引
+    old_list = []
+    old_by_id = {}
+    old_bids = set()
+    max_old_bid = 0
+    if os.path.exists(DATA):
+        try:
+            old_list = json.load(open(DATA, "r", encoding="utf-8")) or []
+            if not isinstance(old_list, list):
+                old_list = []
+            for it in old_list:
+                wid = it.get("id")
+                if wid is not None:
+                    old_by_id[str(wid)] = it
+                try:
+                    bid = int(it.get("bookmarkId"))
+                except (TypeError, ValueError):
+                    continue
+                old_bids.add(bid)
+                if bid > max_old_bid:
+                    max_old_bid = bid
+        except Exception as e:
+            _log("main", f"读取已有数据失败(按空库处理): {e}")
+            old_list, old_by_id, old_bids, max_old_bid = [], {}, set(), 0
+    _log("main", f"增量导入: 已有 {len(old_list)} 条, 最新 bookmarkId={max_old_bid}")
+
     _log("main", f"Fetching bookmarks for uid {uid}...")
-    all_items = []
+    # 新增条目(结构与原代码完全一致); 旧条目合并时直接从 old_list 原样取
+    new_items = []
     # bookmarkId -> [自建收藏标签] 映射, 从每页响应的 bookmarkTags 字段顺路收集
     # (pixiv 官方 API: body.bookmarkTags = {"<bookmarkData.id>": ["标签A", "标签B"]})
     collected_tags = {}
+    fetched_count = 0    # 本次已抓取(新增)条数
+    page_no = 0          # 全局页码(show/hide 连续计数)
+    reached_old = False  # 命中旧收藏 -> 停止全部抓取
     
     proxy_url = get_proxy()
     proxy = urllib.request.ProxyHandler({
@@ -311,6 +341,8 @@ def main():
     opener = urllib.request.build_opener(proxy)
     
     for rest in ("show", "hide"):
+        if reached_old:
+            break
         offset = 0
         while True:
             url = (f"https://www.pixiv.net/ajax/user/{uid}/illusts/bookmarks"
@@ -330,21 +362,26 @@ def main():
                     break
                 body = d.get("body") or {}
                 works = body.get("works") or []
-                # 进度上报: 让上层(服务器)能显示"已导入 X / 共 Y 幅"
-                # Pixiv 收藏 API 不返回总数, 用用户主页的 total 作为预估上限
-                if _PROGRESS_CB and not _PROGRESS_CB.get("total"):
-                    _PROGRESS_CB["total"] = _fetch_total_bookmarks(uid, cookie_header, proxy_url)
-                if _PROGRESS_CB:
-                    _PROGRESS_CB["done"] = len(all_items)
                 # 顺路收集收藏标签映射 (bookmarkData.id -> tags)
                 btags = body.get("bookmarkTags") or {}
                 if isinstance(btags, dict):
                     collected_tags.update(btags)
                 if not works:
                     break
+                page_no += 1
+                page_new = 0
                 for w in works:
                     bm = w.get("bookmarkData") or {}
-                    all_items.append({
+                    bid_raw = bm.get("id")
+                    try:
+                        bid = int(bid_raw)
+                    except (TypeError, ValueError):
+                        bid = None
+                    # order=desc: 命中 <= max_old_bid 说明后面全是旧收藏, 立即停止全部抓取
+                    if bid is not None and max_old_bid and bid <= max_old_bid:
+                        reached_old = True
+                        break
+                    new_items.append({
                         "id": str(w.get("id")),
                         "title": w.get("title", ""),
                         "tags": [t.get("tag", "") if isinstance(t, dict) else str(t)
@@ -361,7 +398,16 @@ def main():
                         "xRestrict": w.get("xRestrict", 0),
                         "bookmarkId": str(bm.get("id", "")) if bm.get("id") else "",
                     })
-                _log("main", f"[{rest}] +{len(works)} (total {len(all_items)})")
+                    page_new += 1
+                    fetched_count += 1
+                # 进度上报: done=本次已抓取条数, total=已抓取+已有旧条目
+                if _PROGRESS_CB:
+                    _PROGRESS_CB["done"] = fetched_count
+                    _PROGRESS_CB["total"] = max(fetched_count + len(old_list), fetched_count)
+                    _PROGRESS_CB["cur"] = f"第 {page_no} 页 · 新增 {fetched_count} 条"
+                _log("main", f"第 {page_no} 页: 新增 {page_new} 条")
+                if reached_old:
+                    break
                 if len(works) < 48:
                     break
                 offset += len(works)
@@ -404,20 +450,52 @@ def main():
                 _log("main", f"[{rest}] Error: {e}")
                 break
     
-    if not all_items:
+    # 5. 合并: 新收藏在前(按收藏时间倒序), 旧收藏原顺序不变
+    new_bids = set()
+    for it in new_items:
+        try:
+            new_bids.add(int(it.get("bookmarkId")))
+        except (TypeError, ValueError):
+            pass
+    merged_old = []
+    for it in old_list:
+        try:
+            obid = int(it.get("bookmarkId"))
+        except (TypeError, ValueError):
+            obid = None
+        if obid is not None and obid in new_bids:
+            continue
+        # 旧条目直接复用 old_by_id 里的原对象(按原顺序)
+        merged_old.append(old_by_id.get(str(it.get("id")), it))
+    final = new_items + merged_old
+
+    if not new_items:
+        _log("main", "无新增收藏")
+
+    # 写盘保护: final 为空则报错返回, 绝不清空旧库
+    if len(final) <= 0:
+        _log("main", "ERROR: final 为空, 不写盘")
         print("ERROR: No items fetched")
         return 1
-    
+
     # 原子写入: 先写临时文件再替换, 避免半成品数据砸掉旧库
     _tmp = DATA + ".tmp"
-    json.dump(all_items, open(_tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    json.dump(final, open(_tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     os.replace(_tmp, DATA)
-    _log("main", f"=== Done: {len(all_items)} bookmarks ===")
-    print(f"OK: {len(all_items)} bookmarks imported")
+
+    # 收尾: 进度打满 100%
+    if _PROGRESS_CB:
+        _PROGRESS_CB["done"] = len(final)
+        _PROGRESS_CB["total"] = len(final)
+        _PROGRESS_CB["new_count"] = len(new_items)
+        _PROGRESS_CB["cur"] = f"完成: 新增 {len(new_items)} 条"
+
+    _log("main", f"=== 增量完成: 新增 {len(new_items)} 条, 共 {len(final)} 条 ===")
+    print(f"OK: {len(final)} bookmarks imported (+{len(new_items)} new)")
     
     # 抓取收藏标签
     try:
-        _save_coltags_from_collected(all_items, collected_tags)
+        _save_coltags_from_collected(final, collected_tags)
     except Exception as e:
         _log("main", f"保存收藏标签失败: {e}")
     
@@ -450,13 +528,33 @@ def _save_coltags_from_collected(all_items, collected_tags):
             if t:
                 result.setdefault(t, []).append(wid)
                 n_mapped += 1
-    
-    if not result:
+
+    # 增量导入时 collected_tags 只覆盖本次抓到的页, 直接覆盖会把旧标签全丢掉。
+    # 所以先读旧文件, 保留仍然存在的作品映射, 再把本次结果合并进去。
+    merged = {}
+    cur_ids = {str(it.get("id")) for it in all_items if it.get("id")}
+    try:
+        if os.path.exists(COLTAGS):
+            old_raw = json.load(open(COLTAGS, encoding="utf-8")) or {}
+            if isinstance(old_raw, dict):
+                for t, ids in old_raw.items():
+                    keep = [i for i in (ids or []) if str(i) in cur_ids]
+                    if keep:
+                        merged[t] = list(dict.fromkeys(keep))
+    except Exception as e:
+        _log("main", f"读取旧 coltags.json 失败(按空处理): {e}")
+    for t, ids in result.items():
+        seen = merged.setdefault(t, [])
+        for i in ids:
+            if i not in seen:
+                seen.append(i)
+
+    if not merged:
         _log("main", "收藏标签映射后为空, 保留旧 coltags.json")
         return
-    
-    json.dump(result, open(COLTAGS, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-    _log("main", f"收藏标签已保存: {COLTAGS} ({len(result)} 个标签, {n_mapped} 条映射)")
+
+    json.dump(merged, open(COLTAGS, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    _log("main", f"收藏标签已保存: {COLTAGS} ({len(merged)} 个标签, {sum(len(v) for v in merged.values())} 条映射)")
 
 if __name__ == "__main__":
     sys.exit(main())

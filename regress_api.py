@@ -163,6 +163,17 @@ chk("GET /api/debug/status", st == 200, f"status={st}")
 # ---------- 11. 动态数据源 ----------
 chk("get_data_src 后端函数", True, "前端不引用(正确)")
 
+
+# ---------- 本轮: 导入状态新字段 ----------
+def _chk_import_fields():
+    import urllib.request, json as _j
+    d = _j.loads(urllib.request.urlopen(BASE + "/api/import-status", timeout=10).read())
+    missing = [k for k in ("cur", "new_count", "done", "total", "eta_s") if k not in d]
+    return (not missing), f"导入状态字段齐全 {list(d.keys())}" if not missing else f"缺 {missing}"
+
+ok, detail = _chk_import_fields()
+chk(ok, detail)
+
 # ---------- 汇总 ----------
 print("=" * 60)
 print(f"{'检查项':<44} 结果")
