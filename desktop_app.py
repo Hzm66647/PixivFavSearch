@@ -314,6 +314,9 @@ def main():
         server.register_open_window_callback(open_external_window)   # inner 模式
         server.register_browser_callback(open_in_browser)             # browser 模式(默认)
         server.register_login_callback(_start_login_window)           # 首跑登录窗口
+        # 标记桌面模式: 前端据此避开 WebView2 里 window.open 空窗口
+        # 触发的"获取打开此'about'链接的应用"系统对话框。
+        server.set_desktop_mode(True)
     except Exception:
         pass
 

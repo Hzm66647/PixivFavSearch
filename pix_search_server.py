@@ -1460,11 +1460,13 @@ def thumb_for(item, lang="zh"):
     # net_reachable() 先花最多 2 秒确认连不连得上, 连不上立刻走占位图。
     if not net_can_try() or not net_reachable():
         return _make_placeholder_thumb(pid, item.get("title", ""), kind="net")
-    # 候选太多会成倍放大等待时间: 5 个候选在"域不可达"时要串行等 5 轮超时。
-    # 实测无代理环境下这正是 210s 的来源。
-    # 串行重试只保留前 2 个候选(格式回退: jpg → png), 其余留给下次。
-    if len(_candidates) > 2:
-        _candidates = _candidates[:2]
+    # ⚠️ 曾经这里把候选裁到前 2 个, 为了在"域不可达"时少等几轮超时。
+    # 那是错的: 候选链是**格式回退链**, 后面的候选兜住的是"这张作品没有
+    # 原图"的情况。实测有些作品 img-original 全 404, 只能靠 master1200;
+    # 裁到 2 个就够不到它 → 全链条失败 → 被误标"作品已失效"(实测 231 件)。
+    # 正确做法保留全链: 前面候选 404 只要几十毫秒(不是超时), 代价极小;
+    # 真正的 210s 卡顿来自"域不可达", 那个由上面的熔断器 + net_reachable()
+    # 拦截, 一进函数就返回, 根本不会走到这个循环。两者职责不要混淆。
     # 网络真正不可达时, 第 1 个候选就会耗尽整个超时; 与其让每个候选
     # 各等一轮, 不如一次判定。探测超时取较小值, 连通后再用完整超时下载。
     _probe_timeout = 6
@@ -1485,6 +1487,14 @@ def thumb_for(item, lang="zh"):
             else:
                 opener = urllib.request.build_opener(NoRedirect)
             _last_err = None
+            # 跟踪每个候选的失败类型, 用于最后判定「这张图是真的没了」还是
+            # 「候选全部不适用」。
+            # ⚠️ 关键教训: 候选链是"格式回退"链(jpg → png → master1200 → 缩略图),
+            # 前面的候选 404 只说明"这种格式不存在", 完全不等于作品已失效。
+            # 旧代码拿"最后一个错误"判死 —— 一个作品前 4 个候选全 404、第 5 个
+            # 超时, 就会被判成确定性失效锁 24h。实测因此误标 231 件正常作品。
+            _saw_http = False       # 出现过 HTTP 响应 → 域是通的
+            _all_definitive = True  # 每个候选都是 404/403/410 → 才是真失效
             for _cu in _candidates:
                 if not _cu:
                     continue
@@ -1497,8 +1507,10 @@ def thumb_for(item, lang="zh"):
                     _t = 6 if net_status()["fails"] > 0 else _timeout
                     with opener.open(req, timeout=_t) as r:
                         data = r.read(_maxbytes + 1)
+                    _saw_http = True
                     if not data or len(data) > _maxbytes:
                         _last_err = "too big / empty"
+                        _all_definitive = False
                         continue
                     # 魔数校验: 拒绝非图片内容。代理/网关在出错时会返回
                     # HTTP 200 + HTML 错误页(1260B 那种), 若不校验就会被当成
@@ -1507,6 +1519,7 @@ def thumb_for(item, lang="zh"):
                     if not (data[:3] == b"\xff\xd8\xff" or data[:8] == _PNG_SIG
                             or data[:6] in (b"GIF87a", b"GIF89a") or data[:4] == b"RIFF"):
                         _last_err = "not an image (magic mismatch)"
+                        _all_definitive = False
                         continue
                     # 完整性校验: 魔数只保证"开头像图片"。网络中断会让下载得到
                     # 截断的图 —— 头部完整(能读出尺寸)、像素数据缺失(PIL load 报
@@ -1521,6 +1534,7 @@ def thumb_for(item, lang="zh"):
                             _im.load()
                     except Exception as _ve:
                         _last_err = f"corrupt download: {type(_ve).__name__}"
+                        _all_definitive = False
                         if debug_on():
                             _dbg("THUMB-CORRUPT", f"pid={pid} 截断/损坏, 丢弃并重试: {str(_ve)[:70]}")
                         continue
@@ -1556,6 +1570,14 @@ def thumb_for(item, lang="zh"):
                     return local
                 except Exception as _e:
                     _last_err = _e
+                    # 有 HTTP 状态码 = 域是通的(只是这个候选不存在);
+                    # 超时/连接错误/非 HTTP 异常 = 不确定, 不能当作"真失效"。
+                    if isinstance(_e, urllib.error.HTTPError):
+                        _saw_http = True
+                        if _e.code not in (404, 403, 410):
+                            _all_definitive = False
+                    else:
+                        _all_definitive = False
                     continue
             # 全部候选失败
             # 全部候选失败。
@@ -1601,14 +1623,29 @@ def thumb_for(item, lang="zh"):
                 # 网络级失败 → 强制重探, 让"连不上"的判断尽快生效,
                 # 避免后续每张卡片都要撞一次墙
                 net_reachable(force=True)
-            elif not _transient:
-                net_report(True)  # 明确的 HTTP 拒绝(404/403) = 网络是通的
-            if _transient:
-                # 瞬时失败: 不写入失败缓存, 下次访问会自然重试
-                if debug_on():
-                    _dbg("THUMB-TRANSIENT", f"pid={pid} 瞬时失败不锁: {type(e).__name__}")
+            elif _saw_http:
+                net_report(True)  # 至少有一个候选拿到了 HTTP 响应 = 网络是通的
+            # ── 判定「确定性失败」────────────────────────────────────────
+            # 只有"这张图确实没了"才值得锁 24h。锁错的代价极高: 该作品在
+            # 24h 内永远显示"作品已失效"占位图, 用户以为图没了。
+            # 实测教训(误标 231 件正常作品):
+            #   ① 候选链是格式回退链, 前面 404 只说明"这种格式没有", 不代表
+            #      作品失效 —— 必须「所有候选都拿到 404/403/410」才算真失效。
+            #   ② 只要有一个候选是超时/连接错误/内容异常, 就属于"不确定",
+            #      绝不能锁死(否则一次网络抖动 = 一批作品集体被判死刑)。
+            #   ③ 至少要见到一个 HTTP 响应, 否则纯属网络问题, 更不该锁。
+            if isinstance(e, urllib.error.HTTPError):
+                # 末次是 HTTP 响应: 要求它属于"确实没了", 且每个候选都如此
+                _definitive = (e.code in (404, 403, 410)) and _all_definitive and _saw_http
             else:
+                # 末次是超时/连接错误/内容异常 → 一律不确定, 不锁
+                _definitive = False
+            if _definitive:
                 _mark_thumb_fail(pid)   # 确定性失败: 24h 内用占位图
+            elif debug_on():
+                _dbg("THUMB-RETRY",
+                     f"pid={pid} 不锁(候选不适用/瞬时): {type(e).__name__} "
+                     f"all_def={_all_definitive} saw_http={_saw_http}")
             if not hasattr(thumb_for, '_err_logged'):
                 thumb_for._err_logged = set()
             err_key = type(e).__name__
@@ -2316,7 +2353,8 @@ class H(BaseHTTPRequestHandler):
                 self._sec_headers()
                 self.end_headers()
                 return
-            self.send_html(INDEX.replace("__DATASRC__", get_data_src()))
+            self.send_html(INDEX.replace("__DATASRC__", get_data_src())
+                                .replace("__DESKTOP__", "1" if _DESKTOP_MODE else "0"))
         elif u.path == "/api/search":
             mode = urllib.parse.parse_qs(u.query).get("mode", ["pixiv"])[0].strip()
             q = urllib.parse.parse_qs(u.query).get("q", [""])[0].strip()
@@ -4325,6 +4363,10 @@ input[type=range]::-webkit-slider-thumb:active{transform:scale(1.1)}
 </style>
 <script>
 let works=[];
+// 是否运行在桌面 exe 的 WebView2 里(服务端注入: 1=是, 0=纯浏览器)
+// WebView2 无内核内的 window.open 处理, 空窗口会被丢给 Windows →
+// 弹出"获取打开此'about'链接的应用"对话框。所以桌面模式一律不走 window.open。
+const IS_DESKTOP = '__DESKTOP__' === '1';
 let folders=[];
 let safe=true;
 let searchQuery='';
@@ -4448,6 +4490,28 @@ function setOpenMode(m){try{localStorage.setItem('pfs_open_mode',m)}catch(e){}}
 function openWork(id){
  const url='https://www.pixiv.net/artworks/'+id;
  const mode=getOpenMode();
+ if(IS_DESKTOP){
+  // 桌面模式(WebView2): 只让后端用系统浏览器打开, 绝不在页面里 window.open。
+  // 原因: pywebview 没注册 NewWindowRequested 处理器, window.open('','_blank')
+  // 产生的空窗口会被 WebView2 丢给 Windows 外壳, 而 Windows 没有 about:
+  // 协议处理器 → 每次都弹"获取打开此'about'链接的应用"对话框(实测)。
+  // 后端 open_in_browser() 走 webbrowser.open + 托盘气泡, 干净无弹窗。
+  fetch('/api/open-work',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({url:url,mode:mode==='inner'?'inner':'browser'})})
+   .then(r=>r.json()).then(d=>{
+     if(d&&d.opened)return;
+     // 后端回调没注册(极少见) → 兜底用隐藏 <a> 合成点击, 同样不产生空窗口
+     const a=document.createElement('a');
+     a.href=url;a.target='_blank';a.rel='noopener';
+     document.body.appendChild(a);a.click();a.remove();
+   })
+   .catch(()=>{
+     const a=document.createElement('a');
+     a.href=url;a.target='_blank';a.rel='noopener';
+     document.body.appendChild(a);a.click();a.remove();
+   });
+  return;
+ }
  if(mode==='inner'){
   // 备选: 应用内 WebView 窗口(关掉即回主应用)
   window._workWinOpened=false;
@@ -5825,6 +5889,16 @@ def register_browser_callback(cb):
     """desktop_app 启动时注册: 用系统默认浏览器打开链接(默认模式)。"""
     global _OPEN_BROWSER_CB
     _OPEN_BROWSER_CB = cb
+
+# 桌面模式标记: desktop_app 启动时置 True。
+# 前端据此决定跳转方式 —— WebView2 里 window.open('', '_blank') 会弹出
+# 空窗口(about:), Windows 找不到 about 协议处理器就弹"获取打开此'about'
+# 链接的应用"对话框。所以桌面模式下绝不走 window.open。
+_DESKTOP_MODE = False
+
+def set_desktop_mode(on=True):
+    global _DESKTOP_MODE
+    _DESKTOP_MODE = bool(on)
 
 _START_LOGIN_CB = None
 
