@@ -3,7 +3,7 @@
 输入标题关键词 -> 列出匹配作品(标题/作者/链接/缩略图)
 缩略图按需下载并缓存到 data/thumbs/
 """
-VERSION = "1.3.5"
+VERSION = "1.3.6"
 import time as _time_mod
 _START_TS = _time_mod.time()  # 启动时间戳(健康检查 uptime 用)
 UPDATE_CHECK_URL = "https://api.github.com/repos/Hzm66647/PixivFavSearch/releases/latest"
